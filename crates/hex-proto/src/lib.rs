@@ -152,7 +152,10 @@ pub enum EventBody {
     AttemptFailed {
         /// Human-readable reason.
         reason: String,
-        /// The terminal disposition this failure produces (`Failed`/`TimedOut`).
+        /// The terminal disposition this failure produces. Only `Failed` or
+        /// `TimedOut` are legal here; a non-failure value is rejected by
+        /// lifecycle validation and coerced to `Failed` in the reducer, so a
+        /// failed attempt can never fail *open* into success.
         disposition: Disposition,
     },
     /// A budget was exhausted; the run fails closed.

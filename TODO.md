@@ -62,7 +62,7 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
 
 Goal (met): `hex run critique-loop --input task="…"` runs end-to-end — codex
 implements, claude critiques, loop until approved + gate passes — and a killed
-run resumes from its journal. 54 tests + clippy green; verified end-to-end
+run resumes from its journal. 58 tests + clippy green; verified end-to-end
 against the real `hex` binary, and hardened through a cross-model review round
 (journal torn-tail repair, snapshot-integrity verification, run-lock, budget
 fail-closed, typed timeout disposition, evidence/correlation guards).

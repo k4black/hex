@@ -149,6 +149,12 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             state.started_at_ms = event.at_ms;
         }
         EventBody::AttemptStarted { .. } => {
+            // Fail closed on an attempt-start that does not target the projected
+            // current node (a forged/misordered record): ignore it rather than
+            // marking the wrong node in flight.
+            if state.current.is_none() || event.node_id != state.current {
+                return state;
+            }
             state.awaiting = true;
             state.attempts_total += 1;
             state.current_attempt = event.attempt_id.clone();
@@ -198,8 +204,14 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             state.current_attempt = None;
             // Terminal in one atomic event: the failure and its disposition are
             // recorded together, so a crash can never leave a failed attempt
-            // looking re-runnable.
-            state.status = Status::Finished(*disposition);
+            // looking re-runnable. Fail closed: only a genuine failure
+            // disposition is honored — anything else (e.g. a forged `Succeeded`)
+            // collapses to `Failed`, never bypassing the acceptance contract.
+            let disposition = match disposition {
+                Disposition::Failed | Disposition::TimedOut => *disposition,
+                _ => Disposition::Failed,
+            };
+            state.status = Status::Finished(disposition);
         }
         EventBody::RunFinished { disposition } => {
             state.status = Status::Finished(*disposition);
@@ -403,17 +415,15 @@ mod tests {
         let effects = schedule(&g, &s, 0);
         assert_eq!(effects.len(), 1);
         // After an attempt starts, nothing new schedules until it ends.
-        let s2 = reduce(
-            &g,
-            s,
-            &ev(
-                9,
-                EventBody::AttemptStarted {
-                    idempotency_key: "k".to_owned(),
-                    worker: None,
-                },
-            ),
+        let mut started = ev(
+            9,
+            EventBody::AttemptStarted {
+                idempotency_key: "k".to_owned(),
+                worker: None,
+            },
         );
+        started.node_id = Some("implement".to_owned()); // must target the current node
+        let s2 = reduce(&g, s, &started);
         assert!(schedule(&g, &s2, 0).is_empty());
     }
 
@@ -513,6 +523,35 @@ mod tests {
         let after = reduce(&g, s, &forged);
         assert_eq!(after.current.as_deref(), Some("implement"), "must not route");
         assert!(after.awaiting, "spurious signal leaves the attempt in-flight");
+    }
+
+    #[test]
+    fn attempt_failed_with_success_disposition_fails_closed() {
+        let g = loop_graph();
+        // Reach an in-flight attempt on `implement`.
+        let mut s = drive_to(
+            &g,
+            &[
+                EventBody::RunStarted,
+                EventBody::AttemptStarted {
+                    idempotency_key: "k".to_owned(),
+                    worker: None,
+                },
+            ],
+        );
+        s.current_attempt = Some("att_1".to_owned());
+        // A forged failure claiming success must collapse to Failed.
+        let mut failed = ev(
+            50,
+            EventBody::AttemptFailed {
+                reason: "forged".to_owned(),
+                disposition: Disposition::Succeeded,
+            },
+        );
+        failed.node_id = Some("implement".to_owned());
+        failed.attempt_id = Some("att_1".to_owned());
+        let after = reduce(&g, s, &failed);
+        assert_eq!(after.status, Status::Finished(Disposition::Failed));
     }
 
     #[test]

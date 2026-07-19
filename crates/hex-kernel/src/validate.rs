@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use hex_proto::{Event, EventBody, PROTOCOL_VERSION};
+use hex_proto::{Disposition, Event, EventBody, PROTOCOL_VERSION};
 
 use crate::graph::{Graph, NodeKind, NodeSpec};
 
@@ -223,14 +223,17 @@ fn check_signal_names(graph: &Graph, issues: &mut Vec<Issue>) {
     }
 }
 
-/// Validate the lifecycle ordering of a run's journal *before* folding it, so a
-/// malformed or forged sequence fails closed instead of silently mutating the
-/// projection. Complements the byte-level integrity the runtime's journal
-/// reader already enforces (contiguous seq, schema, single run id).
+/// Validate the lifecycle ordering of a run's journal against `graph` *before*
+/// folding it, so a malformed or forged sequence fails closed instead of
+/// silently mutating the projection. Graph-aware: it tracks the current node
+/// exactly as [`reduce`](crate::reduce) does (entry, then routing on signals),
+/// and requires every attempt start to target that node — so verification and
+/// reduction can never disagree. Complements the byte-level integrity the
+/// runtime's journal reader enforces (contiguous seq, schema, single run id).
 ///
 /// # Errors
 /// Returns the first lifecycle violation found.
-pub fn check_journal(events: &[Event]) -> Result<(), Issue> {
+pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<(), Issue> {
     #[derive(PartialEq)]
     enum Phase {
         Init,
@@ -239,7 +242,8 @@ pub fn check_journal(events: &[Event]) -> Result<(), Issue> {
         Finished,
     }
     let mut phase = Phase::Init;
-    // The in-flight attempt, if any: every result/interruption must match it.
+    // The projected current node (by routing) and the in-flight attempt.
+    let mut current: Option<&str> = None;
     let mut active: Option<(&str, &str)> = None;
 
     for (i, e) in events.iter().enumerate() {
@@ -265,31 +269,49 @@ pub fn check_journal(events: &[Event]) -> Result<(), Issue> {
                     return Err(bad(i, "run_started out of order"));
                 }
                 phase = Phase::Running;
+                current = Some(graph.entry.as_str());
             }
             EventBody::AttemptStarted { .. } => {
                 if phase != Phase::Running || active.is_some() {
                     return Err(bad(i, "attempt_started while not idle-running"));
                 }
                 match (e.node_id.as_deref(), e.attempt_id.as_deref()) {
-                    (Some(n), Some(a)) => active = Some((n, a)),
+                    (Some(n), Some(a)) => {
+                        if Some(n) != current {
+                            return Err(bad(i, "attempt_started does not target the current node"));
+                        }
+                        active = Some((n, a));
+                    }
                     _ => return Err(bad(i, "attempt_started missing node/attempt id")),
                 }
             }
-            EventBody::Signal { .. } | EventBody::AttemptFailed { .. } => {
+            EventBody::Signal { name } => {
                 if !attempt_matches(active, e) {
-                    return Err(bad(i, "signal/attempt_failed does not match the in-flight attempt"));
+                    return Err(bad(i, "signal does not match the in-flight attempt"));
                 }
                 active = None;
-                // A disposition-bearing AttemptFailed is itself terminal.
-                if matches!(e.body, EventBody::AttemptFailed { .. }) {
-                    phase = Phase::Finished;
+                // Advance the current node exactly as the reducer routes; a
+                // signal with no legal edge is a defensive run failure.
+                match current.and_then(|c| graph.route(c, name)) {
+                    Some(to) => current = Some(to),
+                    None => phase = Phase::Finished,
                 }
+            }
+            EventBody::AttemptFailed { disposition, .. } => {
+                if !attempt_matches(active, e) {
+                    return Err(bad(i, "attempt_failed does not match the in-flight attempt"));
+                }
+                if !matches!(disposition, Disposition::Failed | Disposition::TimedOut) {
+                    return Err(bad(i, "attempt_failed carries a non-failure disposition"));
+                }
+                active = None;
+                phase = Phase::Finished; // a disposition-bearing failure is terminal
             }
             EventBody::AttemptInterrupted => {
                 if !attempt_matches(active, e) {
                     return Err(bad(i, "attempt_interrupted does not match the in-flight attempt"));
                 }
-                active = None;
+                active = None; // current stays; the node is re-attempted
             }
             EventBody::RunFinished { .. } => {
                 if active.is_some() {
@@ -436,6 +458,84 @@ mod tests {
             .build();
         let issues = validate(&g).unwrap_err();
         assert!(issues.iter().any(|i| i.code == "E-proposal-no-edge"));
+    }
+
+    fn ev(seq: u64, node: Option<&str>, attempt: Option<&str>, body: EventBody) -> Event {
+        Event {
+            schema_version: PROTOCOL_VERSION,
+            seq,
+            at_ms: 0,
+            run_id: "run_0".to_owned(),
+            node_id: node.map(ToOwned::to_owned),
+            attempt_id: attempt.map(ToOwned::to_owned),
+            actor: hex_proto::Actor::runtime(),
+            body,
+        }
+    }
+
+    fn started_journal() -> Vec<Event> {
+        vec![
+            ev(
+                0,
+                None,
+                None,
+                EventBody::RunCreated {
+                    graph_hash: "h".to_owned(),
+                    inputs: Default::default(),
+                    defaults: Default::default(),
+                },
+            ),
+            ev(1, None, None, EventBody::RunStarted),
+            ev(
+                2,
+                Some("implement"),
+                Some("att_1"),
+                EventBody::AttemptStarted {
+                    idempotency_key: "k".to_owned(),
+                    worker: None,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn check_journal_accepts_a_well_formed_prefix() {
+        let g = cyclic(Budget {
+            attempts: Some(8),
+            ..Budget::default()
+        });
+        assert!(check_journal(&g, &started_journal()).is_ok());
+    }
+
+    #[test]
+    fn check_journal_rejects_attempt_on_wrong_node() {
+        let g = cyclic(Budget {
+            attempts: Some(8),
+            ..Budget::default()
+        });
+        let mut events = started_journal();
+        // The graph's entry is `implement`; an attempt on `test` is impossible.
+        events[2].node_id = Some("test".to_owned());
+        assert!(check_journal(&g, &events).is_err());
+    }
+
+    #[test]
+    fn check_journal_rejects_success_flavored_failure() {
+        let g = cyclic(Budget {
+            attempts: Some(8),
+            ..Budget::default()
+        });
+        let mut events = started_journal();
+        events.push(ev(
+            3,
+            Some("implement"),
+            Some("att_1"),
+            EventBody::AttemptFailed {
+                reason: "forged".to_owned(),
+                disposition: Disposition::Succeeded,
+            },
+        ));
+        assert!(check_journal(&g, &events).is_err());
     }
 
     #[test]

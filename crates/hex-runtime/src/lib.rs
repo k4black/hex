@@ -203,7 +203,7 @@ impl Runtime {
         let graph = self.compile_with(&source, &inputs, &defaults)?;
 
         // Fail closed on a malformed lifecycle before folding it into state.
-        hex_kernel::check_journal(&events)
+        hex_kernel::check_journal(&graph, &events)
             .map_err(|i| HexError::new(format!("journal is invalid: {i}")))?;
 
         let mut state = State::default();
