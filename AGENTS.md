@@ -134,6 +134,11 @@ authority. _Avoid_: state, cache, snapshot (the atomic snapshot file is one
 **Operator**: Any actor (human or agent) issuing control commands, with
 scoped authority. _Avoid_: user, supervisor, controller.
 
+**Preset**: A named, parametrized graph in the library, resolved project
+(`.hex/graphs/`) > user (`~/.config/hex/graphs/`) > built-in; invoked as
+`hex run <preset> --input k=v`. _Avoid_: pipeline (banned Graph synonym),
+template (reserved for `templates:` node reuse inside a graph).
+
 **Interactive session**: An `agent` attempt with `interactive: true` — stays
 open for live human↔agent conversation (grill-me/Q&A), journaled per turn,
 resumable. Requires worker capabilities `live_steering` + `session_resume`.

@@ -1,8 +1,9 @@
 # TODO / Roadmap
 
-Phased so pause/resume, evidence, and truthful state are solid **before**
-concurrency or remote control. Architecture locked in the 2026-07-19 design
-session (see README.md + AGENTS.md; research: `docs/design/gpt-research-{1,2}.md`).
+Phased so a working claude+codex critique loop ships **first**, then
+pause/resume/evidence harden, then concurrency and remote control. Architecture
+locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
+`docs/design/gpt-research-{1,2}.md`).
 
 ## Decisions — resolved 2026-07-19
 
@@ -27,6 +28,20 @@ session (see README.md + AGENTS.md; research: `docs/design/gpt-research-{1,2}.md
       respond/validate/graph, `--json` everywhere.
 - [x] Isolation: runtime-owned; default `shared`, opt-in per-run `worktree`
       (feature work isolated from the main working copy); **no auto-merge**.
+- [x] MVP shape: slim skeleton **with** journal/replay/resume (hex's core
+      identity), claude + codex adapters, and a built-in critique-loop preset
+      as the flagship demo.
+- [x] Presets: named, parametrized graphs resolved **project
+      (`.hex/graphs/`) > user (`~/.config/hex/graphs/`) > built-in** —
+      `hex run critique-loop --input task="…"`. ("Preset", not "pipeline" —
+      the term pipeline stays banned as a Graph synonym.)
+- [x] Config: layered `~/.config/hex/config.yaml` + project `.hex/config.yaml`
+      (project wins) — worker registry (argv template, headless flags, model,
+      declared capabilities) + default budgets/context/isolation in MVP;
+      richer policy (permissions, notifications, cost) later.
+- [x] Authoring automation: a shipped **authoring skill** (SKILL.md teaching
+      an agent to write + `hex validate` graph YAML) right after MVP;
+      `hex graph new` architect command and MCP prompts deferred.
 
 ## Phase 0 — restructure the scaffold ✅
 
@@ -43,46 +58,71 @@ session (see README.md + AGENTS.md; research: `docs/design/gpt-research-{1,2}.md
 - [x] Placeholder types wiring the new inward graph; build/test/clippy/bench
       green; binary prints the 11-verb surface.
 
-## Phase 1 — MVP: honest single-run cyclic kernel
+## Phase 1 — slim MVP: claude + codex critique loop
+
+Goal: `hex run critique-loop --input task="…"` works end-to-end — codex
+implements, claude critiques, loop until approved + gate passes — and a killed
+run resumes from its journal.
 
 - [ ] `hex-proto`: versioned `Event` envelope (schema, seq, run/node/attempt,
-      actor, type, payload), `Command`, `Capability`.
-- [ ] Graph IR + YAML loader (co-located `on:` map, `defaults:`, block-scalar
-      prompts; `templates:`/`extends:` + `gates:`/`use:` can trail slightly);
-      canonical `format`; published JSON Schema. Full grammar spec → design doc.
-- [ ] Static validator: schema, references, reachability, **bounded-cycle
-      (SCC) enforcement**, worker-capability match.
-- [ ] Kernel: `reduce` / `schedule` (→ effect intents: `StartAttempt`,
-      `RunGate`, `RequestHuman`, `CancelAttempt`, `RecordTerminal`) / `accept`.
+      actor, type, payload) + `Command`.
+- [ ] Config loading: `~/.config/hex/config.yaml` + `.hex/config.yaml`
+      (project wins) — worker registry + default budgets/context.
+- [ ] YAML loader → Graph IR (kind-as-key, co-located `on:` map, `defaults:`,
+      block-scalar prompts, `inputs:` parametrization). Templates/extends and
+      reusable `gates:`/`use:` are Phase 2.
+- [ ] Validator (minimum honest set): references, reachability,
+      **bounded-cycle (SCC) enforcement**, `may_propose` coverage.
+- [ ] Kernel: `reduce` / `schedule` (→ `StartAttempt`, `RunGate`,
+      `RequestHuman`, `CancelAttempt`, `RecordTerminal`) / `accept` — minimal
+      but real.
 - [ ] Runtime drive loop: replay → schedule → intent-before-effect with
       idempotency keys → execute → append → reduce; crash recovery (orphaned
-      attempts marked `interrupted`; redo = new run, never silent rerun).
-- [ ] Append-only JSONL journal + atomic snapshot projection; single writer,
-      fsync, torn-tail tolerance, monotonic seq.
-- [ ] Run dir: `.hex/runs/<id>/{graph.yaml, graph.sha256, events.jsonl,
-      state.json, control/, artifacts/<hash>/, attempts/<id>/}`.
-- [ ] Workers: deterministic mock (contract suite) + generic subprocess (argv)
-      + one real coding-agent adapter.
-- [ ] Node kinds: `agent`, `command`, `gate`, `human`, `terminal`; shared
-      command/gate executor; run-level reusable gates + `accept.require`.
-- [ ] Routing: ordered deterministic edges + `may_propose` validation with
-      `route.rejected` feedback.
-- [ ] Worker channel, transport 1: injected env (run/node/attempt ids, scoped
-      token) + `hex emit`; event allow-list enforced per node.
-- [ ] Context policy per node: `fresh` (default) vs `continue`.
-- [ ] Budgets: attempts/time, per-node + per-run + per-cycle visits;
-      repeated-failure circuit breaker; progress-signature stall detection;
-      fail-closed.
-- [ ] Isolation: `shared` default; per-run `worktree` opt-in (create worktree
-      + branch, run there, leave branch; no auto-merge).
-- [ ] CLI verbs: `validate` `graph` `run` `resume` `pause` `cancel` `status`
-      `watch` `logs` `emit` `respond`; `--json`/NDJSON, stable exit codes,
-      `capabilities`.
-- [ ] Crash/replay test suite (kill at every state transition); kernel
-      property tests (terminal runs schedule nothing; seq monotonic; one
-      terminal per attempt; replay == projection; unbounded cycles rejected).
+      attempts marked `interrupted`; redo = new run).
+- [ ] Append-only JSONL journal + replay; run dir
+      `.hex/runs/<id>/{graph.yaml, graph.sha256, events.jsonl, artifacts/,
+      attempts/<id>/}`. Atomic `state.json` snapshot may trail to Phase 2.
+- [ ] Workers: **claude** + **codex** headless adapters (argv, fresh session
+      per attempt) + a simple mock for tests.
+- [ ] Worker channel, transport 1: injected env (ids + scoped token) +
+      `hex emit`; per-node `may_propose` allow-list enforced.
+- [ ] Node kinds working: `agent`, `gate` (inline command), `terminal`
+      (`command`/`human` may stub to Phase 2).
+- [ ] Budgets: attempts + elapsed time (per node + per run + per cycle
+      visits); fail-closed.
+- [ ] Preset resolution: `.hex/graphs/` > `~/.config/hex/graphs/` > built-in;
+      ship built-in `critique-loop` (codex implements → claude critiques →
+      gate) with `--input` parameters.
+- [ ] Verbs: `run` `resume` `status` `watch` `cancel` `validate`; `--json`
+      NDJSON on watch; stable exit codes.
+- [ ] Isolation: `shared` only.
+- [ ] Tests: kernel property basics (terminal runs schedule nothing; replay ==
+      projection; unbounded cycles rejected) + one kill-and-resume
+      integration test + critique-loop e2e on the mock worker.
 
-## Phase 2 — interactive sessions & MCP transport
+## Phase 2 — hardening + authoring
+
+Everything deliberately cut from the MVP.
+
+- [ ] Full validator: schema + published JSON Schema, worker-capability
+      matching; canonical `format`.
+- [ ] `templates:`/`extends:`, run-level reusable `gates:` + `accept.require`.
+- [ ] `command` node kind (shared executor with `gate`).
+- [ ] Atomic `state.json` snapshot projection; torn-tail tolerance; monotonic
+      seq audit.
+- [ ] Mock-worker contract suite (every adapter passes the same tests);
+      crash/replay suite (kill at every state transition).
+- [ ] Repeated-failure circuit breaker + progress-signature stall detection.
+- [ ] Verbs: `pause`, `logs`, `graph` (ascii/mermaid/dot); `capabilities`.
+- [ ] Isolation: per-run `worktree` opt-in (branch left for manual
+      integration; no auto-merge).
+- [ ] **Authoring skill**: SKILL.md shipped in-repo teaching an agent to
+      draft graph YAML from a task description and iterate against
+      `hex validate` / `hex graph`.
+- [ ] `hex init` (scaffold `.hex/` + example graph) + `hex doctor` (workers
+      installed/authed/versions).
+
+## Phase 3 — interactive sessions & MCP transport
 
 - [ ] `interactive: true` agent policy: live human↔agent conversation
       (grill-me/Q&A), every turn journaled (`worker.message`/`human.message`),
@@ -94,7 +134,7 @@ session (see README.md + AGENTS.md; research: `docs/design/gpt-research-{1,2}.md
       `finish_session(status)`) lowering to the same `Command`.
 - [ ] `context: compact` (structured handoff then fresh).
 
-## Phase 3 — approval + safe coding workflows
+## Phase 4 — approval + safe coding workflows
 
 - [ ] Approval `human` node (blocking decision on a finished proposal:
       approve/reject/edit with actor + rationale) — e.g. plan → human approves
@@ -105,8 +145,9 @@ session (see README.md + AGENTS.md; research: `docs/design/gpt-research-{1,2}.md
 - [ ] Worktree cleanup + manual integration helpers (still no auto-merge).
 - [ ] Builder commands (`hex add`/`hex connect`) mutating the YAML in place.
 - [ ] `triage`-style diagnostics + exportable run bundle; shell completion.
+- [ ] Config, richer policy layer: permissions, notifications, cost policies.
 
-## Phase 4 — explicit concurrency & sub-agents
+## Phase 5 — explicit concurrency & sub-agents
 
 - [ ] TODO(design): parallelism + sub-agent grammar in the YAML surface —
       revisit "even simpler YAML" at the same time.
@@ -119,16 +160,20 @@ session (see README.md + AGENTS.md; research: `docs/design/gpt-research-{1,2}.md
       (generation parallel, acceptance conservative and serialized).
 - [ ] Per-node cost/token budgets where workers report usage.
 
-## Phase 5 — daemon & remote surfaces
+## Phase 6 — daemon & remote surfaces
 
 - [ ] Per-run background controller; `RuntimeClient::Remote` over a run-local
       socket + scoped token (`hex run --background`, attach/detach).
-- [ ] `hex-mcp` server: same verbs as MCP tools; clients can start new runs.
+- [ ] `hex-mcp` server: same verbs as MCP tools; clients can start new runs;
+      authoring prompts/templates exposed over MCP.
+- [ ] `hex graph new` architect command (worker drafts a graph from a
+      description, validates, writes the file).
 - [ ] `hex-dashboard` TUI: projection consumer + `RuntimeClient`; can also
       start/control runs.
 
 ## Only after demand
 
 - [ ] Container/sandbox isolation adapters; PTY worker adapter tier.
-- [ ] Issue tracker / PR adapters; web viewer; agent-generated graphs;
-      distributed workers; SQLite query projection (deletable, rebuildable).
+- [ ] Issue tracker / PR adapters; web viewer; agent-generated graphs at
+      runtime; distributed workers; SQLite query projection (deletable,
+      rebuildable); preset marketplace/registry.

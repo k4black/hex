@@ -157,6 +157,25 @@ The kernel compiles any surface form to a flat, immutable Graph IR
 (nodes + typed edges + bounds); a run records the exact snapshot + hash. Every
 cycle must declare a bound — an unbounded cycle is a validation *error*.
 
+## Config & presets
+
+Layered config, project wins: `~/.config/hex/config.yaml` (user) ←
+`.hex/config.yaml` (project). It holds the **worker registry** — how to invoke
+each external agent (argv template, headless flags, model, declared
+capabilities) — plus default budgets/context/isolation.
+
+A **preset** is a named, parametrized graph resolved through three layers:
+`.hex/graphs/` (project) > `~/.config/hex/graphs/` (user) > built-in. hex
+ships `critique-loop` (codex implements → claude critiques → gate) as the
+flagship built-in:
+
+```bash
+hex run critique-loop --input task="fix the flaky auth test"
+```
+
+An authoring skill (SKILL.md shipped in-repo) teaches coding agents to draft
+graph YAML from a task description and iterate against `hex validate`.
+
 ## CLI surface
 
 The same verbs work from the CLI, MCP, and dashboard; all support `--json` /
