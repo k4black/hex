@@ -117,8 +117,8 @@ Everything deliberately cut from the MVP.
       full crash/replay suite (kill at every state transition, real SIGKILL of
       a child controller — beyond the Phase-1 resume/tamper/stale-lock tests).
 - [ ] Canonical self-contained compiled snapshot (hash covers interpolated
-      inputs + resolved defaults), superseding the source-hash + manifest.json
-      integrity check shipped in Phase 1.
+      inputs + resolved defaults), superseding the source-hash + defaults-in-
+      `RunCreated` integrity check shipped in Phase 1.
 - [ ] Repeated-failure circuit breaker + progress-signature stall detection.
 - [ ] Verbs: `pause`, `logs`, `graph` (ascii/mermaid/dot); `capabilities`.
 - [ ] Isolation: per-run `worktree` opt-in (branch left for manual
