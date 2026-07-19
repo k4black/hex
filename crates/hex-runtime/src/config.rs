@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
@@ -33,7 +33,7 @@ pub struct WorkerSpec {
 }
 
 /// Global fallback defaults.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DefaultsSpec {
     /// Default worker name for agent nodes.

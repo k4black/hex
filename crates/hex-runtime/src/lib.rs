@@ -133,9 +133,22 @@ impl Runtime {
         self.compile(&resolved.source, inputs)
     }
 
-    /// Compile already-resolved YAML `source` to a validated IR.
+    /// Compile already-resolved YAML `source` to a validated IR, using this
+    /// runtime's live config defaults.
     fn compile(&self, source: &str, inputs: &BTreeMap<String, String>) -> Result<Graph> {
-        let graph = loader::load(source, inputs, &self.config.defaults)?;
+        self.compile_with(source, inputs, &self.config.defaults)
+    }
+
+    /// Compile with an explicit set of fallback defaults — used on resume so a
+    /// run recompiles against the defaults it was *created* with, not whatever
+    /// the mutable config happens to say now.
+    fn compile_with(
+        &self,
+        source: &str,
+        inputs: &BTreeMap<String, String>,
+        defaults: &config::DefaultsSpec,
+    ) -> Result<Graph> {
+        let graph = loader::load(source, inputs, defaults)?;
         hex_kernel::validate(&graph).map_err(|issues| {
             let joined = issues
                 .iter()
@@ -145,6 +158,67 @@ impl Runtime {
             HexError::new(format!("graph is invalid:\n{joined}"))
         })?;
         Ok(graph)
+    }
+
+    /// Load a run with full integrity checks, returning its graph, journal, and
+    /// replayed state. The single verified path behind `resume`, `status`, and
+    /// `cancel`: it checks the run id, the snapshot hash triple, the recorded
+    /// creation hash (required), the persisted defaults, and journal lifecycle
+    /// before folding.
+    fn load_verified(&self, run_id: &str) -> Result<(Graph, Vec<Event>, State)> {
+        let run_dir = self.run_dir(run_id)?;
+        let source = std::fs::read_to_string(run_dir.join("graph.yaml"))
+            .map_err(|_| HexError::new(format!("run `{run_id}` not found")))?;
+        let events = journal::read_all(&run_dir.join("events.jsonl"))?;
+
+        // The journal's own run id must match the directory/operator id.
+        if let Some(first) = events.first()
+            && first.run_id != run_id
+        {
+            return Err(HexError::new("journal run id does not match the run directory"));
+        }
+
+        // Snapshot integrity: file hash == recorded sha256 == creation hash.
+        let computed = graph_hash(&source);
+        let stored = std::fs::read_to_string(run_dir.join("graph.sha256"))
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_default();
+        if stored != computed {
+            return Err(HexError::new(
+                "graph.yaml does not match graph.sha256 — snapshot was modified",
+            ));
+        }
+        let recorded = recorded_graph_hash(&events)
+            .ok_or_else(|| HexError::new("journal has no run_created hash to verify against"))?;
+        if recorded != computed {
+            return Err(HexError::new(
+                "graph.yaml does not match the hash recorded at run creation",
+            ));
+        }
+
+        // Recompile against the defaults the run was created with.
+        let defaults = self.load_manifest(&run_dir);
+        let inputs = recorded_inputs(&events);
+        let graph = self.compile_with(&source, &inputs, &defaults)?;
+
+        // Fail closed on a malformed lifecycle before folding it into state.
+        hex_kernel::check_journal(&events)
+            .map_err(|i| HexError::new(format!("journal is invalid: {i}")))?;
+
+        let mut state = State::default();
+        for event in &events {
+            state = reduce(&graph, state, event);
+        }
+        Ok((graph, events, state))
+    }
+
+    /// The effective defaults persisted at run creation, falling back to live
+    /// config if the manifest is absent (older runs).
+    fn load_manifest(&self, run_dir: &Path) -> config::DefaultsSpec {
+        std::fs::read_to_string(run_dir.join("manifest.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| self.config.defaults.clone())
     }
 
     /// Start a new run of `reference`, parametrized by `inputs`. Blocks until
@@ -167,10 +241,15 @@ impl Runtime {
         std::fs::create_dir_all(run_dir.join("attempts"))?;
         let _lock = RunLock::acquire(&run_dir)?;
 
-        // Persist the exact graph snapshot + its hash for auditability/resume.
+        // Persist the exact graph snapshot, its hash, and the effective defaults
+        // used to compile it, so resume is independent of later config edits.
         std::fs::write(run_dir.join("graph.yaml"), &resolved.source)?;
         let hash = graph_hash(&resolved.source);
         std::fs::write(run_dir.join("graph.sha256"), &hash)?;
+        std::fs::write(
+            run_dir.join("manifest.json"),
+            serde_json::to_string(&self.config.defaults)?,
+        )?;
 
         let journal = Journal::create(run_dir.join("events.jsonl"))?;
         let mut session = Session::new(
@@ -212,41 +291,13 @@ impl Runtime {
         if !run_dir.join("graph.yaml").exists() {
             return Err(HexError::new(format!("run `{run_id}` not found")));
         }
-        // Exclusive ownership: refuse to resume a run another process is driving.
+        // Exclusive ownership: refuse to resume a run another live process is
+        // driving. A crashed run's advisory lock is released by the OS, so this
+        // succeeds after a real crash.
         let _lock = RunLock::acquire(&run_dir)?;
 
-        let source = std::fs::read_to_string(run_dir.join("graph.yaml"))?;
-        let events = journal::read_all(&run_dir.join("events.jsonl"))?;
-
-        // Snapshot integrity: the file on disk, the recorded sha256, and the
-        // hash the run was created with must all agree before we replay.
-        let computed = graph_hash(&source);
-        let stored = std::fs::read_to_string(run_dir.join("graph.sha256"))
-            .map(|s| s.trim().to_owned())
-            .unwrap_or_default();
-        if stored != computed {
-            return Err(HexError::new(
-                "graph.yaml does not match graph.sha256 — snapshot was modified",
-            ));
-        }
-        if let Some(recorded) = recorded_graph_hash(&events)
-            && recorded != computed
-        {
-            return Err(HexError::new(
-                "graph.yaml does not match the hash recorded at run creation",
-            ));
-        }
-
-        let inputs = recorded_inputs(&events);
-        // Re-validate on resume: a graph that no longer validates must not run.
-        let graph = self.compile(&source, &inputs)?;
+        let (graph, _events, state) = self.load_verified(run_id)?;
         check_workers(&graph, &self.workers)?;
-
-        // Replay the journal into the current projection.
-        let mut state = State::default();
-        for event in &events {
-            state = reduce(&graph, state, event);
-        }
 
         let journal = Journal::open_append(run_dir.join("events.jsonl"))?;
         let mut session = Session::new(
@@ -299,7 +350,7 @@ impl Runtime {
     /// # Errors
     /// Fails if the run does not exist or cannot be replayed.
     pub fn status(&self, run_id: &str) -> Result<StatusReport> {
-        let (_, state) = self.replay(run_id)?;
+        let (_, _, state) = self.load_verified(run_id)?;
         Ok(StatusReport {
             run_id: run_id.to_owned(),
             status: state.status.clone(),
@@ -328,17 +379,21 @@ impl Runtime {
     /// # Errors
     /// Fails if the run does not exist, is active, or cannot be appended to.
     pub fn cancel(&self, run_id: &str) -> Result<()> {
-        let (_, state) = self.replay(run_id)?;
+        let run_dir = self.run_dir(run_id)?;
+        // Take the same exclusive lock a driver holds: acquiring it proves no
+        // live process is writing, and holding it makes the append atomic w.r.t.
+        // a concurrent resume. `acquire` fails cleanly if the run is active.
+        let _lock = RunLock::acquire(&run_dir).map_err(|_| {
+            HexError::new(
+                "run is active (locked by a live process); external cancellation of a live \
+                 foreground run is not supported in the slim MVP",
+            )
+        })?;
+        let (_, _, state) = self.load_verified(run_id)?;
         if state.is_finished() {
             return Ok(());
         }
-        if self.run_dir(run_id)?.join("run.lock").exists() {
-            return Err(HexError::new(
-                "run is active (locked); external cancellation of a live foreground run \
-                 is not supported in the slim MVP",
-            ));
-        }
-        let mut journal = Journal::open_append(self.run_dir(run_id)?.join("events.jsonl"))?;
+        let mut journal = Journal::open_append(run_dir.join("events.jsonl"))?;
         journal.append(
             run_id,
             None,
@@ -351,20 +406,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// Load a run's graph and replay its journal into projected state.
-    fn replay(&self, run_id: &str) -> Result<(Graph, State)> {
-        let run_dir = self.run_dir(run_id)?;
-        let source = std::fs::read_to_string(run_dir.join("graph.yaml"))
-            .map_err(|_| HexError::new(format!("run `{run_id}` not found")))?;
-        let events = journal::read_all(&run_dir.join("events.jsonl"))?;
-        let inputs = recorded_inputs(&events);
-        let graph = self.compile(&source, &inputs)?;
-        let mut state = State::default();
-        for event in &events {
-            state = reduce(&graph, state, event);
-        }
-        Ok((graph, state))
-    }
 }
 
 /// Recover the `--input` values a run was created with from its journal.
@@ -411,30 +452,34 @@ fn random_suffix() -> String {
 }
 
 /// An exclusive per-run lock enforcing the single-writer invariant: only one
-/// process may drive (or append a terminal to) a run at a time. Released on drop.
+/// process may drive (or append a terminal to) a run at a time.
+///
+/// It is an **OS advisory lock** on an open file (`fs2`), so the kernel
+/// releases it automatically if the holder is SIGKILLed — a crashed run can be
+/// resumed, while a live run cannot be double-driven. The `run.lock` file
+/// merely anchors the lock; its presence alone never blocks anyone.
 struct RunLock {
-    path: PathBuf,
+    _file: std::fs::File,
 }
 
 impl RunLock {
     fn acquire(run_dir: &Path) -> Result<Self> {
-        let path = run_dir.join("run.lock");
-        match OpenOptions::new().create_new(true).write(true).open(&path) {
-            Ok(mut f) => {
-                let _ = writeln!(f, "{}", std::process::id());
-                Ok(Self { path })
+        use fs2::FileExt;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(run_dir.join("run.lock"))?;
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
+                Ok(Self { _file: file })
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(HexError::new(
-                "run is already active (locked); refusing a concurrent writer",
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(HexError::new(
+                "run is already active (locked by a live process); refusing a concurrent writer",
             )),
             Err(e) => Err(e.into()),
         }
-    }
-}
-
-impl Drop for RunLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 

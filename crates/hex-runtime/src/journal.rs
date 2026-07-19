@@ -55,6 +55,12 @@ fn scan(path: &Path) -> Result<Scan> {
         }
         let ev: Event = serde_json::from_str(text)
             .map_err(|e| corrupt(events.len(), &format!("malformed record: {e}")))?;
+        if ev.schema_version != PROTOCOL_VERSION {
+            return Err(corrupt(
+                events.len(),
+                &format!("unsupported schema_version {}", ev.schema_version),
+            ));
+        }
         if ev.seq != expected_seq {
             return Err(corrupt(
                 events.len(),

@@ -7,6 +7,8 @@
 
 use std::collections::BTreeSet;
 
+use hex_proto::{Event, EventBody, PROTOCOL_VERSION};
+
 use crate::graph::{Graph, NodeKind, NodeSpec};
 
 /// A single validation failure, located by node/edge where possible.
@@ -219,6 +221,80 @@ fn check_signal_names(graph: &Graph, issues: &mut Vec<Issue>) {
             }
         }
     }
+}
+
+/// Validate the lifecycle ordering of a run's journal *before* folding it, so a
+/// malformed or forged sequence fails closed instead of silently mutating the
+/// projection. Complements the byte-level integrity the runtime's journal
+/// reader already enforces (contiguous seq, schema, single run id).
+///
+/// # Errors
+/// Returns the first lifecycle violation found.
+pub fn check_journal(events: &[Event]) -> Result<(), Issue> {
+    #[derive(PartialEq)]
+    enum Phase {
+        Init,
+        Created,
+        Running,
+        Finished,
+    }
+    let mut phase = Phase::Init;
+    let mut awaiting = false;
+
+    for (i, e) in events.iter().enumerate() {
+        if e.schema_version != PROTOCOL_VERSION {
+            return Err(bad(i, format!("unsupported schema_version {}", e.schema_version)));
+        }
+        if phase == Phase::Finished {
+            // Only inert diagnostics may trail a terminal.
+            if !matches!(e.body, EventBody::Note { .. }) {
+                return Err(bad(i, "event after the run finished"));
+            }
+            continue;
+        }
+        match &e.body {
+            EventBody::RunCreated { .. } => {
+                if phase != Phase::Init {
+                    return Err(bad(i, "run_created must be the first event"));
+                }
+                phase = Phase::Created;
+            }
+            EventBody::RunStarted => {
+                if phase != Phase::Created {
+                    return Err(bad(i, "run_started out of order"));
+                }
+                phase = Phase::Running;
+            }
+            EventBody::AttemptStarted { .. } => {
+                if phase != Phase::Running || awaiting {
+                    return Err(bad(i, "attempt_started while not idle-running"));
+                }
+                if e.node_id.is_none() || e.attempt_id.is_none() {
+                    return Err(bad(i, "attempt_started missing node/attempt id"));
+                }
+                awaiting = true;
+            }
+            EventBody::Signal { .. } | EventBody::AttemptFailed { .. } => {
+                if !awaiting {
+                    return Err(bad(i, "signal/attempt_failed with no attempt in flight"));
+                }
+                awaiting = false;
+            }
+            EventBody::AttemptInterrupted => {
+                if !awaiting {
+                    return Err(bad(i, "attempt_interrupted with no attempt in flight"));
+                }
+                awaiting = false;
+            }
+            EventBody::RunFinished { .. } => phase = Phase::Finished,
+            EventBody::BudgetExhausted { .. } | EventBody::Note { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn bad(index: usize, why: impl Into<String>) -> Issue {
+    Issue::new("E-journal-lifecycle", format!("event {index}: {}", why.into()))
 }
 
 /// A routing signal name: lowercase, starts with a letter, `[a-z0-9_]` after.

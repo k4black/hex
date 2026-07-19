@@ -50,6 +50,9 @@ pub struct WorkOutcome {
     pub signal: Option<String>,
     /// Execution failure reason (the agent crashed or emitted nothing valid).
     pub error: Option<String>,
+    /// Whether the failure was specifically a per-attempt timeout, so the
+    /// runtime can record the `TimedOut` disposition rather than plain `Failed`.
+    pub timed_out: bool,
 }
 
 impl WorkOutcome {
@@ -59,6 +62,7 @@ impl WorkOutcome {
         Self {
             signal: Some(name.into()),
             error: None,
+            timed_out: false,
         }
     }
 
@@ -68,6 +72,17 @@ impl WorkOutcome {
         Self {
             signal: None,
             error: Some(reason.into()),
+            timed_out: false,
+        }
+    }
+
+    /// A failed outcome caused by exceeding the attempt's time budget.
+    #[must_use]
+    pub fn timed_out(reason: impl Into<String>) -> Self {
+        Self {
+            signal: None,
+            error: Some(reason.into()),
+            timed_out: true,
         }
     }
 }

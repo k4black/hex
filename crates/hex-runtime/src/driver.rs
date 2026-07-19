@@ -157,7 +157,7 @@ impl<'a> Session<'a> {
 
     fn start_attempt(&mut self, node_id: &str, attempt_id: &str, idk: &str) -> Result<()> {
         let Some(node) = self.graph.node(node_id) else {
-            return self.fail_attempt(node_id, attempt_id, "unknown node");
+            return self.fail_attempt(node_id, attempt_id, "unknown node", Disposition::Failed);
         };
         let NodeSpec::Agent {
             worker,
@@ -166,7 +166,7 @@ impl<'a> Session<'a> {
             ..
         } = &node.spec
         else {
-            return self.fail_attempt(node_id, attempt_id, "not an agent node");
+            return self.fail_attempt(node_id, attempt_id, "not an agent node", Disposition::Failed);
         };
         let worker_name = worker.clone();
 
@@ -182,7 +182,12 @@ impl<'a> Session<'a> {
         )?;
 
         let Some(adapter) = self.workers.get(&worker_name) else {
-            return self.fail_attempt(node_id, attempt_id, &format!("unknown worker `{worker_name}`"));
+            return self.fail_attempt(
+                node_id,
+                attempt_id,
+                &format!("unknown worker `{worker_name}`"),
+                Disposition::Failed,
+            );
         };
 
         let attempt_dir = self.attempt_dir(attempt_id)?;
@@ -205,23 +210,38 @@ impl<'a> Session<'a> {
                 Actor::agent(worker_name),
                 EventBody::Signal { name: signal },
             ),
-            Some(signal) => {
-                self.fail_attempt(node_id, attempt_id, &format!("emitted disallowed `{signal}`"))
-            }
+            Some(signal) => self.fail_attempt(
+                node_id,
+                attempt_id,
+                &format!("emitted disallowed `{signal}`"),
+                Disposition::Failed,
+            ),
             None => {
                 let reason = outcome.error.unwrap_or_else(|| "no signal".to_owned());
-                self.fail_attempt(node_id, attempt_id, &reason)
+                let disposition = if outcome.timed_out {
+                    Disposition::TimedOut
+                } else {
+                    Disposition::Failed
+                };
+                self.fail_attempt(node_id, attempt_id, &reason, disposition)
             }
         }
     }
 
     fn run_gate(&mut self, node_id: &str, attempt_id: &str, idk: &str) -> Result<()> {
         let Some(node) = self.graph.node(node_id) else {
-            return self.fail_attempt(node_id, attempt_id, "unknown node");
+            return self.fail_attempt(node_id, attempt_id, "unknown node", Disposition::Failed);
         };
         let command = match &node.spec {
             NodeSpec::Gate { command } | NodeSpec::Command { command } => command.clone(),
-            _ => return self.fail_attempt(node_id, attempt_id, "not a gate/command node"),
+            _ => {
+                return self.fail_attempt(
+                    node_id,
+                    attempt_id,
+                    "not a gate/command node",
+                    Disposition::Failed,
+                );
+            }
         };
 
         self.record(
@@ -250,11 +270,27 @@ impl<'a> Session<'a> {
                     },
                 )
             }
-            Err(reason) => self.fail_attempt(node_id, attempt_id, &reason),
+            Err(fail) => {
+                let disposition = if fail.timed_out {
+                    Disposition::TimedOut
+                } else {
+                    Disposition::Failed
+                };
+                self.fail_attempt(node_id, attempt_id, &fail.reason, disposition)
+            }
         }
     }
 
-    fn fail_attempt(&mut self, node_id: &str, attempt_id: &str, reason: &str) -> Result<()> {
+    /// Record a failed attempt *and* the run's terminal disposition, so a
+    /// failure always leaves an explicit `RunFinished` in the journal (never an
+    /// implicit terminal). A failed attempt ends the run — redo is a new run.
+    fn fail_attempt(
+        &mut self,
+        node_id: &str,
+        attempt_id: &str,
+        reason: &str,
+        disposition: Disposition,
+    ) -> Result<()> {
         self.record(
             Some(node_id),
             Some(attempt_id),
@@ -262,6 +298,12 @@ impl<'a> Session<'a> {
             EventBody::AttemptFailed {
                 reason: reason.to_owned(),
             },
+        )?;
+        self.record(
+            None,
+            None,
+            Actor::runtime(),
+            EventBody::RunFinished { disposition },
         )
     }
 
@@ -272,23 +314,38 @@ impl<'a> Session<'a> {
     }
 }
 
+/// An infrastructure failure of a gate/command process (not a pass/fail
+/// verdict): a bad argv, spawn/log error, or a deadline kill.
+struct ProcFail {
+    timed_out: bool,
+    reason: String,
+}
+
+impl ProcFail {
+    fn infra(reason: impl Into<String>) -> Self {
+        Self {
+            timed_out: false,
+            reason: reason.into(),
+        }
+    }
+}
+
 /// Run a gate/command argv, capturing output to the attempt dir.
 /// `Ok(true/false)` is a genuine pass/fail verdict from the process exit status;
-/// `Err(_)` is an infrastructure failure (bad command, spawn/log error, or
-/// deadline kill) that must not be treated as a `failed` verdict.
+/// `Err(_)` is an infrastructure failure that must not be treated as `failed`.
 fn run_process(
     command: &[String],
     workdir: &Path,
     attempt_dir: &Path,
     deadline_ms: Option<u64>,
-) -> std::result::Result<bool, String> {
+) -> std::result::Result<bool, ProcFail> {
     let (program, args) = command
         .split_first()
-        .ok_or_else(|| "gate/command has an empty argv".to_owned())?;
+        .ok_or_else(|| ProcFail::infra("gate/command has an empty argv"))?;
     let stdout = std::fs::File::create(attempt_dir.join("stdout.log"))
-        .map_err(|e| format!("cannot open gate stdout log: {e}"))?;
+        .map_err(|e| ProcFail::infra(format!("cannot open gate stdout log: {e}")))?;
     let stderr = std::fs::File::create(attempt_dir.join("stderr.log"))
-        .map_err(|e| format!("cannot open gate stderr log: {e}"))?;
+        .map_err(|e| ProcFail::infra(format!("cannot open gate stderr log: {e}")))?;
     let mut child = ProcCommand::new(program)
         .args(args)
         .current_dir(workdir)
@@ -296,11 +353,14 @@ fn run_process(
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
-        .map_err(|e| format!("spawn `{program}` failed: {e}"))?;
+        .map_err(|e| ProcFail::infra(format!("spawn `{program}` failed: {e}")))?;
     match hex_worker::wait_bounded(&mut child, deadline_ms) {
         Ok(Some(status)) => Ok(status.success()),
-        Ok(None) => Err("gate exceeded its time budget (killed)".to_owned()),
-        Err(e) => Err(format!("gate wait failed: {e}")),
+        Ok(None) => Err(ProcFail {
+            timed_out: true,
+            reason: "gate exceeded its time budget (killed)".to_owned(),
+        }),
+        Err(e) => Err(ProcFail::infra(format!("gate wait failed: {e}"))),
     }
 }
 

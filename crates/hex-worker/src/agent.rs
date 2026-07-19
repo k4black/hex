@@ -105,7 +105,7 @@ impl Worker for AgentWorker {
 
         let status = match wait_bounded(&mut child, request.deadline_ms) {
             Ok(Some(status)) => status,
-            Ok(None) => return WorkOutcome::error("attempt exceeded its time budget (killed)"),
+            Ok(None) => return WorkOutcome::timed_out("attempt exceeded its time budget (killed)"),
             Err(e) => return WorkOutcome::error(format!("wait failed: {e}")),
         };
 
@@ -136,8 +136,10 @@ pub fn wait_bounded(child: &mut Child, deadline_ms: Option<u64>) -> std::io::Res
             return Ok(Some(status));
         }
         if u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX) >= budget {
-            let _ = child.kill();
-            let _ = child.wait();
+            // Verify termination rather than assuming kill succeeded: propagate
+            // an error if we cannot confirm the child is gone.
+            child.kill()?;
+            child.wait()?;
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -148,8 +150,13 @@ pub fn wait_bounded(child: &mut Child, deadline_ms: Option<u64>) -> std::io::Res
 /// and it must be in `may_propose`. Multiple different emissions are ambiguous
 /// and rejected rather than silently resolved to the last one.
 fn read_signal(emit_file: &std::path::Path, may_propose: &[String]) -> Result<String, String> {
-    let contents = fs::read_to_string(emit_file)
-        .map_err(|_| "agent emitted no signal".to_owned())?;
+    // Bound the read: a faulty agent must not be able to exhaust memory by
+    // writing an unbounded emit file. Valid signals are tiny; 64 KiB is ample.
+    const MAX_EMIT_BYTES: u64 = 64 * 1024;
+    let file = fs::File::open(emit_file).map_err(|_| "agent emitted no signal".to_owned())?;
+    let mut contents = String::new();
+    std::io::Read::read_to_string(&mut std::io::Read::take(file, MAX_EMIT_BYTES), &mut contents)
+        .map_err(|e| format!("could not read emit file: {e}"))?;
     let distinct: BTreeSet<&str> = contents
         .lines()
         .map(str::trim)

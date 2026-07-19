@@ -61,11 +61,21 @@ fn cmd_validate(args: &[String]) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     match runtime.validate(reference, &parsed.inputs) {
         Ok(graph) => {
-            println!("ok: `{}` is valid ({} nodes)", graph.name, graph.nodes.len());
+            if parsed.json {
+                let v = serde_json::json!({"ok": true, "name": graph.name, "nodes": graph.nodes.len()});
+                println!("{v}");
+            } else {
+                println!("ok: `{}` is valid ({} nodes)", graph.name, graph.nodes.len());
+            }
             Ok(ExitCode::SUCCESS)
         }
         Err(e) => {
-            eprintln!("{e}");
+            if parsed.json {
+                let v = serde_json::json!({"ok": false, "error": e.to_string()});
+                println!("{v}");
+            } else {
+                eprintln!("{e}");
+            }
             Ok(ExitCode::from(2))
         }
     }
@@ -76,6 +86,21 @@ fn cmd_graph(args: &[String]) -> Result<ExitCode, String> {
     let reference = parsed.positional.first().ok_or("usage: hex graph <graph>")?;
     let runtime = open_runtime()?;
     let graph = runtime.validate(reference, &parsed.inputs).map_err(|e| e.to_string())?;
+    if parsed.json {
+        let nodes: Vec<_> = graph
+            .nodes
+            .values()
+            .map(|n| serde_json::json!({"id": n.id, "kind": kind_name(n.spec.kind())}))
+            .collect();
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .map(|e| serde_json::json!({"from": e.from, "on": e.on, "to": e.to}))
+            .collect();
+        let v = serde_json::json!({"name": graph.name, "entry": graph.entry, "nodes": nodes, "edges": edges});
+        println!("{v}");
+        return Ok(ExitCode::SUCCESS);
+    }
     println!("graph: {}   entry: {}", graph.name, graph.entry);
     println!("nodes:");
     for node in graph.nodes.values() {
@@ -172,7 +197,12 @@ fn cmd_cancel(args: &[String]) -> Result<ExitCode, String> {
     let run_id = parsed.positional.first().ok_or("usage: hex cancel <run-id>")?;
     let runtime = open_runtime()?;
     runtime.cancel(run_id).map_err(|e| e.to_string())?;
-    println!("cancelled {run_id}");
+    if parsed.json {
+        let v = serde_json::json!({"run_id": run_id, "cancelled": true});
+        println!("{v}");
+    } else {
+        println!("cancelled {run_id}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 

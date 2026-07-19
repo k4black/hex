@@ -62,8 +62,10 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
 
 Goal (met): `hex run critique-loop --input task="…"` runs end-to-end — codex
 implements, claude critiques, loop until approved + gate passes — and a killed
-run resumes from its journal. 39 tests + clippy green; verified end-to-end
-against the real `hex` binary.
+run resumes from its journal. 53 tests + clippy green; verified end-to-end
+against the real `hex` binary, and hardened through a cross-model review round
+(journal torn-tail repair, snapshot-integrity verification, run-lock, budget
+fail-closed, typed timeout disposition, evidence/correlation guards).
 
 - [x] `hex-proto`: versioned `Event` envelope (schema, seq, at_ms, run/node/
       attempt, actor, typed `EventBody`) + `Command` + `Disposition`.
@@ -108,10 +110,15 @@ Everything deliberately cut from the MVP.
       matching; canonical `format`.
 - [ ] `templates:`/`extends:`, run-level reusable `gates:` + `accept.require`.
 - [ ] `command` node kind (shared executor with `gate`).
-- [ ] Atomic `state.json` snapshot projection; torn-tail tolerance; monotonic
-      seq audit.
+- [ ] Atomic `state.json` snapshot projection. (Torn-tail repair, monotonic-seq
+      and lifecycle auditing, and a run-lock already landed in Phase 1's
+      hardening pass.)
 - [ ] Mock-worker contract suite (every adapter passes the same tests);
-      crash/replay suite (kill at every state transition).
+      full crash/replay suite (kill at every state transition, real SIGKILL of
+      a child controller — beyond the Phase-1 resume/tamper/stale-lock tests).
+- [ ] Canonical self-contained compiled snapshot (hash covers interpolated
+      inputs + resolved defaults), superseding the source-hash + manifest.json
+      integrity check shipped in Phase 1.
 - [ ] Repeated-failure circuit breaker + progress-signature stall detection.
 - [ ] Verbs: `pause`, `logs`, `graph` (ascii/mermaid/dot); `capabilities`.
 - [ ] Isolation: per-run `worktree` opt-in (branch left for manual

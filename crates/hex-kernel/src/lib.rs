@@ -21,7 +21,7 @@ pub mod graph;
 pub mod validate;
 
 pub use graph::{Budget, Context, Edge, Graph, Node, NodeKind, NodeSpec, Requirement};
-pub use validate::{Issue, validate};
+pub use validate::{Issue, check_journal, validate};
 
 /// Status of a run, derived purely by folding [`reduce`] over the journal.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -192,7 +192,10 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             }
             state.awaiting = false;
             state.current_attempt = None;
-            state.status = Status::Finished(Disposition::Failed);
+            // The disposition for a failed attempt is decided by the runtime,
+            // which records an explicit `RunFinished` (Failed or TimedOut).
+            // reduce does not synthesize a terminal, so every terminal outcome
+            // is backed by a journaled `RunFinished` event.
         }
         EventBody::RunFinished { disposition } => {
             state.status = Status::Finished(*disposition);
@@ -242,10 +245,14 @@ pub fn schedule(graph: &Graph, state: &RunState, now_ms: u64) -> Vec<Effect> {
     {
         return vec![terminal(Disposition::BudgetExhausted)];
     }
-    if let Some(maxe) = graph.budget.elapsed_ms
-        && now_ms.saturating_sub(state.started_at_ms) >= maxe
-    {
-        return vec![terminal(Disposition::TimedOut)];
+    if let Some(maxe) = graph.budget.elapsed_ms {
+        // Fail closed on the time budget, and treat a backward clock (now before
+        // the recorded start) conservatively as exhausted rather than granting a
+        // fresh budget.
+        let over = now_ms < state.started_at_ms || now_ms - state.started_at_ms >= maxe;
+        if over {
+            return vec![terminal(Disposition::TimedOut)];
+        }
     }
 
     let attempt_id = format!("att_{}", state.attempts_total + 1);
@@ -287,9 +294,14 @@ fn terminal(disposition: Disposition) -> Effect {
     Effect::RecordTerminal { disposition }
 }
 
-/// Whether `event` refers to the currently in-flight node + attempt.
+/// Whether `event` refers to the currently in-flight node + attempt. Requires
+/// an attempt to actually be in flight — a `Signal`/`AttemptFailed` arriving
+/// while nothing is awaiting is spurious and must not alter the projection.
 fn correlated(state: &RunState, event: &Event) -> bool {
-    event.node_id == state.current && event.attempt_id == state.current_attempt
+    state.awaiting
+        && state.current_attempt.is_some()
+        && event.node_id == state.current
+        && event.attempt_id == state.current_attempt
 }
 
 #[cfg(test)]
