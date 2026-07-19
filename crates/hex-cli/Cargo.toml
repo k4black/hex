@@ -1,0 +1,22 @@
+[package]
+name = "hex-cli"
+description = "hex: command-line operator surface (the `hex` binary)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "hex"
+path = "src/main.rs"
+
+[dependencies]
+hex-proto = { workspace = true }
+hex-core = { workspace = true }
+hex-engine = { workspace = true }
+hex-backend = { workspace = true }
+
+[lints]
+workspace = true

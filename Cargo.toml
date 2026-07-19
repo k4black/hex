@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/k4black/hex"
+
+[workspace.dependencies]
+# Internal crates (dependencies point strictly inward: proto <- core <- engine,
+# proto/core <- backend, everything <- cli).
+hex-proto = { path = "crates/hex-proto" }
+hex-core = { path = "crates/hex-core" }
+hex-engine = { path = "crates/hex-engine" }
+hex-backend = { path = "crates/hex-backend" }
+
+# External, shared across the workspace so versions stay aligned.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+criterion = "0.7"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Thin release profile; tune later once there is real code to measure.
+[profile.release]
+lto = "thin"
