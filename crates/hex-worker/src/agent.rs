@@ -6,8 +6,10 @@
 //! sets `HEX_EMIT_FILE`, the agent runs `hex emit <event>`, and after the
 //! process exits this adapter reads the emitted signal.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::process::{Command as ProcCommand, Stdio};
+use std::process::{Child, Command as ProcCommand, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use hex_proto::Capability;
 
@@ -30,17 +32,15 @@ pub struct AgentWorker {
 }
 
 impl AgentWorker {
-    /// Build an agent worker with the default headless capabilities.
+    /// Build an agent worker. It advertises only what the blocking headless
+    /// adapter actually provides: a fresh session per attempt. (Streaming,
+    /// resume, and graceful cancel are declared once genuinely implemented.)
     #[must_use]
     pub fn new(name: impl Into<String>, command: Vec<String>) -> Self {
         Self {
             name: name.into(),
             command,
-            capabilities: CapabilityManifest::from(&[
-                Capability::FreshSessions,
-                Capability::StreamingOutput,
-                Capability::GracefulCancel,
-            ]),
+            capabilities: CapabilityManifest::from(&[Capability::FreshSessions]),
         }
     }
 }
@@ -103,34 +103,73 @@ impl Worker for AgentWorker {
             // drop closes stdin
         }
 
-        let status = match child.wait() {
-            Ok(s) => s,
+        let status = match wait_bounded(&mut child, request.deadline_ms) {
+            Ok(Some(status)) => status,
+            Ok(None) => return WorkOutcome::error("attempt exceeded its time budget (killed)"),
             Err(e) => return WorkOutcome::error(format!("wait failed: {e}")),
         };
 
+        // A nonzero exit is an infrastructure/agent failure, not a routing
+        // proposal — never accept a signal from a process that failed.
+        if !status.success() {
+            let code = status.code().map_or_else(|| "signal".to_owned(), |c| c.to_string());
+            return WorkOutcome::error(format!("agent exited nonzero (exit {code})"));
+        }
+
         match read_signal(&emit_file, &request.may_propose) {
             Ok(signal) => WorkOutcome::signal(signal),
-            Err(reason) => {
-                let code = status.code().map_or_else(|| "signal".to_owned(), |c| c.to_string());
-                WorkOutcome::error(format!("{reason} (exit {code})"))
-            }
+            Err(reason) => WorkOutcome::error(reason),
         }
     }
 }
 
-/// Read the last emitted signal and confirm it is allowed for this node.
+/// Wait for `child`, killing it if it outlives `deadline_ms`. `Ok(None)` means
+/// the deadline fired and the child was killed. Shared by the agent adapter and
+/// the runtime's gate executor so both honor per-attempt time budgets.
+pub fn wait_bounded(child: &mut Child, deadline_ms: Option<u64>) -> std::io::Result<Option<ExitStatus>> {
+    let Some(budget) = deadline_ms else {
+        return child.wait().map(Some);
+    };
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX) >= budget {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Read the emitted signal: the agent must emit exactly one distinct value,
+/// and it must be in `may_propose`. Multiple different emissions are ambiguous
+/// and rejected rather than silently resolved to the last one.
 fn read_signal(emit_file: &std::path::Path, may_propose: &[String]) -> Result<String, String> {
     let contents = fs::read_to_string(emit_file)
         .map_err(|_| "agent emitted no signal".to_owned())?;
-    let last = contents
+    let distinct: BTreeSet<&str> = contents
         .lines()
         .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .ok_or_else(|| "agent emitted no signal".to_owned())?;
-    if may_propose.iter().any(|allowed| allowed == last) {
-        Ok(last.to_owned())
-    } else {
-        Err(format!("agent emitted `{last}` which is not in may_propose"))
+        .filter(|l| !l.is_empty())
+        .collect();
+    match distinct.len() {
+        0 => Err("agent emitted no signal".to_owned()),
+        1 => {
+            let signal = *distinct.iter().next().expect("one element");
+            if may_propose.iter().any(|allowed| allowed == signal) {
+                Ok(signal.to_owned())
+            } else {
+                Err(format!("agent emitted `{signal}` which is not in may_propose"))
+            }
+        }
+        _ => {
+            let mut names: Vec<&str> = distinct.into_iter().collect();
+            names.sort_unstable();
+            Err(format!("agent emitted multiple signals: {}", names.join(", ")))
+        }
     }
 }
 
@@ -154,6 +193,7 @@ mod tests {
             may_propose: may.iter().map(|s| (*s).to_owned()).collect(),
             workdir: dir.to_path_buf(),
             attempt_dir: dir.to_path_buf(),
+            deadline_ms: None,
         }
     }
 
@@ -194,5 +234,52 @@ mod tests {
         let worker = AgentWorker::new("fake", vec!["true".to_owned()]);
         let outcome = worker.run(&request(&dir, &["ready"]));
         assert!(outcome.error.is_some());
+    }
+
+    #[test]
+    fn signal_from_a_failed_process_is_rejected() {
+        let dir = temp_dir("nonzero");
+        // Emit a valid signal, then exit nonzero — must not be accepted.
+        let worker = AgentWorker::new(
+            "fake",
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf ready > \"$HEX_EMIT_FILE\"; exit 3".to_owned(),
+            ],
+        );
+        let outcome = worker.run(&request(&dir, &["ready"]));
+        assert!(outcome.signal.is_none());
+        assert!(outcome.error.unwrap().contains("nonzero"));
+    }
+
+    #[test]
+    fn multiple_distinct_emissions_are_ambiguous() {
+        let dir = temp_dir("ambiguous");
+        let worker = AgentWorker::new(
+            "fake",
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf 'approved\\nchanges_requested\\n' > \"$HEX_EMIT_FILE\"".to_owned(),
+            ],
+        );
+        let outcome = worker.run(&request(&dir, &["approved", "changes_requested"]));
+        assert!(outcome.error.unwrap().contains("multiple signals"));
+    }
+
+    #[test]
+    fn deadline_kills_a_slow_child() {
+        let dir = temp_dir("deadline");
+        let worker = AgentWorker::new(
+            "fake",
+            vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+        );
+        let mut req = request(&dir, &["ready"]);
+        req.deadline_ms = Some(100);
+        let start = std::time::Instant::now();
+        let outcome = worker.run(&req);
+        assert!(start.elapsed().as_secs() < 5, "must not wait for the child");
+        assert!(outcome.error.unwrap().contains("time budget"));
     }
 }

@@ -17,7 +17,7 @@ use hex_proto::Capability;
 pub mod agent;
 pub mod mock;
 
-pub use agent::AgentWorker;
+pub use agent::{AgentWorker, wait_bounded};
 pub use mock::MockWorker;
 
 /// What the runtime hands a worker to run one attempt.
@@ -37,6 +37,9 @@ pub struct WorkRequest {
     pub workdir: PathBuf,
     /// Per-attempt scratch directory for stdout/stderr and the emit file.
     pub attempt_dir: PathBuf,
+    /// Wall-clock deadline for this attempt in milliseconds; the child is
+    /// killed if it runs longer. `None` means no per-attempt time bound.
+    pub deadline_ms: Option<u64>,
 }
 
 /// What a worker reports after one attempt. Exactly one of `signal`/`error`

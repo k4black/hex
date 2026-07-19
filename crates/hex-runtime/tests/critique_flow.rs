@@ -107,6 +107,47 @@ fn budget_exhaustion_fails_closed() {
 }
 
 #[test]
+fn rejects_unsafe_run_ids() {
+    let root = temp_root("badid");
+    let runtime = Runtime::with_workers(root, Config::builtin(), Workers::new());
+    for bad in ["../escape", "run_/../x", "nope", "run_"] {
+        assert!(runtime.status(bad).is_err(), "status accepted `{bad}`");
+        assert!(runtime.resume(bad).is_err(), "resume accepted `{bad}`");
+        assert!(runtime.events(bad).is_err(), "events accepted `{bad}`");
+    }
+}
+
+#[test]
+fn tampered_snapshot_is_rejected_on_resume() {
+    let root = temp_root("tamper");
+    let run_id = "run_tamper";
+    let run_dir = root.join(".hex").join("runs").join(run_id);
+    std::fs::create_dir_all(run_dir.join("attempts")).expect("mkdir");
+    std::fs::write(run_dir.join("graph.yaml"), GRAPH).expect("graph.yaml");
+    // A sha256 that does not match the graph text must block resume.
+    std::fs::write(run_dir.join("graph.sha256"), "not_the_real_hash").expect("sha");
+    {
+        let mut j = Journal::create(run_dir.join("events.jsonl")).expect("journal");
+        j.append(
+            run_id,
+            None,
+            None,
+            Actor::runtime(),
+            EventBody::RunCreated {
+                graph_hash: "not_the_real_hash".to_owned(),
+                inputs: inputs(),
+            },
+        )
+        .unwrap();
+    }
+    let mut workers = Workers::new();
+    workers.insert("mock", Box::new(MockWorker::new()));
+    let runtime = Runtime::with_workers(root, Config::builtin(), workers);
+    let err = runtime.resume(run_id).unwrap_err();
+    assert!(err.to_string().contains("sha256") || err.to_string().contains("snapshot"));
+}
+
+#[test]
 fn interrupted_run_resumes_from_journal() {
     let root = temp_root("resume");
     // Hand-build a run whose journal ends mid-attempt (a crash after
@@ -115,6 +156,9 @@ fn interrupted_run_resumes_from_journal() {
     let run_dir = root.join(".hex").join("runs").join(run_id);
     std::fs::create_dir_all(run_dir.join("attempts")).expect("mkdir run");
     std::fs::write(run_dir.join("graph.yaml"), GRAPH).expect("graph.yaml");
+    // Snapshot integrity: persist the sha256 and record the same hash below.
+    let hash = hex_runtime::driver::graph_hash(GRAPH);
+    std::fs::write(run_dir.join("graph.sha256"), &hash).expect("graph.sha256");
 
     {
         let mut j = Journal::create(run_dir.join("events.jsonl")).expect("journal");
@@ -124,7 +168,7 @@ fn interrupted_run_resumes_from_journal() {
             None,
             Actor::runtime(),
             EventBody::RunCreated {
-                graph_hash: "deadbeef".to_owned(),
+                graph_hash: hash.clone(),
                 inputs: inputs(),
             },
         )

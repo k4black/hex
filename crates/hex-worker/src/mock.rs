@@ -70,6 +70,7 @@ mod tests {
             may_propose: vec![],
             workdir: PathBuf::from("."),
             attempt_dir: PathBuf::from("."),
+            deadline_ms: None,
         }
     }
 

@@ -94,12 +94,12 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     let report = runtime.start(reference, &parsed.inputs).map_err(|e| e.to_string())?;
     if parsed.json {
-        println!(
-            "{{\"run_id\":\"{}\",\"origin\":\"{}\",\"disposition\":{}}}",
-            report.run_id,
-            report.origin,
-            json_disposition(report.disposition)
-        );
+        let v = serde_json::json!({
+            "run_id": report.run_id,
+            "origin": report.origin,
+            "disposition": disposition_name(report.disposition),
+        });
+        println!("{v}");
     } else {
         println!("run {} ({})", report.run_id, report.origin);
         println!("disposition: {}", disposition_name(report.disposition));
@@ -113,11 +113,11 @@ fn cmd_resume(args: &[String]) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     let report = runtime.resume(run_id).map_err(|e| e.to_string())?;
     if parsed.json {
-        println!(
-            "{{\"run_id\":\"{}\",\"disposition\":{}}}",
-            report.run_id,
-            json_disposition(report.disposition)
-        );
+        let v = serde_json::json!({
+            "run_id": report.run_id,
+            "disposition": disposition_name(report.disposition),
+        });
+        println!("{v}");
     } else {
         println!("resumed {}", report.run_id);
         println!("disposition: {}", disposition_name(report.disposition));
@@ -131,13 +131,13 @@ fn cmd_status(args: &[String]) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     let s = runtime.status(run_id).map_err(|e| e.to_string())?;
     if parsed.json {
-        println!(
-            "{{\"run_id\":\"{}\",\"status\":\"{}\",\"current\":{},\"attempts\":{}}}",
-            s.run_id,
-            status_name(&s.status),
-            s.current.map_or("null".to_owned(), |c| format!("\"{c}\"")),
-            s.attempts
-        );
+        let v = serde_json::json!({
+            "run_id": s.run_id,
+            "status": status_name(&s.status),
+            "current": s.current,
+            "attempts": s.attempts,
+        });
+        println!("{v}");
     } else {
         println!("run: {}", s.run_id);
         println!("status: {}", status_name(&s.status));
@@ -255,10 +255,6 @@ fn disposition_name(d: Disposition) -> &'static str {
         Disposition::BudgetExhausted => "budget_exhausted",
         Disposition::TimedOut => "timed_out",
     }
-}
-
-fn json_disposition(d: Disposition) -> String {
-    format!("\"{}\"", disposition_name(d))
 }
 
 fn status_name(s: &Status) -> String {

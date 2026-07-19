@@ -7,8 +7,6 @@
 
 use std::collections::BTreeSet;
 
-use hex_proto::Disposition;
-
 use crate::graph::{Graph, NodeKind, NodeSpec};
 
 /// A single validation failure, located by node/edge where possible.
@@ -71,6 +69,7 @@ pub fn validate(graph: &Graph) -> Result<(), Vec<Issue>> {
 
     check_reachability(graph, &mut issues);
     check_routing(graph, &mut issues);
+    check_signal_names(graph, &mut issues);
     check_acceptance(graph, &mut issues);
 
     // Unbounded cycles are an error, not a warning.
@@ -171,16 +170,63 @@ fn check_routing(graph: &Graph, issues: &mut Vec<Issue>) {
 
 fn check_acceptance(graph: &Graph, issues: &mut Vec<Issue>) {
     for req in &graph.accept {
-        if !graph.nodes.contains_key(&req.node) {
+        let Some(node) = graph.nodes.get(&req.node) else {
             issues.push(Issue::new(
                 "E-accept-node",
                 format!("acceptance requires unknown node `{}`", req.node),
             ));
+            continue;
+        };
+        // The required signal must actually be producible by that node, or the
+        // contract can never be satisfied and the run can never succeed.
+        let producible = match &node.spec {
+            NodeSpec::Agent { may_propose, .. } => may_propose.iter().any(|s| s == &req.signal),
+            NodeSpec::Gate { .. } | NodeSpec::Command { .. } => {
+                req.signal == "passed" || req.signal == "failed"
+            }
+            NodeSpec::Terminal { .. } | NodeSpec::Human { .. } => false,
+        };
+        if !producible {
+            issues.push(Issue::new(
+                "E-accept-unsatisfiable",
+                format!(
+                    "acceptance requires `{}.{}` but node `{}` can never emit `{}`",
+                    req.node, req.signal, req.node, req.signal
+                ),
+            ));
         }
     }
-    // A success terminal with an empty contract is legal but worth nothing;
-    // the MVP does not warn on it.
-    let _ = Disposition::Succeeded;
+}
+
+/// Routing event names must fit a small grammar so they survive the
+/// comma-delimited `HEX_MAY_PROPOSE` channel and stay unambiguous.
+fn check_signal_names(graph: &Graph, issues: &mut Vec<Issue>) {
+    let mut check = |name: &str, where_: &str| {
+        if !is_valid_signal_name(name) {
+            issues.push(Issue::new(
+                "E-bad-signal-name",
+                format!("signal `{name}` ({where_}) must match [a-z][a-z0-9_]*"),
+            ));
+        }
+    };
+    for edge in &graph.edges {
+        check(&edge.on, &format!("edge {}->{}", edge.from, edge.to));
+    }
+    for node in graph.nodes.values() {
+        if let NodeSpec::Agent { may_propose, .. } = &node.spec {
+            for sig in may_propose {
+                check(sig, &format!("{} may_propose", node.id));
+            }
+        }
+    }
+}
+
+/// A routing signal name: lowercase, starts with a letter, `[a-z0-9_]` after.
+#[must_use]
+pub fn is_valid_signal_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 fn reachable_from<'a>(graph: &'a Graph, start: &'a str) -> BTreeSet<&'a str> {
@@ -236,6 +282,7 @@ fn has_cycle(graph: &Graph) -> bool {
 mod tests {
     use super::*;
     use crate::graph::{Budget, Graph};
+    use hex_proto::Disposition;
 
     fn cyclic(budget: Budget) -> Graph {
         Graph::builder("t", "implement")
@@ -293,6 +340,38 @@ mod tests {
             .build();
         let issues = validate(&g).unwrap_err();
         assert!(issues.iter().any(|i| i.code == "E-proposal-no-edge"));
+    }
+
+    #[test]
+    fn unsatisfiable_acceptance_is_rejected() {
+        // Require a signal the referenced node can never emit.
+        let g = Graph::builder("t", "a")
+            .agent("a", "w", "p", &["go"])
+            .terminal("done", Disposition::Succeeded)
+            .edge("a", "go", "done")
+            .budget(Budget {
+                attempts: Some(2),
+                ..Budget::default()
+            })
+            .require("a", "nope")
+            .build();
+        let issues = validate(&g).unwrap_err();
+        assert!(issues.iter().any(|i| i.code == "E-accept-unsatisfiable"));
+    }
+
+    #[test]
+    fn bad_signal_name_is_rejected() {
+        let g = Graph::builder("t", "a")
+            .agent("a", "w", "p", &["Go Now"])
+            .terminal("done", Disposition::Succeeded)
+            .edge("a", "Go Now", "done")
+            .budget(Budget {
+                attempts: Some(2),
+                ..Budget::default()
+            })
+            .build();
+        let issues = validate(&g).unwrap_err();
+        assert!(issues.iter().any(|i| i.code == "E-bad-signal-name"));
     }
 
     #[test]

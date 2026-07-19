@@ -6,7 +6,7 @@
 //! is authoritative. Sequence numbers are monotonic and assigned here.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,35 +23,71 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Read every complete event from a journal file, tolerating a torn last line.
-///
-/// # Errors
-/// Fails only if the file cannot be read or a non-final line is malformed.
-pub fn read_all(path: &Path) -> Result<Vec<Event>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let lines: Vec<String> = reader.lines().collect::<std::io::Result<_>>()?;
-    let mut events = Vec::with_capacity(lines.len());
-    let last = lines.len().saturating_sub(1);
-    for (i, line) in lines.iter().enumerate() {
-        if line.trim().is_empty() {
+/// The result of scanning a journal file: the valid events and the byte offset
+/// just past the last complete, newline-terminated, valid record. Trailing
+/// bytes with no newline are a torn tail (a crash mid-append) and are excluded.
+struct Scan {
+    events: Vec<Event>,
+    valid_len: u64,
+}
+
+/// Scan a journal at the byte/newline level. A record is authoritative only if
+/// it is newline-terminated *and* parses; sequences must be contiguous from 0
+/// and the run id consistent. A malformed but newline-terminated line is real
+/// corruption (not a torn tail) and is an error; only a trailing record with no
+/// newline is tolerated.
+fn scan(path: &Path) -> Result<Scan> {
+    let bytes = std::fs::read(path)?;
+    let mut events = Vec::new();
+    let mut valid_len: u64 = 0;
+    let mut cursor = 0usize;
+    let mut expected_seq = 0u64;
+    let mut run_id: Option<String> = None;
+
+    while let Some(rel) = bytes[cursor..].iter().position(|&b| b == b'\n') {
+        let line_end = cursor + rel + 1; // include the newline
+        let raw = &bytes[cursor..cursor + rel];
+        cursor = line_end;
+        let text = std::str::from_utf8(raw).map_err(|_| corrupt(events.len(), "invalid utf-8"))?;
+        if text.trim().is_empty() {
+            valid_len = line_end as u64;
             continue;
         }
-        match serde_json::from_str::<Event>(line) {
-            Ok(ev) => events.push(ev),
-            Err(e) => {
-                // Only the very last line may be torn by a crash mid-write.
-                if i == last {
-                    break;
-                }
-                return Err(crate::error::HexError::new(format!(
-                    "corrupt journal at line {}: {e}",
-                    i + 1
-                )));
-            }
+        let ev: Event = serde_json::from_str(text)
+            .map_err(|e| corrupt(events.len(), &format!("malformed record: {e}")))?;
+        if ev.seq != expected_seq {
+            return Err(corrupt(
+                events.len(),
+                &format!("non-contiguous seq {} (expected {expected_seq})", ev.seq),
+            ));
         }
+        match &run_id {
+            Some(id) if id != &ev.run_id => {
+                return Err(corrupt(events.len(), "run id changes mid-journal"));
+            }
+            None => run_id = Some(ev.run_id.clone()),
+            _ => {}
+        }
+        expected_seq += 1;
+        valid_len = line_end as u64;
+        events.push(ev);
     }
-    Ok(events)
+    // Anything after `cursor` has no terminating newline: a torn tail.
+    Ok(Scan { events, valid_len })
+}
+
+fn corrupt(index: usize, why: &str) -> crate::error::HexError {
+    crate::error::HexError::new(format!("corrupt journal at record {index}: {why}"))
+}
+
+/// Read every complete, contiguous event from a journal file, tolerating a torn
+/// last line.
+///
+/// # Errors
+/// Fails if the file cannot be read or a non-final record is malformed,
+/// out-of-sequence, or from a different run.
+pub fn read_all(path: &Path) -> Result<Vec<Event>> {
+    Ok(scan(path)?.events)
 }
 
 /// The single writer for one run's journal.
@@ -80,12 +116,22 @@ impl Journal {
         })
     }
 
-    /// Open an existing journal for appending, continuing its sequence.
+    /// Open an existing journal for appending, continuing its sequence. If the
+    /// file carries a torn tail (a crash mid-append), it is truncated to the
+    /// last clean record first so the next append cannot concatenate onto a
+    /// partial line.
     ///
     /// # Errors
-    /// Fails if the file cannot be read or opened for append.
+    /// Fails if the file cannot be read/repaired or opened for append.
     pub fn open_append(path: PathBuf) -> Result<Self> {
-        let next_seq = read_all(&path)?.last().map_or(0, |e| e.seq + 1);
+        let scanned = scan(&path)?;
+        let file_len = std::fs::metadata(&path)?.len();
+        if scanned.valid_len < file_len {
+            let f = OpenOptions::new().write(true).open(&path)?;
+            f.set_len(scanned.valid_len)?;
+            f.sync_all()?;
+        }
+        let next_seq = scanned.events.last().map_or(0, |e| e.seq + 1);
         let file = OpenOptions::new().append(true).open(&path)?;
         Ok(Self {
             file,
@@ -179,6 +225,55 @@ mod tests {
         }
         let events = read_all(&path).expect("read tolerates torn tail");
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn open_append_repairs_a_torn_tail_before_writing() {
+        let path = temp_path("repair");
+        {
+            let mut j = Journal::create(path.clone()).expect("create");
+            j.append("run_0", None, None, Actor::runtime(), EventBody::RunStarted)
+                .expect("append");
+        }
+        // Crash mid-write: a valid record with no terminating newline.
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).expect("open");
+            f.write_all(b"{\"schema_version\":1,\"seq\":1,\"partial")
+                .expect("write");
+        }
+        // Reopening must truncate the torn tail, so the next append lands clean.
+        let mut j = Journal::open_append(path.clone()).expect("reopen repairs");
+        let ev = j
+            .append(
+                "run_0",
+                None,
+                None,
+                Actor::runtime(),
+                EventBody::RunFinished {
+                    disposition: Disposition::Succeeded,
+                },
+            )
+            .expect("append after repair");
+        assert_eq!(ev.seq, 1, "seq continues cleanly");
+        // And the journal reads back as two contiguous records, not corruption.
+        let events = read_all(&path).expect("clean read");
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn malformed_terminated_line_is_corruption() {
+        let path = temp_path("corrupt");
+        {
+            let mut j = Journal::create(path.clone()).expect("create");
+            j.append("run_0", None, None, Actor::runtime(), EventBody::RunStarted)
+                .expect("append");
+        }
+        // A *newline-terminated* bad line is real corruption, not a torn tail.
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).expect("open");
+            f.write_all(b"{not json}\n").expect("write");
+        }
+        assert!(read_all(&path).is_err());
     }
 
     #[test]

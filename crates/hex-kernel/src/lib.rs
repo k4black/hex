@@ -45,6 +45,8 @@ pub struct RunState {
     pub status: Status,
     /// The node currently active (about to run, or in-flight).
     pub current: Option<String>,
+    /// The id of the in-flight attempt, if any (for correlation + resume).
+    pub current_attempt: Option<String>,
     /// Whether an attempt is in-flight for [`RunState::current`].
     pub awaiting: bool,
     /// Total attempts started across the whole run.
@@ -149,6 +151,7 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
         EventBody::AttemptStarted { .. } => {
             state.awaiting = true;
             state.attempts_total += 1;
+            state.current_attempt = event.attempt_id.clone();
             if let Some(cur) = &state.current {
                 *state.attempts_per_node.entry(cur.clone()).or_insert(0) += 1;
             }
@@ -157,9 +160,17 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             // Orphaned attempt: clear the in-flight flag so the same node is
             // re-scheduled as a fresh attempt.
             state.awaiting = false;
+            state.current_attempt = None;
         }
         EventBody::Signal { name } => {
+            // Only a signal correlated to the in-flight attempt advances the
+            // graph. This guards replay of a corrupt/forged journal record
+            // whose node/attempt does not match the projected position.
+            if !correlated(&state, event) {
+                return state;
+            }
             state.awaiting = false;
+            state.current_attempt = None;
             if let Some(cur) = state.current.clone() {
                 state.signals.insert(cur.clone(), name.clone());
                 match graph.route(&cur, name) {
@@ -176,7 +187,11 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             }
         }
         EventBody::AttemptFailed { .. } => {
+            if !correlated(&state, event) {
+                return state;
+            }
             state.awaiting = false;
+            state.current_attempt = None;
             state.status = Status::Finished(Disposition::Failed);
         }
         EventBody::RunFinished { disposition } => {
@@ -203,6 +218,19 @@ pub fn schedule(graph: &Graph, state: &RunState, now_ms: u64) -> Vec<Effect> {
         return vec![terminal(Disposition::Failed)];
     };
 
+    // Terminal nodes settle the run *before* budget checks: reaching an outcome
+    // does not spend an attempt, so a success that coincides with the last
+    // attempt must not be flipped to `budget_exhausted`.
+    if let NodeSpec::Terminal { disposition } = &node.spec {
+        // A success terminal only succeeds if the acceptance contract holds.
+        if *disposition == Disposition::Succeeded
+            && !matches!(accept(graph, state), Acceptance::Accepted)
+        {
+            return vec![terminal(Disposition::Failed)];
+        }
+        return vec![terminal(*disposition)];
+    }
+
     // Budgets are checked before spending an attempt, and fail closed.
     if let Some(max) = graph.budget.attempts
         && state.attempts_total >= max
@@ -223,15 +251,7 @@ pub fn schedule(graph: &Graph, state: &RunState, now_ms: u64) -> Vec<Effect> {
     let attempt_id = format!("att_{}", state.attempts_total + 1);
     let idempotency_key = format!("{cur}#{}", state.attempts_total + 1);
     match &node.spec {
-        NodeSpec::Terminal { disposition } => {
-            // A success terminal only succeeds if the acceptance contract holds.
-            if *disposition == Disposition::Succeeded
-                && !matches!(accept(graph, state), Acceptance::Accepted)
-            {
-                return vec![terminal(Disposition::Failed)];
-            }
-            vec![terminal(*disposition)]
-        }
+        NodeSpec::Terminal { .. } => unreachable!("terminal handled above"),
         NodeSpec::Agent { .. } => vec![Effect::StartAttempt {
             node_id: cur,
             attempt_id,
@@ -265,6 +285,11 @@ pub fn accept(graph: &Graph, state: &RunState) -> Acceptance {
 
 fn terminal(disposition: Disposition) -> Effect {
     Effect::RecordTerminal { disposition }
+}
+
+/// Whether `event` refers to the currently in-flight node + attempt.
+fn correlated(state: &RunState, event: &Event) -> bool {
+    event.node_id == state.current && event.attempt_id == state.current_attempt
 }
 
 #[cfg(test)]
@@ -303,10 +328,26 @@ mod tests {
             .build()
     }
 
+    /// Fold a list of event bodies, stamping node/attempt ids the way the real
+    /// runtime does so correlation holds.
     fn drive_to(graph: &Graph, events: &[EventBody]) -> RunState {
         let mut state = RunState::default();
+        let mut attempt_n = 0u32;
         for (i, body) in events.iter().enumerate() {
-            state = reduce(graph, state, &ev(i as u64, body.clone()));
+            let mut e = ev(i as u64, body.clone());
+            match body {
+                EventBody::AttemptStarted { .. } => {
+                    attempt_n += 1;
+                    e.node_id = state.current.clone();
+                    e.attempt_id = Some(format!("att_{attempt_n}"));
+                }
+                EventBody::Signal { .. } | EventBody::AttemptFailed { .. } => {
+                    e.node_id = state.current.clone();
+                    e.attempt_id = state.current_attempt.clone();
+                }
+                _ => {}
+            }
+            state = reduce(graph, state, &e);
         }
         state
     }
@@ -408,6 +449,54 @@ mod tests {
                 disposition: Disposition::Succeeded
             }]
         );
+    }
+
+    #[test]
+    fn exact_budget_success_is_not_flipped() {
+        // At the attempts limit, a success terminal must still succeed — a
+        // reached outcome does not spend an attempt.
+        let g = loop_graph();
+        let mut s = drive_to(&g, &[EventBody::RunStarted]);
+        s.current = Some("done".to_owned());
+        s.attempts_total = 8; // exactly at budget
+        s.signals.insert("test".to_owned(), "passed".to_owned());
+        assert_eq!(
+            schedule(&g, &s, 0),
+            vec![Effect::RecordTerminal {
+                disposition: Disposition::Succeeded
+            }]
+        );
+    }
+
+    #[test]
+    fn uncorrelated_signal_does_not_route() {
+        let g = loop_graph();
+        // Start an attempt on `implement` (att_1), then feed a Signal tagged
+        // with a *different* attempt id — it must be ignored.
+        let mut s = drive_to(
+            &g,
+            &[
+                EventBody::RunStarted,
+                EventBody::AttemptStarted {
+                    idempotency_key: "k".to_owned(),
+                    worker: None,
+                },
+            ],
+        );
+        // AttemptStarted in drive_to has no attempt_id in the envelope; set the
+        // projection's expected attempt explicitly to model a real run.
+        s.current_attempt = Some("att_1".to_owned());
+        let mut forged = ev(
+            50,
+            EventBody::Signal {
+                name: "ready".to_owned(),
+            },
+        );
+        forged.node_id = Some("implement".to_owned());
+        forged.attempt_id = Some("att_999".to_owned()); // wrong attempt
+        let after = reduce(&g, s, &forged);
+        assert_eq!(after.current.as_deref(), Some("implement"), "must not route");
+        assert!(after.awaiting, "spurious signal leaves the attempt in-flight");
     }
 
     #[test]

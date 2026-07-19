@@ -282,9 +282,13 @@ fn compile_budget(raw: Option<&RawBudget>) -> Result<Budget> {
 fn parse_context(raw: Option<&str>) -> Result<Context> {
     match raw {
         None | Some("fresh") => Ok(Context::Fresh),
-        Some("continue") => Ok(Context::Continue),
+        // `continue` is a real IR variant but the slim MVP only runs fresh
+        // sessions; accepting it would silently ignore the author's intent.
+        Some("continue") => Err(HexError::new(
+            "context `continue` is not supported yet (Phase 3); only `fresh`",
+        )),
         Some(other) => Err(HexError::new(format!(
-            "unknown context `{other}` (expected fresh/continue)"
+            "unknown context `{other}` (expected fresh)"
         ))),
     }
 }
