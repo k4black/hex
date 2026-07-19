@@ -4,24 +4,26 @@
 
 Rust CLI (edition 2024) that runs existing agent CLIs as opaque workers over a
 deterministic, bounded graph, recording everything to an append-only journal.
-Layered Cargo workspace, one binary (`hex`). No orchestration logic exists yet —
-this is a scaffold. Design rationale: `docs/design/gpt-research-{1,2}.md`.
+Layered Cargo workspace, one binary (`hex`). No orchestration logic exists yet.
+Design rationale: `docs/design/gpt-research-{1,2}.md`; the decisions below
+(locked 2026-07-19) supersede the research where they differ.
 
 ## Where things live
 
-Crates under `crates/`; dependencies point **strictly inward** (a crate may only
-depend on ones above it in this table):
+Dependencies point **strictly inward** (a crate may only depend on ones above
+it in this table). One-liner: *kernel decides · worker runs one agent ·
+runtime orchestrates and records · cli/mcp/dashboard are windows.*
 
 | Crate | Purpose | May depend on |
 |---|---|---|
 | `hex-proto` | Versioned protocol: `Event`, `Command`, `Capability`. Only stable public surface. | — |
-| `hex-core` | Graph IR, journal, projections. | proto |
-| `hex-engine` | Reducer, scheduler, acceptance. | core |
-| `hex-backend` | `Backend` trait + capabilities + mock/subprocess adapters. | proto, core |
-| `hex-cli` | The `hex` binary (operator surface). | all above |
-| `hex-mcp` | *(stub, later)* MCP transport over the protocol. | proto |
-| `hex-dashboard` | *(stub, later)* TUI/web viewer, projection consumer. | core |
-| `hex-bench` | Cross-crate criterion benchmarks. | core, engine |
+| `hex-kernel` | **Pure**: Graph IR, journal model, projections, `reduce`/`schedule`/`accept`. No IO/subprocess/clock. | proto |
+| `hex-worker` | `Worker` trait + capability manifest + adapters (mock, subprocess, coding-agent presets). Runs **one** worker; never coordinates. | proto, kernel |
+| `hex-runtime` | Imperative shell: drive loop, effect execution, journal writer, control ingestion, workspace isolation, run supervision. Exposes `Runtime` + `RuntimeClient` trait (`InProcess` now, `Remote` later). | kernel, worker, proto |
+| `hex-cli` | The `hex` binary — thin client over `RuntimeClient`; arg parsing + rendering only. | runtime |
+| `hex-mcp` | *(later)* MCP transport — a peer client of the CLI; can start/control runs. | runtime |
+| `hex-dashboard` | *(later)* TUI/web viewer — another thin client. | runtime |
+| `hex-bench` | Cross-crate criterion benchmarks. | kernel, runtime |
 
 ## Commands
 
@@ -38,34 +40,47 @@ cargo bench                               # criterion, in hex-bench
 These are the design invariants that make hex *hex* — violating them turns it
 into another agent framework. They are non-negotiable.
 
-1. **Dependency direction is inward, always.** `hex-engine` must never import a
-   backend adapter, rendering, or the CLI. The kernel stays testable without any
-   model or subprocess.
+1. **Dependency direction is inward, always.** `hex-kernel` must never import
+   a worker adapter, rendering, or any client. The kernel stays testable
+   without any model or subprocess.
 2. **The journal is authoritative.** Every state change is an append-only
-   `Event`. Status/graph views are projections *rebuildable from the journal* —
-   never a second source of truth. Do not add mutable-database state.
-3. **The kernel is deterministic; the worker is not.** A model may *propose* an
-   event/route; the engine validates the transition. Routing spends no tokens.
+   `Event`. Current state is a projection *computed* from the journal
+   (`fold(reduce, journal)`) — never stored as a second source of truth. No
+   mutable-database state.
+3. **The kernel is deterministic; the worker is not.** The kernel emits
+   *effect intents* (`StartAttempt`, `RunGate`, `RequestHuman`, …); only the
+   runtime performs them, writing intent-before-effect with idempotency keys.
+   A model may *propose* an event only from its node's `may_propose`
+   allow-list; the kernel validates the transition. Routing spends no tokens.
 4. **Node kinds stay tiny:** `agent`, `command`, `gate`, `human`, `terminal`.
-   Roles ("planner", "reviewer") are metadata on an `agent` node, never new kinds.
+   Roles ("planner", "reviewer") are metadata on an `agent` node; interactivity
+   is a *policy flag* on `agent` (`interactive: true`), never a new kind.
 5. **Every cycle is bounded.** An unbounded cycle is a validation *error*.
 6. **Completion is provisional.** A worker's "done" is a proposal; required
    gates + acceptance rules decide the run outcome. Deterministic evidence
    outranks model assertions.
-7. **Distinct operations get distinct events/verbs.** Never collapse
-   register/start-process/model-call under one word like "spawn"; never make
-   `resume`/`retry`/`replay` synonyms.
+7. **Two execution verbs only.** `run` starts a new run; `resume` continues
+   the same run from its journal (after pause *or* crash). There is no
+   `retry`/`replay`/`skip` — redoing work is a new run. Never silently rerun a
+   side-effecting attempt.
 8. **Human and agent share one control protocol**, with authority scoped per
-   actor. Every surface (CLI, `--json`, MCP, dashboard) is a projection over it —
-   never a parallel implementation.
+   actor. One `Command` type, two worker transports (injected `hex emit` CLI +
+   MCP tool hooks); every surface (CLI, `--json`, MCP, dashboard) is a thin
+   client over `RuntimeClient` — never a parallel implementation.
+9. **The worker adapter never coordinates.** Sub-agents, watchdogs, fan-out
+   are kernel-routed / runtime-scheduled graph constructs, or the external
+   agent's own internal business — never logic inside `hex-worker`.
 
 ## Code style
 
-- Prefer `argv` execution, NOT shell strings, for subprocess backends.
+- Prefer `argv` execution, NOT shell strings, for subprocess workers.
 - Machine output: stdout carries requested data only, diagnostics to stderr,
   stable exit codes, `--json`/NDJSON, no interactive prompts in machine mode.
 
 ## Terminology
+
+Five kernel entities: **Graph, Run, Event, Budget, Artifact.** Everything else
+is a node kind, an event type, an adapter, or a derived view.
 
 **Graph**: An immutable, versioned workflow definition (nodes + edges) a run
 executes. Bounded cycles allowed. _Avoid_: workflow, DAG, pipeline.
@@ -77,42 +92,68 @@ _Avoid_: step, stage, task, hat, role.
 event and carrying an ordered condition — never model-chosen control flow.
 _Avoid_: link, arrow (a *transition* is the act; the edge is the rule).
 
-**Attempt**: One execution of one node, with a unique id, a bound, and a start
-+ terminal event. _Avoid_: run, try, iteration.
-
 **Run**: One execution of a graph, referencing an exact graph snapshot/hash,
 ending in one terminal disposition. _Avoid_: job, session, loop.
 
+**Attempt**: One execution of one node, with a unique id, a bound, and a start
++ terminal event. _Avoid_: run, try, iteration.
+
 **Event**: An append-only fact in the journal (versioned, sequenced, actored).
-The unit of truth. _Avoid_: log line, message.
+The unit of truth. Approvals, gate results, budget spend, artifact refs are
+all event types, not separate entities. _Avoid_: log line, message.
 
-**Gate**: A deterministic validator returning pass / fail / escalate.
-_Avoid_: check, test (a test is *run by* a gate), hook.
+**Effect (intent)**: A description of an external action the kernel wants
+performed (`StartAttempt`, `RunGate`, …). The kernel emits it; the runtime
+executes it. _Avoid_: command (reserved for operator `Command`s), task.
 
-**Backend**: An adapter wrapping an opaque external worker behind the
-capability-declaring `Backend` trait. _Avoid_: agent (the worker), provider,
-model, driver.
+**Worker**: *Our adapter* in `hex-worker` — the code everyone calls with
+params and gets results from; wraps one opaque external agent behind the
+capability-declaring `Worker` trait. _Avoid_: backend (retired term),
+provider, driver.
 
-**Artifact**: A large or binary output/evidence/diff a node produces, stored by
-content hash outside the event payload. _Avoid_: output, file, blob.
+**Agent**: The opaque external process a Worker drives (Claude Code, Codex, a
+script). Also the node kind that invokes one. _Avoid_: calling our adapter an
+agent, or the agent a worker.
 
-**Approval**: A durable human decision on a blocking gate (approve/reject/edit),
-recorded with actor and rationale. _Avoid_: sign-off, confirmation.
+**Gate**: A *node kind* running a deterministic validator returning
+pass / fail / escalate; feeds acceptance. Reusable run-level gates are
+declared once and referenced. _Avoid_: check, test (a test is *run by* a
+gate), hook.
+
+**Artifact**: A large or binary output/evidence/diff a node produces, stored
+by content hash outside the event payload. _Avoid_: output, file, blob.
 
 **Budget**: A durable limit and its consumption (attempts/time/cost); never
-resets on resume. _Avoid_: quota, cap, limit (a limit is one field of a budget).
+resets on resume. _Avoid_: quota, cap, limit (a limit is one field of a
+budget).
 
-**Projection**: A read model derived from and rebuildable from the journal.
-_Avoid_: state, cache, snapshot (the atomic snapshot is one *kind* of projection).
+**Projection**: A read model *computed* from the journal — never stored
+authority. _Avoid_: state, cache, snapshot (the atomic snapshot file is one
+*kind* of projection, an optimization).
 
-**Operator**: Any actor (human or agent) issuing control commands.
-_Avoid_: user, supervisor, controller.
+**Operator**: Any actor (human or agent) issuing control commands, with
+scoped authority. _Avoid_: user, supervisor, controller.
+
+**Interactive session**: An `agent` attempt with `interactive: true` — stays
+open for live human↔agent conversation (grill-me/Q&A), journaled per turn,
+resumable. Requires worker capabilities `live_steering` + `session_resume`.
+
+**Approval**: A blocking human decision on a finished proposal — a `human`
+boundary node (designed now, built later), recorded as
+`human.requested`/`human.responded` events with actor + rationale. _Avoid_:
+sign-off, confirmation.
 
 ## Gotchas
 
 1. Binary is `hex`, package is `hex-cli` — use `cargo run --bin hex`, not `-p hex`.
-2. Graph surface syntax (TOML vs YAML) is **undecided on purpose**; `hex-core`
-   models the compiled IR only. Don't hardcode a format in the kernel.
-3. `hex-mcp`/`hex-dashboard` are deliberate stubs; keep them thin — an MCP or UI
-   surface is a transport/projection, never orchestration.
-4. _add new gotchas here as they are discovered_
+2. Crate contents are placeholder stubs wiring the dependency graph; treat
+   them as scaffolding to replace, not patterns to follow.
+3. Surface syntax is **standard YAML only** — kind-as-key + `on:` map,
+   co-located edges, inline block-scalar prompts, `templates:`/`extends:`,
+   run-level `gates:`. No custom mini-grammar (`->` arrows etc.); the kernel
+   models the compiled IR only.
+4. `hex-mcp`/`hex-dashboard` are deliberate stubs; they become thin
+   `RuntimeClient` clients — a transport/projection, never orchestration.
+5. Worktree isolation is per-run and opt-in (`isolation: worktree`), default
+   `shared`; **no auto-merge** — the branch is left for explicit integration.
+6. _add new gotchas here as they are discovered_

@@ -4,13 +4,14 @@
 
 `hex` compiles a human-readable graph, runs existing agent CLIs (Claude Code,
 Codex, Gemini, …) as opaque workers, records every transition in an append-only
-journal, enforces hard limits and evidence gates, and exposes the *same* control
-protocol to humans and agents.
+journal, enforces hard limits and evidence gates, and exposes the *same*
+control protocol to humans and agents.
 
-It is deliberately narrow. The loop itself can be one shell line; the value is a
-small, legible kernel that makes nondeterministic agents **programmable,
-interruptible, resumable, verifiable, and easy to operate** — from a terminal or
-from another agent.
+It is deliberately narrow. The loop itself can be one shell line; the value is
+a small, legible kernel that makes nondeterministic agents **programmable,
+interruptible, resumable, verifiable, and easy to operate** — from a terminal
+or from another agent. Mental model: *Git-style local control for agent runs,
+not Kubernetes for agents.*
 
 > Make the graph deterministic, the workers replaceable, the journal
 > authoritative, every loop bounded, completion evidence-based, and every human
@@ -23,86 +24,186 @@ a multi-agent role-playing framework · a cloud workflow platform · a required
 daemon. These may become optional adapters later; they never enter the kernel's
 domain model.
 
-## Core ideas
+## Architecture
 
-- **Deterministic kernel.** Models may *propose* events/routes; the kernel
-  validates every state transition. Routing spends no tokens.
-- **One canonical journal.** Every state change, control request, approval, and
-  result is an append-only event. Status/graph views are rebuildable
-  projections — never a second source of truth.
-- **Human/agent symmetry.** A person at a TTY and an orchestrating agent send
-  the same commands; authority is scoped per actor. Every UI (CLI, `--json`,
-  MCP, dashboard) is a projection over one protocol.
-- **Bounded by construction.** Every cycle must declare a bound (attempts,
-  time, budget, or an evidence/human exit). Unbounded cycles are a validation
-  error, not a warning.
-- **Completion is provisional.** A worker's "done" is a proposal; required
-  deterministic gates and acceptance rules decide the run's real outcome.
-- **Fresh context by default.** Per-node context policy (`fresh`/`continue`/…)
-  is explicit, never silently inherited from a provider session.
-
-## Workspace layout
-
-Layered Cargo workspace (edition 2024); dependencies point strictly inward.
+One-liner: **kernel decides · worker runs one agent · runtime orchestrates and
+records · cli / mcp / dashboard are windows.**
 
 | Crate | Role | Depends on |
 |---|---|---|
-| [`hex-proto`](crates/hex-proto) | Versioned control protocol: `Event`, `Command`, `Capability`. The one stable public surface. | — |
-| [`hex-core`](crates/hex-core) | Domain model: compiled graph IR, journal, projections. | proto |
-| [`hex-engine`](crates/hex-engine) | Deterministic reducer, scheduler, acceptance rules. | core |
-| [`hex-backend`](crates/hex-backend) | `Backend` trait + capability manifest + mock/subprocess adapters. | proto, core |
-| [`hex-cli`](crates/hex-cli) | The `hex` binary — operator surface for humans and agents. | all |
-| [`hex-mcp`](crates/hex-mcp) | *(later)* MCP adapter — a thin transport over the protocol, no orchestration logic. | proto |
-| [`hex-dashboard`](crates/hex-dashboard) | *(later)* Optional TUI/web viewer — a projection consumer only. | core |
-| [`hex-bench`](crates/hex-bench) | Cross-crate criterion benchmarks. | core, engine |
+| [`hex-proto`](crates/hex-proto) | Versioned protocol: `Event`, `Command`, `Capability`. The one stable public surface, shared by kernel, workers, and clients. | — |
+| [`hex-kernel`](crates/hex-kernel) | **Pure, deterministic.** Graph IR, journal model, projections, and the three functions `reduce` / `schedule` / `accept`. No IO, no subprocess, no wall clock. | proto |
+| [`hex-worker`](crates/hex-worker) | Adapter for **one** opaque external agent/CLI behind the `Worker` trait + capability manifest (mock, subprocess/argv, coding-agent presets). Runs one worker, reports what happened. Never coordinates. | proto, kernel |
+| [`hex-runtime`](crates/hex-runtime) | Orchestration — the imperative shell. Drive loop, effect execution, journal writer, control-command ingestion, workspace isolation, run supervision. Exposes the `Runtime` API and the `RuntimeClient` trait. | kernel, worker, proto |
+| [`hex-cli`](crates/hex-cli) | The `hex` binary — a **thin client** over `RuntimeClient`. Arg parsing + rendering only. | runtime |
+| [`hex-mcp`](crates/hex-mcp) | *(later)* MCP transport — a thin client/peer of the CLI over the same `RuntimeClient`. Can start and control runs. | runtime |
+| [`hex-dashboard`](crates/hex-dashboard) | *(later)* TUI/web viewer — another thin client; also able to start runs. | runtime |
+| [`hex-bench`](crates/hex-bench) | Criterion benchmarks. | kernel, runtime |
 
-Dependency direction: `proto ← core ← engine`, `proto,core ← backend`, all
-`← cli`. The engine never imports backend adapters, rendering, or the CLI.
+Dependency direction stays strictly inward: `proto ← kernel ← runtime`,
+`proto,kernel ← worker`, `worker,kernel ← runtime`, all clients `← runtime`.
+The kernel never imports a worker adapter, rendering, or any client.
 
-## Vocabulary
+### Execution model — functional core, imperative shell
 
-`Graph` · `Node` · `Edge` · `Run` · `Attempt` · `Event` · `Gate` · `Approval` ·
-`Budget` · `Backend` · `Artifact` · `Projection` · `Operator`.
+The kernel is three pure functions:
 
-Node kinds are intentionally tiny: `agent`, `command`, `gate`, `human`,
-`terminal`. Roles like "planner"/"reviewer" are *metadata* on an `agent` node,
-never distinct kinds. See [`AGENTS.md`](AGENTS.md) for full definitions.
+- `reduce(state, event, graph) -> state` — all state-transition logic.
+- `schedule(graph, state) -> Decision` — ready nodes, route evaluation, bound
+  enforcement; returns **effect intents** (`StartAttempt`, `RunGate`,
+  `RequestHuman`, `CancelAttempt`, `RecordTerminal`), never performs them.
+- `accept(graph, state)` — the provisional-completion / acceptance contract.
 
-## Planned CLI surface
+The runtime replays the journal into a projection, asks `schedule` what to do,
+writes each intent to the journal **before** acting (with an idempotency key),
+executes it via a `Worker` adapter / gate executor / human wait, appends the
+result events, feeds them back through `reduce`, and loops. On crash: replay
+the journal; an attempt with no terminal event is `interrupted` — redo means a
+**new run**, never a silent rerun.
 
-A representative slice — the full roadmap lives in [`TODO.md`](TODO.md).
+Payoff: routing spends no tokens, the kernel is unit-testable with a mock
+worker, and `replay(journal)` always reproduces the projection.
+
+### Process & control model
+
+- **Now:** foreground single process — `hex run` owns the loop via
+  `RuntimeClient::InProcess`. No daemon.
+- **Later:** a per-run background controller + `Remote` client behind the same
+  `RuntimeClient` trait; the daemon is only a transport wrapper, never a second
+  implementation.
+
+Workers talk back over **one `Command` protocol with two transports**: an
+injected `hex emit <event>` CLI (works for any subprocess — the universal
+floor) and MCP tool hooks (e.g. `finish_session(success)`) for MCP-native
+agents. The worker's capability manifest declares which it can use.
+
+**Routing:** deterministic ordered edges evaluated by the kernel, plus
+validated agent proposals — an agent node may only emit events from its
+declared `may_propose` allow-list; the kernel validates the transition
+(`route.rejected` feeds back otherwise). Agents can choose among *given*
+options (e.g. a critic choosing "approve" vs "changes requested"); they can
+never invent a transition.
+
+## Domain model
+
+Five kernel entities — everything else is a node kind, an event type, an
+adapter, or a derived view:
+
+**Graph** (Nodes + Edges) · **Run** (Attempts) · **Event** · **Budget** ·
+**Artifact**
+
+Five node kinds — roles ("planner", "reviewer") are metadata, never kinds:
+
+`agent` · `command` · `gate` · `human` · `terminal`
+
+- Interactivity is a **policy flag** on `agent` (`interactive: true` = a live,
+  resumable session the human converses with — grill-me/Q&A style; requires
+  the worker to declare `live_steering` + `session_resume`). Not a new kind.
+- Approval (blocking human decision on a finished proposal) is a separate
+  `human` boundary node — designed now, implemented in a later phase; it
+  shares the same `human.requested` / `human.responded` event family.
+- `command` and `gate` are distinct kinds (a gate yields pass/fail/escalate
+  and feeds acceptance) sharing one executor in the runtime.
+
+## Graph surface — single YAML file
+
+Standard YAML only (no custom grammar — easy for humans *and* agents to
+write). Edges co-located on the node via an `on:` map; prompts inline as block
+scalars; `defaults:` + `templates:`/`extends:` kill repetition; reusable
+run-level `gates:` feed `accept.require`.
+
+```yaml
+version: 1
+name: implement-until-green
+
+defaults:
+  worker: codex
+  context: fresh
+  budget: { attempts: 8, elapsed: 30m }
+
+gates:
+  repo_tests:
+    run: [npm, test]
+
+nodes:
+  implement:
+    agent:
+      prompt: |
+        Implement the next unchecked item in TODO.md.
+        Keep the diff small and focused.
+      may_propose: [ready_for_test, needs_human]
+    on:
+      ready_for_test: test
+      needs_human: clarify
+
+  test:
+    gate: { use: repo_tests }
+    on: { passed: done, failed: implement }
+
+  clarify:
+    agent:
+      interactive: true
+      prompt: "Discuss the blocker with the operator; agree on a decision."
+    on: { resolved: implement }
+
+  done:
+    terminal: succeeded
+
+accept:
+  require: [repo_tests.passed]
+```
+
+The kernel compiles any surface form to a flat, immutable Graph IR
+(nodes + typed edges + bounds); a run records the exact snapshot + hash. Every
+cycle must declare a bound — an unbounded cycle is a validation *error*.
+
+## CLI surface
+
+The same verbs work from the CLI, MCP, and dashboard; all support `--json` /
+NDJSON, stable exit codes, and `capabilities` introspection.
 
 ```text
-hex validate <graph>       check schema, references, bounded cycles
-hex graph <graph>          render the graph (ascii/mermaid/dot)
-hex run <graph>            execute a run
-hex status <run>           projected run status
-hex watch <run>            stream events (ndjson with --json)
-hex pause|resume|cancel    operator control
-hex step <run>             run exactly one ready attempt
-hex emit <event>           agent-side scoped structured control
-hex approve|reject <req>   human decisions on blocking gates
+hex validate <graph>     schema, references, bounded cycles, capability match
+hex graph <graph>        render (ascii/mermaid/dot)
+hex run <graph>          start a NEW run
+hex resume <run>         continue the SAME run (after pause or crash)
+hex pause|cancel <run>   operator control
+hex status <run>         projected run status
+hex watch <run>          stream events (NDJSON with --json)
+hex logs <run>           attempt output
+hex emit <event>         worker→runtime, scoped-token control
+hex respond <req>        human answer (interactive Q&A; later: approve/reject)
 ```
+
+Deliberately absent: `retry`, `replay`, `skip`. Redoing work is always a new
+`run` — the journal keeps the old one inspectable and resumable.
+
+## Workspace isolation
+
+Owned by the runtime, declared per graph: `isolation: shared` (default) or
+`worktree` — one field flips the whole run into a fresh git worktree + branch
+so codex/claude can work freely without touching your main working copy. No
+auto-merge: the branch is left for you to inspect and integrate. Per-node
+worktrees + a serialized integration queue arrive with parallelism.
 
 ## Status
 
-Early scaffold. Every crate compiles with placeholder types; there is no real
-orchestration yet. The graph *surface syntax* (TOML vs YAML) is deliberately
-still undecided — the core models a compiled IR and loading is a stub.
+Early scaffold: every crate compiles with placeholder types wiring the
+dependency graph above; there is no real orchestration logic yet. Phased
+roadmap: [`TODO.md`](TODO.md).
 
 ```bash
 cargo build --workspace     # build everything
 cargo test  --workspace     # run unit tests
 cargo run   --bin hex       # print the planned command surface
-cargo bench                 # run criterion benchmarks
+cargo bench                 # criterion benchmarks
 ```
 
 ## Design
 
-The architecture is derived from a broad survey of the agentic-loop /
-orchestration ecosystem (AutoLoop, Ralph/Hats, Microsoft Conductor, Gas
-Town/City, LangGraph, Dagu, Ruflo, and more). The full research lives in
-[`docs/design/`](docs/design/):
-
-- [`gpt-research-1.md`](docs/design/gpt-research-1.md) — landscape, architecture, MVP boundary.
-- [`gpt-research-2.md`](docs/design/gpt-research-2.md) — deep dives, failure modes, domain model.
+- [`docs/design/gpt-research-1.md`](docs/design/gpt-research-1.md) — landscape,
+  architecture, MVP boundary.
+- [`docs/design/gpt-research-2.md`](docs/design/gpt-research-2.md) — deep
+  dives, failure modes, domain model.
+- [`AGENTS.md`](AGENTS.md) — terminology + non-negotiable core rules.
+- [`TODO.md`](TODO.md) — phased roadmap with every deferred decision.
