@@ -13,10 +13,7 @@ name = "hex"
 path = "src/main.rs"
 
 [dependencies]
-hex-proto = { workspace = true }
-hex-core = { workspace = true }
-hex-engine = { workspace = true }
-hex-backend = { workspace = true }
+hex-runtime = { workspace = true }
 
 [lints]
 workspace = true

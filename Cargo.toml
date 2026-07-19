@@ -10,12 +10,12 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/k4black/hex"
 
 [workspace.dependencies]
-# Internal crates (dependencies point strictly inward: proto <- core <- engine,
-# proto/core <- backend, everything <- cli).
+# Internal crates (dependencies point strictly inward: proto <- kernel,
+# proto/kernel <- worker, kernel/worker <- runtime, clients <- runtime).
 hex-proto = { path = "crates/hex-proto" }
-hex-core = { path = "crates/hex-core" }
-hex-engine = { path = "crates/hex-engine" }
-hex-backend = { path = "crates/hex-backend" }
+hex-kernel = { path = "crates/hex-kernel" }
+hex-worker = { path = "crates/hex-worker" }
+hex-runtime = { path = "crates/hex-runtime" }
 
 # External, shared across the workspace so versions stay aligned.
 serde = { version = "1", features = ["derive"] }

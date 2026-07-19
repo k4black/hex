@@ -1,23 +1,24 @@
-//! `hex-mcp` — Model Context Protocol adapter (later / after-demand).
+//! `hex-mcp` — Model Context Protocol transport (later).
 //!
-//! MCP must be a *thin transport* over the same control protocol every other
-//! surface uses: it maps MCP tool calls onto [`hex_proto::Command`] and streams
-//! [`hex_proto::Event`]s back out. It contains **no** orchestration logic and
-//! must never duplicate the engine — that is the explicit lesson from the
-//! reference tools (AWS CAO's MCP-as-front-end, Ruflo's "one machine API behind
-//! both CLI and MCP").
+//! A thin [`hex_runtime::RuntimeClient`] client, peer of the CLI: it maps MCP
+//! tool calls onto protocol [`Command`]s and streams events back out. A
+//! transport/projection, **never** orchestration — it contains no scheduling
+//! or acceptance logic and must never duplicate the kernel. Same verbs as the
+//! CLI; MCP callers can start and control runs with per-actor scoped
+//! authority.
 //!
-//! Living in its own crate keeps the MCP server SDK dependency out of the core
-//! and CLI, and structurally guarantees this layer can only reach for
-//! [`hex_proto`] — never engine internals.
+//! Living in its own crate keeps the MCP server SDK dependency out of the
+//! kernel and CLI, and structurally guarantees this layer can only reach the
+//! runtime through `RuntimeClient` — never kernel internals.
 //!
 //! Status: stub. The MCP server SDK is added when this is actually built.
 
-use hex_proto::Command;
+use hex_runtime::Command;
 
 /// Placeholder mapping from an MCP tool name to a protocol [`Command`].
 ///
-/// The real adapter validates arguments and scopes authority per caller.
+/// The real transport validates arguments, scopes authority per caller, and
+/// forwards to a [`hex_runtime::RuntimeClient`].
 #[must_use]
 pub fn map_tool_call(tool: &str) -> Option<Command> {
     match tool {

@@ -9,8 +9,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-hex-core = { workspace = true }
-hex-engine = { workspace = true }
+hex-kernel = { workspace = true }
+hex-runtime = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

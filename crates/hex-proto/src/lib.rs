@@ -1,16 +1,15 @@
 //! `hex-proto` — the versioned control protocol for hex.
 //!
-//! This is the one stable, public surface shared by every actor: the engine,
-//! the CLI, agent workers, an MCP adapter, and dashboards. It defines the
-//! append-only [`Event`] envelope, operator [`Command`]s, and backend
-//! [`Capability`] manifests.
+//! This is the one stable, public surface shared by every actor: the kernel,
+//! the runtime, worker adapters, and every thin client (CLI, MCP, dashboard).
+//! It defines the append-only [`Event`] envelope, operator [`Command`]s, and
+//! worker [`Capability`] manifest entries.
 //!
 //! It has **no** dependencies on other hex crates — the whole workspace points
 //! inward to here.
 //!
 //! Status: scaffold. Every type below is a placeholder pending the first real
-//! design pass; the graph *surface syntax* (TOML vs YAML) is deliberately still
-//! undecided.
+//! design pass.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +18,8 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Append-only fact recorded in a run journal. The journal is authoritative;
-/// all status/graph views are projections derived from these events.
+/// all status/graph views are projections *computed* from these events, never
+/// stored as a second source of truth.
 ///
 /// (placeholder shape)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,10 +35,11 @@ pub struct Event {
 }
 
 /// An operator command issued over the shared control protocol. A human at a
-/// TTY and an orchestrating agent send the *same* commands; authority is scoped
-/// separately.
+/// TTY and an agent (via injected `hex emit` or MCP tool hooks) send the
+/// *same* commands; authority is scoped per actor, not per surface.
 ///
-/// (placeholder set)
+/// (placeholder set — `run`/`resume` are the only execution verbs; there is no
+/// retry/replay/skip, redoing work is a new run)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
@@ -46,15 +47,15 @@ pub enum Command {
     Status,
     /// Stop scheduling new attempts.
     Pause,
-    /// Resume a paused run.
+    /// Continue the same run from its journal (after pause *or* crash).
     Resume,
     /// Cancel the run.
     Cancel,
 }
 
-/// A capability a backend advertises so the graph validator can reject
-/// definitions an adapter cannot satisfy (e.g. a node needing live steering on
-/// a one-shot backend).
+/// A capability a worker adapter advertises in its manifest so the graph
+/// validator can reject definitions the adapter cannot satisfy (e.g. an
+/// `interactive: true` node on a worker without live steering).
 ///
 /// (placeholder set)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,12 +65,18 @@ pub enum Capability {
     StructuredEvents,
     /// Streams output incrementally.
     StreamingOutput,
-    /// Can start a fresh worker session per attempt.
+    /// Can start a fresh agent session per attempt.
     FreshSessions,
-    /// Can resume a prior worker session.
+    /// Can resume a prior agent session.
     SessionResume,
+    /// Accepts mid-attempt steering input (required for interactive sessions).
+    LiveSteering,
     /// Supports graceful cancellation.
     GracefulCancel,
+    /// Reports token/cost usage per attempt.
+    CostReporting,
+    /// Can run the agent in a read-only mode.
+    ReadOnlyMode,
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 [package]
 name = "hex-dashboard"
-description = "hex: optional TUI/web viewer, a projection consumer (later)"
+description = "hex: TUI/web viewer, a thin RuntimeClient client (later)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-hex-core = { workspace = true }
+hex-runtime = { workspace = true }
 
 [lints]
 workspace = true

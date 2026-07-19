@@ -205,58 +205,40 @@ dependencies = [
 ]
 
 [[package]]
-name = "hex-backend"
-version = "0.0.0"
-dependencies = [
- "hex-core",
- "hex-proto",
-]
-
-[[package]]
 name = "hex-bench"
 version = "0.0.0"
 dependencies = [
  "criterion",
- "hex-core",
- "hex-engine",
+ "hex-kernel",
+ "hex-runtime",
 ]
 
 [[package]]
 name = "hex-cli"
 version = "0.0.0"
 dependencies = [
- "hex-backend",
- "hex-core",
- "hex-engine",
- "hex-proto",
-]
-
-[[package]]
-name = "hex-core"
-version = "0.0.0"
-dependencies = [
- "hex-proto",
+ "hex-runtime",
 ]
 
 [[package]]
 name = "hex-dashboard"
 version = "0.0.0"
 dependencies = [
- "hex-core",
+ "hex-runtime",
 ]
 
 [[package]]
-name = "hex-engine"
+name = "hex-kernel"
 version = "0.0.0"
 dependencies = [
- "hex-core",
+ "hex-proto",
 ]
 
 [[package]]
 name = "hex-mcp"
 version = "0.0.0"
 dependencies = [
- "hex-proto",
+ "hex-runtime",
 ]
 
 [[package]]
@@ -265,6 +247,23 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hex-runtime"
+version = "0.0.0"
+dependencies = [
+ "hex-kernel",
+ "hex-proto",
+ "hex-worker",
+]
+
+[[package]]
+name = "hex-worker"
+version = "0.0.0"
+dependencies = [
+ "hex-kernel",
+ "hex-proto",
 ]
 
 [[package]]

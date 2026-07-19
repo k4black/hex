@@ -1,6 +1,6 @@
 [package]
 name = "hex-mcp"
-description = "hex: MCP adapter over the shared control protocol (later)"
+description = "hex: MCP transport, a thin RuntimeClient peer of the CLI (later)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-hex-proto = { workspace = true }
+hex-runtime = { workspace = true }
 
 [lints]
 workspace = true
