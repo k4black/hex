@@ -1,0 +1,62 @@
+version: 1
+name: critique-loop
+
+# The flagship built-in: codex implements, claude critiques, a gate proves it,
+# and the loop repeats until the change is approved AND the tests pass.
+# Run it with:  hex run critique-loop --input task="…"
+
+inputs:
+  task:
+    required: true
+
+defaults:
+  worker: codex
+  context: fresh
+  budget:
+    attempts: 12
+    elapsed: 30m
+
+entry: implement
+
+nodes:
+  implement:
+    agent:
+      worker: codex
+      prompt: |
+        You are making a focused change in this repository.
+
+        Task: {{task}}
+
+        Implement the smallest change that satisfies the task. When you are
+        done, run:  hex emit ready_for_review
+      may_propose: [ready_for_review]
+    on:
+      ready_for_review: review
+
+  review:
+    agent:
+      worker: claude
+      prompt: |
+        Review the current working-tree changes against this task: {{task}}
+
+        Judge correctness, scope, and quality. If the change is acceptable run:
+          hex emit approved
+        Otherwise leave concrete feedback in the working tree and run:
+          hex emit changes_requested
+      may_propose: [approved, changes_requested]
+    on:
+      approved: test
+      changes_requested: implement
+
+  test:
+    gate:
+      run: [cargo, test]
+    on:
+      passed: done
+      failed: implement
+
+  done:
+    terminal: succeeded
+
+accept:
+  require: [test.passed]

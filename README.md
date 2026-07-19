@@ -207,15 +207,17 @@ worktrees + a serialized integration queue arrive with parallelism.
 
 ## Status
 
-Early scaffold: every crate compiles with placeholder types wiring the
-dependency graph above; there is no real orchestration logic yet. Phased
-roadmap: [`TODO.md`](TODO.md).
+**Phase 1 (slim MVP) works.** The critique loop runs end-to-end on real agent
+CLIs, records everything to a JSONL journal, enforces budgets, and resumes a
+killed run. `hex-mcp` / `hex-dashboard` are still stubs. Phased roadmap and
+what's deferred: [`TODO.md`](TODO.md).
 
 ```bash
 cargo build --workspace     # build everything
-cargo test  --workspace     # run unit tests
-cargo run   --bin hex       # print the planned command surface
-cargo bench                 # criterion benchmarks
+cargo test  --workspace     # 39 tests
+cargo clippy --workspace --all-targets
+hex validate critique-loop --input task=demo
+hex run critique-loop --input task="fix the flaky auth test"
 ```
 
 ## Design

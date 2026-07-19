@@ -151,14 +151,27 @@ sign-off, confirmation.
 ## Gotchas
 
 1. Binary is `hex`, package is `hex-cli` — use `cargo run --bin hex`, not `-p hex`.
-2. Crate contents are placeholder stubs wiring the dependency graph; treat
-   them as scaffolding to replace, not patterns to follow.
-3. Surface syntax is **standard YAML only** — kind-as-key + `on:` map,
-   co-located edges, inline block-scalar prompts, `templates:`/`extends:`,
-   run-level `gates:`. No custom mini-grammar (`->` arrows etc.); the kernel
-   models the compiled IR only.
-4. `hex-mcp`/`hex-dashboard` are deliberate stubs; they become thin
+2. Phase 1 (slim MVP) is implemented and green; Phase 2+ items in TODO.md are
+   still stubs or unbuilt. Node kinds `agent`/`gate`/`command`/`terminal` work;
+   `human` fails closed (no transport yet). `interactive`, `pause`, worktrees,
+   `templates:`/`extends:`, reusable `gates:`, and capability matching are Phase 2+.
+3. A node's routing token is an `EventBody::Signal { name }` — agent proposals
+   *and* gate verdicts (`passed`/`failed`) unify there; edges match on `name`.
+   `reduce(graph, state, event)` owns routing (it takes the graph); `schedule`
+   only emits `Effect` intents; the runtime `Session` executes them.
+4. Surface syntax is **standard YAML only** — kind-as-key + `on:` map,
+   co-located edges, inline block-scalar prompts. No custom mini-grammar; the
+   kernel models the compiled IR only, and the loader lives in `hex-runtime`
+   (not the kernel). `serde_yaml` is archived-but-fine for now.
+5. The worker↔runtime channel is `hex emit <event>`: the runtime injects
+   `HEX_EMIT_FILE`/`HEX_MAY_PROPOSE` etc.; the agent's argv must be able to
+   reach the `hex` binary. `may_propose` is enforced both at emit and at ingest.
+6. `hex run`'s workspace is the project cwd (shared isolation); run it from the
+   repo root. Redo = new `run`; `resume` continues the same run and marks an
+   orphaned attempt `interrupted` before re-attempting (never a silent rerun).
+7. `hex-mcp`/`hex-dashboard` are deliberate stubs; they become thin
    `RuntimeClient` clients — a transport/projection, never orchestration.
-5. Worktree isolation is per-run and opt-in (`isolation: worktree`), default
-   `shared`; **no auto-merge** — the branch is left for explicit integration.
-6. _add new gotchas here as they are discovered_
+8. Worktree isolation is per-run and opt-in (`isolation: worktree`, Phase 2),
+   default `shared`; **no auto-merge** — the branch is left for explicit
+   integration.
+9. _add new gotchas here as they are discovered_

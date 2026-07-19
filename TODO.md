@@ -58,47 +58,47 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
 - [x] Placeholder types wiring the new inward graph; build/test/clippy/bench
       green; binary prints the 11-verb surface.
 
-## Phase 1 — slim MVP: claude + codex critique loop
+## Phase 1 — slim MVP: claude + codex critique loop ✅
 
-Goal: `hex run critique-loop --input task="…"` works end-to-end — codex
+Goal (met): `hex run critique-loop --input task="…"` runs end-to-end — codex
 implements, claude critiques, loop until approved + gate passes — and a killed
-run resumes from its journal.
+run resumes from its journal. 39 tests + clippy green; verified end-to-end
+against the real `hex` binary.
 
-- [ ] `hex-proto`: versioned `Event` envelope (schema, seq, run/node/attempt,
-      actor, type, payload) + `Command`.
-- [ ] Config loading: `~/.config/hex/config.yaml` + `.hex/config.yaml`
-      (project wins) — worker registry + default budgets/context.
-- [ ] YAML loader → Graph IR (kind-as-key, co-located `on:` map, `defaults:`,
+- [x] `hex-proto`: versioned `Event` envelope (schema, seq, at_ms, run/node/
+      attempt, actor, typed `EventBody`) + `Command` + `Disposition`.
+- [x] Config loading: `~/.config/hex/config.yaml` + `.hex/config.yaml`
+      (project wins), layered over a built-in codex/claude registry.
+- [x] YAML loader → Graph IR (kind-as-key, co-located `on:` map, `defaults:`,
       block-scalar prompts, `inputs:` parametrization). Templates/extends and
-      reusable `gates:`/`use:` are Phase 2.
-- [ ] Validator (minimum honest set): references, reachability,
-      **bounded-cycle (SCC) enforcement**, `may_propose` coverage.
-- [ ] Kernel: `reduce` / `schedule` (→ `StartAttempt`, `RunGate`,
-      `RequestHuman`, `CancelAttempt`, `RecordTerminal`) / `accept` — minimal
-      but real.
-- [ ] Runtime drive loop: replay → schedule → intent-before-effect with
+      reusable `gates:`/`use:` remain Phase 2.
+- [x] Validator (minimum honest set): references, reachability, terminal
+      reachability, **bounded-cycle enforcement**, `may_propose` coverage.
+- [x] Kernel: `reduce` (owns routing) / `schedule` (→ `StartAttempt`,
+      `RunGate`, `RequestHuman`, `RecordTerminal`) / `accept` — minimal but real.
+- [x] Runtime drive loop: replay → schedule → intent-before-effect with
       idempotency keys → execute → append → reduce; crash recovery (orphaned
       attempts marked `interrupted`; redo = new run).
-- [ ] Append-only JSONL journal + replay; run dir
-      `.hex/runs/<id>/{graph.yaml, graph.sha256, events.jsonl, artifacts/,
-      attempts/<id>/}`. Atomic `state.json` snapshot may trail to Phase 2.
-- [ ] Workers: **claude** + **codex** headless adapters (argv, fresh session
-      per attempt) + a simple mock for tests.
-- [ ] Worker channel, transport 1: injected env (ids + scoped token) +
-      `hex emit`; per-node `may_propose` allow-list enforced.
-- [ ] Node kinds working: `agent`, `gate` (inline command), `terminal`
-      (`command`/`human` may stub to Phase 2).
-- [ ] Budgets: attempts + elapsed time (per node + per run + per cycle
-      visits); fail-closed.
-- [ ] Preset resolution: `.hex/graphs/` > `~/.config/hex/graphs/` > built-in;
-      ship built-in `critique-loop` (codex implements → claude critiques →
-      gate) with `--input` parameters.
-- [ ] Verbs: `run` `resume` `status` `watch` `cancel` `validate`; `--json`
-      NDJSON on watch; stable exit codes.
-- [ ] Isolation: `shared` only.
-- [ ] Tests: kernel property basics (terminal runs schedule nothing; replay ==
-      projection; unbounded cycles rejected) + one kill-and-resume
-      integration test + critique-loop e2e on the mock worker.
+- [x] Append-only JSONL journal + replay (torn-tail tolerant, monotonic seq);
+      run dir `.hex/runs/<id>/{graph.yaml, graph.sha256, events.jsonl,
+      attempts/<id>/}`. Atomic `state.json` snapshot trails to Phase 2.
+- [x] Workers: generic `AgentWorker` (argv template, fresh session, `hex emit`
+      channel) drives claude/codex + a scripted `MockWorker` for tests.
+- [x] Worker channel, transport 1: injected env (`HEX_RUN_ID`/`HEX_NODE_ID`/
+      `HEX_ATTEMPT_ID`/`HEX_EMIT_FILE`/`HEX_MAY_PROPOSE`) + `hex emit`;
+      per-node `may_propose` allow-list enforced at emit and at ingest.
+- [x] Node kinds working: `agent`, `gate`/`command` (inline argv), `terminal`
+      (`human` stubs to Phase 2, fails closed).
+- [x] Budgets: attempts + elapsed time + per-node cycle visits; fail-closed.
+- [x] Preset resolution: `.hex/graphs/` > `~/.config/hex/graphs/` > built-in;
+      ships built-in `critique-loop` with `--input` parameters.
+- [x] Verbs: `run` `resume` `status` `watch` `cancel` `validate` `graph`
+      `emit`; `--json`/NDJSON; stable exit codes (0 success / 1 non-success /
+      2 usage).
+- [x] Isolation: `shared` only (the run's workspace is the project cwd).
+- [x] Tests: kernel property basics (terminal schedules nothing; replay ==
+      projection; unbounded cycles rejected) + kill-and-resume integration +
+      critique-loop e2e + budget-exhaustion e2e on the mock worker.
 
 ## Phase 2 — hardening + authoring
 

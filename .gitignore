@@ -22,3 +22,6 @@ target
 
 # critique-loop working state
 .critique-loop/
+
+# hex run artifacts (journals, snapshots, attempt logs)
+.hex/runs/

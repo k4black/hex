@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+hex-proto = { workspace = true }
 hex-kernel = { workspace = true }
 hex-runtime = { workspace = true }
 

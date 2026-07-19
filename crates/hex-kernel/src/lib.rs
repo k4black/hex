@@ -1,7 +1,7 @@
 //! `hex-kernel` — the pure, deterministic kernel of hex.
 //!
-//! Owns the compiled graph IR (nodes, edges, bounded cycles), the journal
-//! *model*, projections, and the three pure functions the runtime drives:
+//! Owns the compiled graph IR (nodes, edges, bounded cycles), the projected
+//! run state, IR validation, and the three pure functions the runtime drives:
 //! [`reduce`], [`schedule`], and [`accept`]. Depends only on [`hex_proto`].
 //!
 //! The kernel is **pure**: no IO, no clock, no subprocesses, no worker
@@ -10,199 +10,423 @@
 //! with idempotency keys). This keeps routing and completion logic testable
 //! without any model or subprocess, and routing spends no tokens.
 //!
-//! The graph *surface syntax* (standard YAML) is loaded elsewhere; this crate
-//! models the compiled IR only.
-//!
-//! Status: scaffold.
+//! The graph *surface syntax* (standard YAML) is parsed elsewhere (the
+//! runtime); this crate models the compiled IR only.
 
-use hex_proto::{Event, PROTOCOL_VERSION};
+use std::collections::BTreeMap;
 
-pub mod graph {
-    //! Compiled, immutable graph IR.
-    //!
-    //! Roles such as "planner" or "reviewer" are *metadata* on an
-    //! [`NodeKind::Agent`] node, and interactivity is a *policy flag* on
-    //! `agent` — never new kinds. Keeping the kind set tiny is a core design
-    //! rule, as is rejecting unbounded cycles at validation time.
-    //!
-    //! (placeholder shapes)
+use hex_proto::{Disposition, Event, EventBody};
 
-    /// The kind of a schedulable node.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum NodeKind {
-        /// Invoke one opaque external agent (a coding-agent CLI) via a worker.
-        Agent,
-        /// Run a deterministic executable/script.
-        Command,
-        /// Run a deterministic validator producing pass/fail/escalate.
-        Gate,
-        /// Suspend durably for a human decision or input.
-        Human,
-        /// Explicit terminal outcome.
-        Terminal,
-    }
+pub mod graph;
+pub mod validate;
 
-    /// A single node in the graph.
-    #[derive(Debug, Clone)]
-    pub struct Node {
-        /// Stable node identifier.
-        pub id: String,
-        /// What this node does.
-        pub kind: NodeKind,
-    }
+pub use graph::{Budget, Context, Edge, Graph, Node, NodeKind, NodeSpec, Requirement};
+pub use validate::{Issue, validate};
 
-    /// A legal transition between nodes, taken on a named event and carrying
-    /// an ordered condition — never model-chosen control flow.
-    #[derive(Debug, Clone)]
-    pub struct Edge {
-        /// Source node id.
-        pub from: String,
-        /// Target node id.
-        pub to: String,
-        /// Event name that activates this edge.
-        pub on: String,
-    }
-
-    /// A compiled, immutable graph: nodes plus the edges between them.
-    #[derive(Debug, Clone, Default)]
-    pub struct Graph {
-        /// All nodes, keyed elsewhere by [`Node::id`].
-        pub nodes: Vec<Node>,
-        /// All legal transitions.
-        pub edges: Vec<Edge>,
-    }
+/// Status of a run, derived purely by folding [`reduce`] over the journal.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Status {
+    /// Created but scheduling has not started.
+    #[default]
+    Created,
+    /// Actively scheduling attempts.
+    Running,
+    /// Scheduling suspended by an operator.
+    Paused,
+    /// Reached a terminal disposition.
+    Finished(Disposition),
 }
 
-pub mod journal {
-    //! The journal *model*: the authoritative, append-only history of a run.
-    //!
-    //! This module defines what a journal is (versioned, sequenced, actored
-    //! events; monotonic seq; one terminal per attempt) — the actual JSONL
-    //! writer/reader with fsync and torn-tail tolerance is IO and therefore
-    //! lives in `hex-runtime`, not here.
-    //!
-    //! (stub — replay/validation of event sequences lands here)
-}
-
-pub mod projection {
-    //! Read models *computed* from the journal — never stored authority.
-    //!
-    //! `state = fold(reduce, journal)`; the atomic snapshot file is one kind
-    //! of projection, an optimization the runtime may persist and must always
-    //! be able to rebuild.
-    //!
-    //! (stub — status/graph/metrics projections land here)
-}
-
-/// Projected state of one run, computed by folding [`reduce`] over the
-/// journal. Never persisted as authority.
-///
-/// (placeholder shape)
+/// Projected state of one run: `state = fold(reduce, journal)`. Never
+/// persisted as authority — always rebuildable from the journal.
 #[derive(Debug, Clone, Default)]
 pub struct RunState {
+    /// Where the run is in its lifecycle.
+    pub status: Status,
+    /// The node currently active (about to run, or in-flight).
+    pub current: Option<String>,
+    /// Whether an attempt is in-flight for [`RunState::current`].
+    pub awaiting: bool,
+    /// Total attempts started across the whole run.
+    pub attempts_total: u32,
+    /// Attempts started per node.
+    pub attempts_per_node: BTreeMap<String, u32>,
+    /// Times each node has been entered (cycle-visit accounting).
+    pub visits: BTreeMap<String, u32>,
+    /// The last routing signal each node produced (drives acceptance).
+    pub signals: BTreeMap<String, String>,
+    /// When scheduling started (Unix epoch ms), for elapsed budgets.
+    pub started_at_ms: u64,
     /// Sequence number of the last event folded in.
     pub last_seq: u64,
+    /// The `--input` values the run was parametrized with.
+    pub inputs: BTreeMap<String, String>,
+    /// Hash of the exact graph snapshot this run executes.
+    pub graph_hash: String,
 }
 
-/// An *intent* describing one external action the kernel wants performed.
-/// The kernel emits it; only the runtime executes it, writing
-/// intent-before-effect with idempotency keys.
-///
-/// (placeholder set)
+impl RunState {
+    /// The terminal disposition, if the run has finished.
+    #[must_use]
+    pub fn disposition(&self) -> Option<Disposition> {
+        match self.status {
+            Status::Finished(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Whether the run has reached any terminal state.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        matches!(self.status, Status::Finished(_))
+    }
+}
+
+/// An *intent* describing one external action the kernel wants performed. The
+/// kernel emits it; only the runtime executes it, writing intent-before-effect
+/// with idempotency keys. Effects are lean (ids only) — the runtime already
+/// holds the graph and reads the node's prompt/command/worker from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    /// Start one attempt of a node via its worker.
-    StartAttempt,
-    /// Run a deterministic gate validator.
-    RunGate,
-    /// Suspend and request a human decision or input.
-    RequestHuman,
-    /// Cancel an in-flight attempt.
-    CancelAttempt,
+    /// Start one attempt of an agent node via its worker.
+    StartAttempt {
+        /// Node to run.
+        node_id: String,
+        /// Fresh attempt id.
+        attempt_id: String,
+        /// Key deduplicating the attempt across restarts.
+        idempotency_key: String,
+    },
+    /// Run a deterministic gate/command node.
+    RunGate {
+        /// Node to run.
+        node_id: String,
+        /// Fresh attempt id.
+        attempt_id: String,
+        /// Key deduplicating the attempt across restarts.
+        idempotency_key: String,
+    },
+    /// Suspend and request a human decision or input (not implemented in the
+    /// slim MVP — the critique loop uses no human node).
+    RequestHuman {
+        /// Node requesting the human.
+        node_id: String,
+    },
     /// Record the run's terminal disposition.
-    RecordTerminal,
+    RecordTerminal {
+        /// The final outcome.
+        disposition: Disposition,
+    },
 }
 
-/// Provisional acceptance of a run outcome. A worker's "done" is a proposal;
-/// required gates + acceptance rules decide — deterministic evidence outranks
-/// model assertions.
-///
-/// (placeholder set)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Whether the acceptance contract (`accept.require`) is satisfied.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Acceptance {
-    /// Evidence still outstanding.
-    #[default]
-    Pending,
-    /// Required gates passed; outcome accepted.
+    /// All required signals observed.
     Accepted,
-    /// Required evidence failed; outcome rejected.
-    Rejected,
+    /// Required `node.signal` evidence still missing.
+    Missing(Vec<String>),
 }
 
 /// Fold one journal event into the projected run state:
-/// `new_state = reduce(old_state, event)`. Pure and deterministic.
-///
-/// (placeholder — only tracks the sequence number for now)
+/// `new_state = reduce(graph, old_state, event)`. Pure and deterministic; the
+/// single source of every state transition, **including routing**.
 #[must_use]
-pub fn reduce(state: RunState, event: &Event) -> RunState {
-    RunState {
-        last_seq: state.last_seq.max(event.seq),
+pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
+    state.last_seq = event.seq;
+    match &event.body {
+        EventBody::RunCreated { graph_hash, inputs } => {
+            state.status = Status::Created;
+            state.graph_hash = graph_hash.clone();
+            state.inputs = inputs.clone();
+        }
+        EventBody::RunStarted => {
+            state.status = Status::Running;
+            state.current = Some(graph.entry.clone());
+            *state.visits.entry(graph.entry.clone()).or_insert(0) += 1;
+            state.started_at_ms = event.at_ms;
+        }
+        EventBody::AttemptStarted { .. } => {
+            state.awaiting = true;
+            state.attempts_total += 1;
+            if let Some(cur) = &state.current {
+                *state.attempts_per_node.entry(cur.clone()).or_insert(0) += 1;
+            }
+        }
+        EventBody::AttemptInterrupted => {
+            // Orphaned attempt: clear the in-flight flag so the same node is
+            // re-scheduled as a fresh attempt.
+            state.awaiting = false;
+        }
+        EventBody::Signal { name } => {
+            state.awaiting = false;
+            if let Some(cur) = state.current.clone() {
+                state.signals.insert(cur.clone(), name.clone());
+                match graph.route(&cur, name) {
+                    Some(to) => {
+                        state.current = Some(to.to_owned());
+                        *state.visits.entry(to.to_owned()).or_insert(0) += 1;
+                    }
+                    None => {
+                        // No legal edge for this signal — a defensive failure
+                        // (validation guarantees `may_propose` events route).
+                        state.status = Status::Finished(Disposition::Failed);
+                    }
+                }
+            }
+        }
+        EventBody::AttemptFailed { .. } => {
+            state.awaiting = false;
+            state.status = Status::Finished(Disposition::Failed);
+        }
+        EventBody::RunFinished { disposition } => {
+            state.status = Status::Finished(*disposition);
+        }
+        EventBody::BudgetExhausted { .. } | EventBody::Note { .. } => {}
+    }
+    state
+}
+
+/// Derive the next [`Effect`] intents from `(graph, state)` at time `now_ms`.
+/// Deterministic. Returns at most one effect in the slim sequential MVP.
+///
+/// `now_ms` is injected so the kernel stays clock-free and testable.
+#[must_use]
+pub fn schedule(graph: &Graph, state: &RunState, now_ms: u64) -> Vec<Effect> {
+    if state.status != Status::Running || state.awaiting {
+        return Vec::new();
+    }
+    let Some(cur) = state.current.clone() else {
+        return Vec::new();
+    };
+    let Some(node) = graph.node(&cur) else {
+        return vec![terminal(Disposition::Failed)];
+    };
+
+    // Budgets are checked before spending an attempt, and fail closed.
+    if let Some(max) = graph.budget.attempts
+        && state.attempts_total >= max
+    {
+        return vec![terminal(Disposition::BudgetExhausted)];
+    }
+    if let Some(maxv) = graph.budget.cycle_visits
+        && state.visits.get(&cur).copied().unwrap_or(0) > maxv
+    {
+        return vec![terminal(Disposition::BudgetExhausted)];
+    }
+    if let Some(maxe) = graph.budget.elapsed_ms
+        && now_ms.saturating_sub(state.started_at_ms) >= maxe
+    {
+        return vec![terminal(Disposition::TimedOut)];
+    }
+
+    let attempt_id = format!("att_{}", state.attempts_total + 1);
+    let idempotency_key = format!("{cur}#{}", state.attempts_total + 1);
+    match &node.spec {
+        NodeSpec::Terminal { disposition } => {
+            // A success terminal only succeeds if the acceptance contract holds.
+            if *disposition == Disposition::Succeeded
+                && !matches!(accept(graph, state), Acceptance::Accepted)
+            {
+                return vec![terminal(Disposition::Failed)];
+            }
+            vec![terminal(*disposition)]
+        }
+        NodeSpec::Agent { .. } => vec![Effect::StartAttempt {
+            node_id: cur,
+            attempt_id,
+            idempotency_key,
+        }],
+        NodeSpec::Gate { .. } | NodeSpec::Command { .. } => vec![Effect::RunGate {
+            node_id: cur,
+            attempt_id,
+            idempotency_key,
+        }],
+        NodeSpec::Human { .. } => vec![Effect::RequestHuman { node_id: cur }],
     }
 }
 
-/// Derive the next batch of [`Effect`] intents from `(graph, state)`.
-/// Deterministic: a model may *propose* a route only from its node's
-/// `may_propose` allow-list; this function validates every transition.
-///
-/// (placeholder — always empty for now)
+/// Decide whether the run's acceptance contract (`accept.require`) is met.
+/// Deterministic evidence outranks any worker's "done" claim.
 #[must_use]
-pub fn schedule(_graph: &graph::Graph, _state: &RunState) -> Vec<Effect> {
-    Vec::new()
+pub fn accept(graph: &Graph, state: &RunState) -> Acceptance {
+    let mut missing = Vec::new();
+    for req in &graph.accept {
+        if state.signals.get(&req.node).map(String::as_str) != Some(req.signal.as_str()) {
+            missing.push(format!("{}.{}", req.node, req.signal));
+        }
+    }
+    if missing.is_empty() {
+        Acceptance::Accepted
+    } else {
+        Acceptance::Missing(missing)
+    }
 }
 
-/// Decide the provisional acceptance of the current state from required
-/// gates + acceptance rules.
-///
-/// (placeholder — always pending for now)
-#[must_use]
-pub fn accept(_state: &RunState) -> Acceptance {
-    Acceptance::Pending
-}
-
-/// Placeholder that also proves the `proto -> kernel` dependency direction
-/// compiles. Returns the protocol version this build was compiled against.
-#[must_use]
-pub fn protocol_version() -> u32 {
-    PROTOCOL_VERSION
+fn terminal(disposition: Disposition) -> Effect {
+    Effect::RecordTerminal { disposition }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hex_proto::Event;
+    use hex_proto::{Actor, PROTOCOL_VERSION};
 
-    fn event(seq: u64) -> Event {
+    fn ev(seq: u64, body: EventBody) -> Event {
         Event {
             schema_version: PROTOCOL_VERSION,
             seq,
+            at_ms: seq * 1000,
             run_id: "run_0".to_owned(),
-            kind: "run.created".to_owned(),
+            node_id: None,
+            attempt_id: None,
+            actor: Actor::runtime(),
+            body,
         }
     }
 
-    #[test]
-    fn reduce_advances_sequence() {
-        let state = reduce(RunState::default(), &event(7));
-        assert_eq!(state.last_seq, 7);
+    /// implement --ready--> test(gate) --passed--> done, --failed--> implement.
+    fn loop_graph() -> Graph {
+        Graph::builder("t", "implement")
+            .agent("implement", "codex", "do it", &["ready"])
+            .gate("test", &["true"])
+            .terminal("done", Disposition::Succeeded)
+            .edge("implement", "ready", "test")
+            .edge("test", "passed", "done")
+            .edge("test", "failed", "implement")
+            .budget(Budget {
+                attempts: Some(8),
+                elapsed_ms: None,
+                cycle_visits: None,
+            })
+            .require("test", "passed")
+            .build()
+    }
+
+    fn drive_to(graph: &Graph, events: &[EventBody]) -> RunState {
+        let mut state = RunState::default();
+        for (i, body) in events.iter().enumerate() {
+            state = reduce(graph, state, &ev(i as u64, body.clone()));
+        }
+        state
     }
 
     #[test]
-    fn empty_graph_schedules_no_effects() {
-        assert!(schedule(&graph::Graph::default(), &RunState::default()).is_empty());
+    fn run_started_activates_entry() {
+        let g = loop_graph();
+        let s = drive_to(&g, &[EventBody::RunStarted]);
+        assert_eq!(s.current.as_deref(), Some("implement"));
+        assert_eq!(s.status, Status::Running);
     }
 
     #[test]
-    fn acceptance_is_pending_by_default() {
-        assert_eq!(accept(&RunState::default()), Acceptance::Pending);
+    fn signal_routes_along_matching_edge() {
+        let g = loop_graph();
+        let s = drive_to(
+            &g,
+            &[
+                EventBody::RunStarted,
+                EventBody::AttemptStarted {
+                    idempotency_key: "k".to_owned(),
+                    worker: None,
+                },
+                EventBody::Signal {
+                    name: "ready".to_owned(),
+                },
+            ],
+        );
+        assert_eq!(s.current.as_deref(), Some("test"));
+        assert!(!s.awaiting);
+    }
+
+    #[test]
+    fn schedule_emits_one_effect_then_waits() {
+        let g = loop_graph();
+        let s = drive_to(&g, &[EventBody::RunStarted]);
+        let effects = schedule(&g, &s, 0);
+        assert_eq!(effects.len(), 1);
+        // After an attempt starts, nothing new schedules until it ends.
+        let s2 = reduce(
+            &g,
+            s,
+            &ev(
+                9,
+                EventBody::AttemptStarted {
+                    idempotency_key: "k".to_owned(),
+                    worker: None,
+                },
+            ),
+        );
+        assert!(schedule(&g, &s2, 0).is_empty());
+    }
+
+    #[test]
+    fn terminal_run_schedules_nothing() {
+        let g = loop_graph();
+        let s = drive_to(
+            &g,
+            &[
+                EventBody::RunStarted,
+                EventBody::RunFinished {
+                    disposition: Disposition::Succeeded,
+                },
+            ],
+        );
+        assert!(schedule(&g, &s, 0).is_empty());
+    }
+
+    #[test]
+    fn attempts_budget_exhaustion_fails_closed() {
+        let g = loop_graph();
+        let mut s = drive_to(&g, &[EventBody::RunStarted]);
+        s.attempts_total = 8; // at the limit
+        assert_eq!(
+            schedule(&g, &s, 0),
+            vec![Effect::RecordTerminal {
+                disposition: Disposition::BudgetExhausted
+            }]
+        );
+    }
+
+    #[test]
+    fn success_terminal_requires_acceptance() {
+        let g = loop_graph();
+        // Reach `done` without ever seeing test.passed.
+        let mut s = drive_to(&g, &[EventBody::RunStarted]);
+        s.current = Some("done".to_owned());
+        assert_eq!(
+            schedule(&g, &s, 0),
+            vec![Effect::RecordTerminal {
+                disposition: Disposition::Failed
+            }]
+        );
+        // With the evidence present it succeeds.
+        s.signals.insert("test".to_owned(), "passed".to_owned());
+        assert_eq!(
+            schedule(&g, &s, 0),
+            vec![Effect::RecordTerminal {
+                disposition: Disposition::Succeeded
+            }]
+        );
+    }
+
+    #[test]
+    fn replay_is_deterministic() {
+        let g = loop_graph();
+        let events = [
+            EventBody::RunStarted,
+            EventBody::AttemptStarted {
+                idempotency_key: "k".to_owned(),
+                worker: None,
+            },
+            EventBody::Signal {
+                name: "ready".to_owned(),
+            },
+        ];
+        let a = drive_to(&g, &events);
+        let b = drive_to(&g, &events);
+        assert_eq!(a.current, b.current);
+        assert_eq!(a.attempts_total, b.attempts_total);
+        assert_eq!(a.visits, b.visits);
     }
 }
