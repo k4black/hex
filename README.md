@@ -214,7 +214,7 @@ what's deferred: [`TODO.md`](TODO.md).
 
 ```bash
 cargo build --workspace     # build everything
-cargo test  --workspace     # 53 tests
+cargo test  --workspace     # 54 tests
 cargo clippy --workspace --all-targets
 hex validate critique-loop --input task=demo
 hex run critique-loop --input task="fix the flaky auth test"

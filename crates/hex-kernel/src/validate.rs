@@ -239,7 +239,8 @@ pub fn check_journal(events: &[Event]) -> Result<(), Issue> {
         Finished,
     }
     let mut phase = Phase::Init;
-    let mut awaiting = false;
+    // The in-flight attempt, if any: every result/interruption must match it.
+    let mut active: Option<(&str, &str)> = None;
 
     for (i, e) in events.iter().enumerate() {
         if e.schema_version != PROTOCOL_VERSION {
@@ -266,31 +267,50 @@ pub fn check_journal(events: &[Event]) -> Result<(), Issue> {
                 phase = Phase::Running;
             }
             EventBody::AttemptStarted { .. } => {
-                if phase != Phase::Running || awaiting {
+                if phase != Phase::Running || active.is_some() {
                     return Err(bad(i, "attempt_started while not idle-running"));
                 }
-                if e.node_id.is_none() || e.attempt_id.is_none() {
-                    return Err(bad(i, "attempt_started missing node/attempt id"));
+                match (e.node_id.as_deref(), e.attempt_id.as_deref()) {
+                    (Some(n), Some(a)) => active = Some((n, a)),
+                    _ => return Err(bad(i, "attempt_started missing node/attempt id")),
                 }
-                awaiting = true;
             }
             EventBody::Signal { .. } | EventBody::AttemptFailed { .. } => {
-                if !awaiting {
-                    return Err(bad(i, "signal/attempt_failed with no attempt in flight"));
+                if !attempt_matches(active, e) {
+                    return Err(bad(i, "signal/attempt_failed does not match the in-flight attempt"));
                 }
-                awaiting = false;
+                active = None;
+                // A disposition-bearing AttemptFailed is itself terminal.
+                if matches!(e.body, EventBody::AttemptFailed { .. }) {
+                    phase = Phase::Finished;
+                }
             }
             EventBody::AttemptInterrupted => {
-                if !awaiting {
-                    return Err(bad(i, "attempt_interrupted with no attempt in flight"));
+                if !attempt_matches(active, e) {
+                    return Err(bad(i, "attempt_interrupted does not match the in-flight attempt"));
                 }
-                awaiting = false;
+                active = None;
             }
-            EventBody::RunFinished { .. } => phase = Phase::Finished,
+            EventBody::RunFinished { .. } => {
+                if active.is_some() {
+                    return Err(bad(i, "run_finished while an attempt is still in flight"));
+                }
+                phase = Phase::Finished;
+            }
             EventBody::BudgetExhausted { .. } | EventBody::Note { .. } => {}
         }
     }
     Ok(())
+}
+
+/// Whether `event`'s node/attempt ids match the in-flight attempt.
+fn attempt_matches(active: Option<(&str, &str)>, event: &Event) -> bool {
+    match active {
+        Some((node, attempt)) => {
+            event.node_id.as_deref() == Some(node) && event.attempt_id.as_deref() == Some(attempt)
+        }
+        None => false,
+    }
 }
 
 fn bad(index: usize, why: impl Into<String>) -> Issue {

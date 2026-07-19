@@ -317,7 +317,9 @@ fn event_summary(body: &hex_runtime::EventBody) -> String {
         }
         B::AttemptInterrupted => "attempt_interrupted".to_owned(),
         B::Signal { name } => format!("signal {name}"),
-        B::AttemptFailed { reason } => format!("attempt_failed: {reason}"),
+        B::AttemptFailed { reason, disposition } => {
+            format!("attempt_failed [{}]: {reason}", disposition_name(*disposition))
+        }
         B::BudgetExhausted { detail } => format!("budget_exhausted: {detail}"),
         B::RunFinished { disposition } => format!("run_finished: {}", disposition_name(*disposition)),
         B::Note { text } => format!("note: {text}"),

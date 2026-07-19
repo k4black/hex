@@ -136,6 +136,7 @@ fn tampered_snapshot_is_rejected_on_resume() {
             EventBody::RunCreated {
                 graph_hash: "not_the_real_hash".to_owned(),
                 inputs: inputs(),
+                defaults: Default::default(),
             },
         )
         .unwrap();
@@ -164,6 +165,7 @@ fn write_crashed_run(root: &std::path::Path, run_id: &str) {
         EventBody::RunCreated {
             graph_hash: hash,
             inputs: inputs(),
+                defaults: Default::default(),
         },
     )
     .unwrap();
@@ -220,6 +222,71 @@ fn interrupted_run_resumes_from_journal() {
 }
 
 #[test]
+fn crash_right_after_attempt_failed_does_not_rerun() {
+    // A journal ending exactly at a terminal AttemptFailed must resume as
+    // finished — the failure and its disposition are one atomic record, so
+    // there is no window in which the failed node looks re-runnable.
+    let root = temp_root("failcrash");
+    let run_id = "run_failcrash";
+    let run_dir = root.join(".hex").join("runs").join(run_id);
+    std::fs::create_dir_all(run_dir.join("attempts")).expect("mkdir");
+    std::fs::write(run_dir.join("graph.yaml"), GRAPH).expect("graph.yaml");
+    let hash = hex_runtime::driver::graph_hash(GRAPH);
+    std::fs::write(run_dir.join("graph.sha256"), &hash).expect("sha");
+    {
+        let mut j = Journal::create(run_dir.join("events.jsonl")).expect("journal");
+        j.append(
+            run_id,
+            None,
+            None,
+            Actor::runtime(),
+            EventBody::RunCreated {
+                graph_hash: hash,
+                inputs: inputs(),
+                defaults: Default::default(),
+            },
+        )
+        .unwrap();
+        j.append(run_id, None, None, Actor::runtime(), EventBody::RunStarted)
+            .unwrap();
+        j.append(
+            run_id,
+            Some("implement"),
+            Some("att_1"),
+            Actor::runtime(),
+            EventBody::AttemptStarted {
+                idempotency_key: "implement#1".to_owned(),
+                worker: Some("mock".to_owned()),
+            },
+        )
+        .unwrap();
+        j.append(
+            run_id,
+            Some("implement"),
+            Some("att_1"),
+            Actor::runtime(),
+            EventBody::AttemptFailed {
+                reason: "boom".to_owned(),
+                disposition: Disposition::Failed,
+            },
+        )
+        .unwrap();
+    }
+
+    // A runtime whose mock *would* emit if the node were re-run.
+    let root_for_read = root.clone();
+    let report = finishing_runtime(root).resume(run_id).expect("resume");
+    assert_eq!(report.disposition, Disposition::Failed);
+    let all = Runtime::with_workers(root_for_read, Config::builtin(), Workers::new())
+        .events(run_id)
+        .expect("events");
+    assert!(
+        !all.iter().any(|e| e.attempt_id.as_deref() == Some("att_2")),
+        "a failed attempt must not be rerun on resume"
+    );
+}
+
+#[test]
 fn stale_lock_file_does_not_block_resume() {
     // A crashed process leaves its `run.lock` file behind, but the OS advisory
     // lock it held is released — so resume must still succeed.
@@ -255,6 +322,7 @@ fn lifecycle_invalid_journal_is_rejected() {
             EventBody::RunCreated {
                 graph_hash: hash,
                 inputs: inputs(),
+                defaults: Default::default(),
             },
         )
         .unwrap();
@@ -311,10 +379,11 @@ accept:
 
     let report = runtime.start("timeout", &BTreeMap::new()).expect("run");
     assert_eq!(report.disposition, Disposition::TimedOut);
-    // The disposition is backed by a real RunFinished event.
+    // The disposition is backed by a single durable terminal event: a
+    // disposition-bearing AttemptFailed (no separate RunFinished / crash window).
     let events = runtime.events(&report.run_id).expect("events");
     assert!(events.iter().any(|e| matches!(
         &e.body,
-        EventBody::RunFinished { disposition: Disposition::TimedOut }
+        EventBody::AttemptFailed { disposition: Disposition::TimedOut, .. }
     )));
 }

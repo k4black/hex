@@ -118,6 +118,11 @@ pub enum EventBody {
         /// The `--input` values the run was parametrized with.
         #[serde(default)]
         inputs: BTreeMap<String, String>,
+        /// The effective compile defaults (e.g. `worker`, `context`) used at
+        /// creation, recorded here so resume is bound to them rather than to
+        /// mutable config or a separate unbound file.
+        #[serde(default)]
+        defaults: BTreeMap<String, String>,
     },
     /// Scheduling has begun; the entry node is active.
     RunStarted,
@@ -140,10 +145,15 @@ pub enum EventBody {
         /// The event name edges match on.
         name: String,
     },
-    /// An attempt failed to execute (worker crashed, emitted nothing valid).
+    /// An attempt failed to execute (worker crashed, timed out, emitted nothing
+    /// valid). This is a *terminal* event: it carries the run's resulting
+    /// disposition so a failure is one atomic durable fact — there is no window
+    /// between recording the failure and recording the outcome.
     AttemptFailed {
         /// Human-readable reason.
         reason: String,
+        /// The terminal disposition this failure produces (`Failed`/`TimedOut`).
+        disposition: Disposition,
     },
     /// A budget was exhausted; the run fails closed.
     BudgetExhausted {

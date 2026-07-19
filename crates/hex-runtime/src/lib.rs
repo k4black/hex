@@ -196,8 +196,9 @@ impl Runtime {
             ));
         }
 
-        // Recompile against the defaults the run was created with.
-        let defaults = self.load_manifest(&run_dir);
+        // Recompile against the defaults recorded in the run's RunCreated event
+        // (integrity-bound with its inputs + verified hash), not live config.
+        let defaults = recorded_defaults(&events);
         let inputs = recorded_inputs(&events);
         let graph = self.compile_with(&source, &inputs, &defaults)?;
 
@@ -212,14 +213,6 @@ impl Runtime {
         Ok((graph, events, state))
     }
 
-    /// The effective defaults persisted at run creation, falling back to live
-    /// config if the manifest is absent (older runs).
-    fn load_manifest(&self, run_dir: &Path) -> config::DefaultsSpec {
-        std::fs::read_to_string(run_dir.join("manifest.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| self.config.defaults.clone())
-    }
 
     /// Start a new run of `reference`, parametrized by `inputs`. Blocks until
     /// the run reaches a terminal disposition (foreground MVP).
@@ -241,15 +234,12 @@ impl Runtime {
         std::fs::create_dir_all(run_dir.join("attempts"))?;
         let _lock = RunLock::acquire(&run_dir)?;
 
-        // Persist the exact graph snapshot, its hash, and the effective defaults
-        // used to compile it, so resume is independent of later config edits.
+        // Persist the exact graph snapshot + its hash. The effective defaults
+        // are recorded in the RunCreated event (below), not a separate unbound
+        // file, so resume is bound to them and independent of later config edits.
         std::fs::write(run_dir.join("graph.yaml"), &resolved.source)?;
         let hash = graph_hash(&resolved.source);
         std::fs::write(run_dir.join("graph.sha256"), &hash)?;
-        std::fs::write(
-            run_dir.join("manifest.json"),
-            serde_json::to_string(&self.config.defaults)?,
-        )?;
 
         let journal = Journal::create(run_dir.join("events.jsonl"))?;
         let mut session = Session::new(
@@ -269,6 +259,7 @@ impl Runtime {
             EventBody::RunCreated {
                 graph_hash: hash,
                 inputs: inputs.clone(),
+                defaults: defaults_to_map(&self.config.defaults),
             },
         )?;
         session.record(None, None, Actor::runtime(), EventBody::RunStarted)?;
@@ -424,6 +415,35 @@ fn recorded_graph_hash(events: &[Event]) -> Option<String> {
         EventBody::RunCreated { graph_hash, .. } => Some(graph_hash.clone()),
         _ => None,
     })
+}
+
+/// The effective compile defaults recorded at run creation.
+fn recorded_defaults(events: &[Event]) -> config::DefaultsSpec {
+    let map = events.iter().find_map(|e| match &e.body {
+        EventBody::RunCreated { defaults, .. } => Some(defaults.clone()),
+        _ => None,
+    });
+    defaults_from_map(&map.unwrap_or_default())
+}
+
+/// Encode compile defaults as a stable string map for the RunCreated event.
+fn defaults_to_map(defaults: &config::DefaultsSpec) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    if let Some(worker) = &defaults.worker {
+        map.insert("worker".to_owned(), worker.clone());
+    }
+    if let Some(context) = &defaults.context {
+        map.insert("context".to_owned(), context.clone());
+    }
+    map
+}
+
+/// Decode compile defaults from the RunCreated event's map.
+fn defaults_from_map(map: &BTreeMap<String, String>) -> config::DefaultsSpec {
+    config::DefaultsSpec {
+        worker: map.get("worker").cloned(),
+        context: map.get("context").cloned(),
+    }
 }
 
 /// Validate an operator-supplied run id: `run_` followed by ASCII alphanumerics

@@ -281,9 +281,10 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Record a failed attempt *and* the run's terminal disposition, so a
-    /// failure always leaves an explicit `RunFinished` in the journal (never an
-    /// implicit terminal). A failed attempt ends the run — redo is a new run.
+    /// Record a failed attempt as a single *terminal* event carrying its
+    /// disposition. Because the failure and its outcome are one atomic record,
+    /// a crash can never leave a failed attempt looking re-runnable. A failed
+    /// attempt ends the run — redo is a new run.
     fn fail_attempt(
         &mut self,
         node_id: &str,
@@ -297,13 +298,8 @@ impl<'a> Session<'a> {
             Actor::runtime(),
             EventBody::AttemptFailed {
                 reason: reason.to_owned(),
+                disposition,
             },
-        )?;
-        self.record(
-            None,
-            None,
-            Actor::runtime(),
-            EventBody::RunFinished { disposition },
         )
     }
 

@@ -137,7 +137,7 @@ pub enum Acceptance {
 pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
     state.last_seq = event.seq;
     match &event.body {
-        EventBody::RunCreated { graph_hash, inputs } => {
+        EventBody::RunCreated { graph_hash, inputs, .. } => {
             state.status = Status::Created;
             state.graph_hash = graph_hash.clone();
             state.inputs = inputs.clone();
@@ -158,7 +158,11 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
         }
         EventBody::AttemptInterrupted => {
             // Orphaned attempt: clear the in-flight flag so the same node is
-            // re-scheduled as a fresh attempt.
+            // re-scheduled as a fresh attempt. Correlated like other attempt
+            // outcomes so a forged interruption cannot desync the projection.
+            if !correlated(&state, event) {
+                return state;
+            }
             state.awaiting = false;
             state.current_attempt = None;
         }
@@ -186,16 +190,16 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
                 }
             }
         }
-        EventBody::AttemptFailed { .. } => {
+        EventBody::AttemptFailed { disposition, .. } => {
             if !correlated(&state, event) {
                 return state;
             }
             state.awaiting = false;
             state.current_attempt = None;
-            // The disposition for a failed attempt is decided by the runtime,
-            // which records an explicit `RunFinished` (Failed or TimedOut).
-            // reduce does not synthesize a terminal, so every terminal outcome
-            // is backed by a journaled `RunFinished` event.
+            // Terminal in one atomic event: the failure and its disposition are
+            // recorded together, so a crash can never leave a failed attempt
+            // looking re-runnable.
+            state.status = Status::Finished(*disposition);
         }
         EventBody::RunFinished { disposition } => {
             state.status = Status::Finished(*disposition);
