@@ -52,7 +52,7 @@ fn write_graph(root: &std::path::Path) -> PathBuf {
     path
 }
 
-fn inputs() -> BTreeMap<String, String> {
+fn recorded_prompt() -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     m.insert("prompt".to_owned(), "the thing".to_owned());
     m
@@ -135,7 +135,7 @@ fn tampered_snapshot_is_rejected_on_resume() {
             Actor::runtime(),
             EventBody::RunCreated {
                 graph_hash: "not_the_real_hash".to_owned(),
-                inputs: inputs(),
+                inputs: recorded_prompt(),
                 defaults: Default::default(),
             },
         )
@@ -151,6 +151,14 @@ fn tampered_snapshot_is_rejected_on_resume() {
 /// Hand-build a run whose journal ends mid-attempt (a crash after
 /// `attempt_started`, before any terminal event for `implement`).
 fn write_crashed_run(root: &std::path::Path, run_id: &str) {
+    write_crashed_run_with_inputs(root, run_id, recorded_prompt());
+}
+
+fn write_crashed_run_with_inputs(
+    root: &std::path::Path,
+    run_id: &str,
+    inputs: BTreeMap<String, String>,
+) {
     let run_dir = root.join(".hex").join("runs").join(run_id);
     std::fs::create_dir_all(run_dir.join("attempts")).expect("mkdir run");
     std::fs::write(run_dir.join("graph.yaml"), GRAPH).expect("graph.yaml");
@@ -164,7 +172,7 @@ fn write_crashed_run(root: &std::path::Path, run_id: &str) {
         Actor::runtime(),
         EventBody::RunCreated {
             graph_hash: hash,
-            inputs: inputs(),
+            inputs,
                 defaults: Default::default(),
         },
     )
@@ -183,6 +191,16 @@ fn write_crashed_run(root: &std::path::Path, run_id: &str) {
     )
     .unwrap();
     // journal dropped here — the run "crashed" mid-attempt.
+}
+
+#[test]
+fn resume_rejects_a_missing_recorded_prompt() {
+    let root = temp_root("missing-prompt");
+    let run_id = "run_missing_prompt";
+    write_crashed_run_with_inputs(&root, run_id, BTreeMap::new());
+
+    let err = finishing_runtime(root).resume(run_id).unwrap_err();
+    assert!(err.to_string().contains("missing the prompt"), "{err}");
 }
 
 fn finishing_runtime(root: PathBuf) -> Runtime {
@@ -242,7 +260,7 @@ fn crash_right_after_attempt_failed_does_not_rerun() {
             Actor::runtime(),
             EventBody::RunCreated {
                 graph_hash: hash,
-                inputs: inputs(),
+                inputs: recorded_prompt(),
                 defaults: Default::default(),
             },
         )
@@ -321,7 +339,7 @@ fn lifecycle_invalid_journal_is_rejected() {
             Actor::runtime(),
             EventBody::RunCreated {
                 graph_hash: hash,
-                inputs: inputs(),
+                inputs: recorded_prompt(),
                 defaults: Default::default(),
             },
         )

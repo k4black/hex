@@ -222,7 +222,13 @@ impl Runtime {
 
         // Recompile against the prompt + defaults recorded at creation
         // (integrity-bound with the verified hash), not live config.
-        let graph = self.compile_with(&source, inputs.get("prompt").map(String::as_str), &defaults)?;
+        let prompt = inputs.get("prompt").map(String::as_str);
+        let graph = self.compile_with(&source, prompt, &defaults)?;
+        if prompt.is_none() && loader::uses_prompt(&graph) {
+            return Err(HexError::new(
+                "run_created is missing the prompt required by graph.yaml",
+            ));
+        }
 
         // Fail closed on a malformed lifecycle before folding it into state.
         hex_kernel::check_journal(&graph, &events)
@@ -235,8 +241,8 @@ impl Runtime {
         Ok((graph, state))
     }
 
-    /// Start a new run of `reference`, parametrized by `inputs`. Blocks until
-    /// the run reaches a terminal disposition (foreground MVP).
+    /// Start a new run of `reference` with an optional operator prompt. Blocks
+    /// until the run reaches a terminal disposition (foreground MVP).
     ///
     /// # Errors
     /// Fails on resolution/validation, missing workers, or IO errors.
@@ -244,14 +250,14 @@ impl Runtime {
         // Resolve the source exactly once, then compile that same text — no
         // second resolution that could observe a changed file (TOCTOU).
         let resolved = preset::resolve(reference, &self.root)?;
-        // A graph that references {{prompt}} needs one at run time (validate and
-        // graph stay lenient).
-        if prompt.is_none() && loader::uses_prompt(&resolved.source) {
+        let graph = self.compile(&resolved.source, prompt)?;
+        // A graph that references {{prompt}} in a node prompt needs one at run
+        // time (validate and graph stay lenient).
+        if prompt.is_none() && loader::uses_prompt(&graph) {
             return Err(HexError::new(
                 "this graph needs a prompt — pass -p/--prompt <text> or -f/--file <path>",
             ));
         }
-        let graph = self.compile(&resolved.source, prompt)?;
         check_workers(&graph, &self.workers)?;
 
         let (run_id, run_dir) = self.new_run()?;

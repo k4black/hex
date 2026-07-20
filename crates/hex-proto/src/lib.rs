@@ -135,9 +135,9 @@ pub struct Event {
 pub enum EventBody {
     /// The run was created over an exact graph snapshot.
     RunCreated {
-        /// Hash of the canonical (input-interpolated) graph.
+        /// Hash of the exact persisted graph source snapshot.
         graph_hash: String,
-        /// The `--input` values the run was parametrized with.
+        /// Operator values used to compile the graph (currently `prompt`).
         #[serde(default)]
         inputs: BTreeMap<String, String>,
         /// The effective compile defaults (e.g. `worker`, `context`) used at

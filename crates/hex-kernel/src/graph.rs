@@ -62,7 +62,7 @@ pub enum NodeSpec {
     Agent {
         /// Worker registry name.
         worker: String,
-        /// Prompt (already input-interpolated by the loader).
+        /// Node prompt (with the operator prompt already interpolated).
         prompt: String,
         /// The routing events this agent is allowed to emit.
         may_propose: Vec<String>,

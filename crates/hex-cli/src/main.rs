@@ -59,7 +59,12 @@ fn open_runtime() -> Result<Runtime, String> {
 /// `run`/`resume` shows live progress instead of blocking silently. stdout is
 /// left clean for the final summary / `--json`.
 fn open_runtime_streaming() -> Result<Runtime, String> {
-    Ok(open_runtime()?.on_event(Box::new(|e| eprintln!("  {}", event_line(e)))))
+    // Best-effort progress: a broken/closed stderr (e.g. `hex run | head`) must
+    // never panic and abort the run — the observer is non-authoritative.
+    Ok(open_runtime()?.on_event(Box::new(|e| {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "  {}", event_line(e));
+    })))
 }
 
 /// A one-line rendering of an event for progress/watch output.
@@ -404,7 +409,7 @@ mod tests {
 
     #[test]
     fn parses_positional_prompt_and_json() {
-        let p = Parsed::from(&args(&["critique-loop", "--json", "-p", "fix the bug"]));
+        let p = Parsed::from(&args(&["critique-loop", "--json", "-p", "fix the bug"])).unwrap();
         assert_eq!(p.positional, vec!["critique-loop".to_owned()]);
         assert!(p.json);
         assert_eq!(p.resolve_prompt().unwrap().as_deref(), Some("fix the bug"));
@@ -412,20 +417,29 @@ mod tests {
 
     #[test]
     fn long_prompt_flag_works() {
-        let p = Parsed::from(&args(&["g", "--prompt", "do the thing"]));
+        let p = Parsed::from(&args(&["g", "--prompt", "do the thing"])).unwrap();
         assert_eq!(p.resolve_prompt().unwrap().as_deref(), Some("do the thing"));
         assert!(!p.json);
     }
 
     #[test]
     fn prompt_and_file_together_is_an_error() {
-        let p = Parsed::from(&args(&["g", "-p", "x", "-f", "prompt.md"]));
-        assert!(p.resolve_prompt().is_err());
+        assert!(Parsed::from(&args(&["g", "-p", "x", "-f", "prompt.md"])).is_err());
+    }
+
+    #[test]
+    fn prompt_flag_requires_a_value() {
+        assert!(Parsed::from(&args(&["g", "-p"])).is_err());
+    }
+
+    #[test]
+    fn prompt_source_may_only_be_passed_once() {
+        assert!(Parsed::from(&args(&["g", "-p", "x", "--prompt", "y"])).is_err());
     }
 
     #[test]
     fn no_prompt_resolves_to_none() {
-        let p = Parsed::from(&args(&["g"]));
+        let p = Parsed::from(&args(&["g"])).unwrap();
         assert_eq!(p.resolve_prompt().unwrap(), None);
     }
 
@@ -435,12 +449,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("prompt.md");
         std::fs::write(&path, "prompt from file").unwrap();
-        let p = Parsed::from(&args(&["g", "-f", path.to_str().unwrap()]));
+        let p = Parsed::from(&args(&["g", "-f", path.to_str().unwrap()])).unwrap();
         assert_eq!(p.resolve_prompt().unwrap().as_deref(), Some("prompt from file"));
     }
 
     #[test]
     fn empty_args_have_no_positional() {
-        assert!(Parsed::from(&args(&[])).positional.is_empty());
+        assert!(Parsed::from(&args(&[])).unwrap().positional.is_empty());
     }
 }

@@ -2,8 +2,8 @@
 //!
 //! Surface shape (slim MVP subset): kind-as-key nodes (`agent:`/`gate:`/
 //! `terminal:`), co-located edges under `on:`, `defaults:` for repetition,
-//! `inputs:` parametrization interpolated into prompts as `{{name}}`, and an
-//! `accept.require` list. The kernel only ever sees the flat IR this produces.
+//! one operator `{{prompt}}` interpolation token, and an `accept.require` list.
+//! The kernel only ever sees the flat IR this produces.
 
 use std::collections::BTreeMap;
 
@@ -103,7 +103,7 @@ struct RawHuman {
 ///
 /// The operator supplies exactly one value — the prompt (`-p`/`-f`). Richer
 /// per-node typed inputs/outputs are an internal graph-dataflow concern (see
-/// TODO Phase 2), not part of this operator surface.
+/// TODO Phase 5), not part of this operator surface.
 ///
 /// # Errors
 /// Fails on malformed YAML, an unknown node kind, or an unparseable duration.
@@ -167,13 +167,19 @@ pub fn load(source: &str, prompt: Option<&str>, config_defaults: &DefaultsSpec) 
 }
 
 /// The single interpolation token the operator prompt fills.
-pub const PROMPT_TOKEN: &str = "{{prompt}}";
+const PROMPT_TOKEN: &str = "{{prompt}}";
 
-/// Whether `source` references the operator prompt — i.e. a run needs `-p`/`-f`.
-/// `validate`/`graph` stay lenient (they never require it); only `run` enforces.
+/// Whether a compiled graph still references the operator prompt — i.e. a run
+/// needs `-p`/`-f`. Only agent and human prompts support interpolation, so
+/// comments and other YAML fields must not trigger this requirement.
 #[must_use]
-pub fn uses_prompt(source: &str) -> bool {
-    source.contains(PROMPT_TOKEN)
+pub(super) fn uses_prompt(graph: &Graph) -> bool {
+    graph.nodes.values().any(|node| match &node.spec {
+        NodeSpec::Agent { prompt, .. } | NodeSpec::Human { prompt } => {
+            prompt.contains(PROMPT_TOKEN)
+        }
+        _ => false,
+    })
 }
 
 fn compile_node(
@@ -353,8 +359,23 @@ mod tests {
 
     #[test]
     fn uses_prompt_detects_the_token() {
-        assert!(uses_prompt(CRITIQUE));
-        assert!(!uses_prompt("nodes:\n  a: { terminal: succeeded }\n"));
+        let graph = load(CRITIQUE, None, &no_defaults()).expect("loads");
+        assert!(uses_prompt(&graph));
+    }
+
+    #[test]
+    fn prompt_token_outside_a_node_prompt_does_not_require_input() {
+        let source = r#"
+# {{prompt}} is just documentation here.
+version: 1
+name: no-prompt
+entry: done
+nodes:
+  done:
+    terminal: succeeded
+"#;
+        let graph = load(source, None, &no_defaults()).expect("loads");
+        assert!(!uses_prompt(&graph));
     }
 
     #[test]

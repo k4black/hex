@@ -24,6 +24,7 @@ fn project(tag: &str) -> PathBuf {
     std::fs::write(
         root.join(".hex").join("graphs").join("demo.yaml"),
         r#"
+# A literal {{prompt}} in documentation must not require operator input.
 version: 1
 name: demo
 entry: build
@@ -90,9 +91,9 @@ fn list_shows_builtin_and_project_graphs() {
 }
 
 #[test]
-fn validate_and_graph_need_no_inputs() {
+fn validate_and_graph_need_no_prompt() {
     let dir = project("validate");
-    // Regression: structural commands must not demand runtime inputs.
+    // Regression: structural commands must not demand an operator prompt.
     assert!(hex(&dir, &["validate", "critique-loop"]).status.success());
     assert!(hex(&dir, &["graph", "critique-loop"]).status.success());
 }

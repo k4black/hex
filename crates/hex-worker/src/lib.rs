@@ -29,7 +29,7 @@ pub struct WorkRequest {
     pub node_id: String,
     /// This attempt's id.
     pub attempt_id: String,
-    /// The prompt (already input-interpolated).
+    /// The node prompt (with the operator prompt already interpolated).
     pub prompt: String,
     /// Routing events the agent is allowed to emit (its `may_propose` list).
     pub may_propose: Vec<String>,

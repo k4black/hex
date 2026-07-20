@@ -55,10 +55,19 @@ pub fn resolve(reference: &str, project_root: &Path) -> Result<Resolved> {
         return Err(HexError::new(format!("graph file not found: {reference}")));
     }
 
-    let candidates = [
-        project_root.join(".hex").join("graphs").join(format!("{reference}.yaml")),
-        user_graphs_dir().map(|d| d.join(format!("{reference}.yaml"))).unwrap_or_default(),
-    ];
+    // Same layers + extensions `list` scans, in precedence order, so a graph
+    // that `hex list` shows as the winner is exactly what `hex run` executes.
+    let mut candidates = Vec::new();
+    let project = project_root.join(".hex").join("graphs");
+    let user = user_graphs_dir();
+    for ext in ["yaml", "yml"] {
+        candidates.push(project.join(format!("{reference}.{ext}")));
+    }
+    if let Some(dir) = &user {
+        for ext in ["yaml", "yml"] {
+            candidates.push(dir.join(format!("{reference}.{ext}")));
+        }
+    }
     if let Some(path) = candidates.iter().find(|p| p.is_file()) {
         let source = std::fs::read_to_string(path)?;
         return Ok(Resolved {
@@ -119,7 +128,9 @@ fn collect_yaml(dir: &Path, found: &mut std::collections::BTreeMap<String, Strin
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e == "yaml" || e == "yml");
+        // Only real files are runnable — a directory named `foo.yaml` is not.
         if is_yaml
+            && path.is_file()
             && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
         {
             found.insert(stem.to_owned(), path.display().to_string());
@@ -151,6 +162,20 @@ mod tests {
     #[test]
     fn missing_path_is_a_hard_error() {
         assert!(resolve("./missing.yaml", Path::new("/nonexistent")).is_err());
+    }
+
+    #[test]
+    fn a_yml_graph_is_both_listed_and_resolvable() {
+        // Regression: `list` and `resolve` must agree on extensions, so a graph
+        // shown by `hex list` is exactly what `hex run` executes.
+        let root = std::env::temp_dir().join(format!("hex-yml-{}", std::process::id()));
+        let graphs = root.join(".hex").join("graphs");
+        std::fs::create_dir_all(&graphs).expect("mkdir");
+        std::fs::write(graphs.join("only-yml.yml"), "version: 1").expect("write");
+
+        assert!(list(&root).iter().any(|e| e.name == "only-yml"), "listed");
+        let r = resolve("only-yml", &root).expect("a listed .yml graph must resolve");
+        assert!(r.origin.ends_with("only-yml.yml"));
     }
 
     #[test]

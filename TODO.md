@@ -70,7 +70,7 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
 
 Goal (met): `hex run critique-loop -p "…"` runs end-to-end — codex
 implements, claude critiques, loop until approved + gate passes — and a killed
-run resumes from its journal. 58 tests + clippy green; verified end-to-end
+run resumes from its journal. Workspace tests + clippy are green; verified end-to-end
 against the real `hex` binary, and hardened through a cross-model review round
 (journal torn-tail repair, snapshot-integrity verification, run-lock, budget
 fail-closed, typed timeout disposition, evidence/correlation guards).
@@ -150,6 +150,14 @@ Everything deliberately cut from the MVP.
       TTY-only, collapses to the final event line when the attempt ends).
 - [ ] Dynamic shell completions (bash/zsh/fish): Tab-complete graph names from
       `hex list`, run-ids, verbs, and flags.
+- [ ] Strict argument parsing: reject unknown flags and enforce per-verb arity
+      instead of silently folding extras into positionals (today `hex list x`
+      or a `--jsonn` typo pass quietly).
+- [ ] Graph-surface versioning before the format is externally relied on: bump
+      `version` on surface changes and keep a replay compiler per version, so a
+      snapshot written by an older hex still resumes. Moot pre-release (no
+      persisted runs, `.hex/runs` gitignored); required before 1.0. Pairs with
+      the canonical compiled-snapshot item above.
 
 ## Phase 3 — interactive sessions & MCP transport
 
