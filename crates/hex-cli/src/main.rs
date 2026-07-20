@@ -8,7 +8,6 @@
 //! `watch` · `cancel`, plus the worker-side `emit`. Redoing work is a new
 //! `run`; there is no `retry`/`replay`.
 
-use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use hex_runtime::{Disposition, Runtime};
@@ -95,14 +94,14 @@ fn print_graph_list(runtime: &Runtime, json: bool) {
     for g in &graphs {
         println!("  {:<width$}  {}", g.name, g.origin, width = width);
     }
-    println!("\nrun one with:  hex run <name> [--input k=v]");
+    println!("\nrun one with:  hex run <name> -p \"<prompt>\"");
 }
 
 fn cmd_validate(args: &[String]) -> Result<ExitCode, String> {
     let parsed = Parsed::from(args);
     let reference = parsed.positional.first().ok_or("usage: hex validate <graph>")?;
     let runtime = open_runtime()?;
-    match runtime.validate(reference, &parsed.inputs) {
+    match runtime.validate(reference) {
         Ok(graph) => {
             if parsed.json {
                 let v = serde_json::json!({"ok": true, "name": graph.name, "nodes": graph.nodes.len()});
@@ -128,7 +127,7 @@ fn cmd_graph(args: &[String]) -> Result<ExitCode, String> {
     let parsed = Parsed::from(args);
     let reference = parsed.positional.first().ok_or("usage: hex graph <graph>")?;
     let runtime = open_runtime()?;
-    let graph = runtime.validate(reference, &parsed.inputs).map_err(|e| e.to_string())?;
+    let graph = runtime.validate(reference).map_err(|e| e.to_string())?;
     if parsed.json {
         let nodes: Vec<_> = graph
             .nodes
@@ -164,7 +163,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         print_graph_list(&runtime, parsed.json);
         return Ok(ExitCode::SUCCESS);
     };
-    let report = runtime.start(reference, &parsed.inputs).map_err(|e| e.to_string())?;
+    let prompt = parsed.resolve_prompt()?;
+    let report = runtime
+        .start(reference, prompt.as_deref())
+        .map_err(|e| e.to_string())?;
     if parsed.json {
         let v = serde_json::json!({
             "run_id": report.run_id,
@@ -275,34 +277,32 @@ fn cmd_emit(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Parsed CLI arguments: positionals, `--input k=v` pairs, and `--json`.
+/// Parsed CLI arguments: positionals, the operator prompt (`-p`/`--prompt`
+/// inline or `-f`/`--file` from a file), and `--json`.
 struct Parsed {
     positional: Vec<String>,
-    inputs: BTreeMap<String, String>,
+    prompt: Option<String>,
+    file: Option<String>,
     json: bool,
 }
 
 impl Parsed {
     fn from(args: &[String]) -> Self {
         let mut positional = Vec::new();
-        let mut inputs = BTreeMap::new();
+        let mut prompt = None;
+        let mut file = None;
         let mut json = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
                 "--json" => json = true,
-                "--input" => {
-                    if let Some(pair) = args.get(i + 1)
-                        && let Some((k, v)) = pair.split_once('=')
-                    {
-                        inputs.insert(k.to_owned(), v.to_owned());
-                    }
+                "-p" | "--prompt" => {
+                    prompt = args.get(i + 1).cloned();
                     i += 1;
                 }
-                other if other.starts_with("--input=") => {
-                    if let Some((k, v)) = other.trim_start_matches("--input=").split_once('=') {
-                        inputs.insert(k.to_owned(), v.to_owned());
-                    }
+                "-f" | "--file" => {
+                    file = args.get(i + 1).cloned();
+                    i += 1;
                 }
                 other => positional.push(other.to_owned()),
             }
@@ -310,8 +310,22 @@ impl Parsed {
         }
         Self {
             positional,
-            inputs,
+            prompt,
+            file,
             json,
+        }
+    }
+
+    /// Resolve the operator prompt from `-p` (inline) or `-f` (file). At most
+    /// one may be given.
+    fn resolve_prompt(&self) -> Result<Option<String>, String> {
+        match (&self.prompt, &self.file) {
+            (Some(_), Some(_)) => Err("pass only one of -p/--prompt or -f/--file".to_owned()),
+            (Some(text), None) => Ok(Some(text.clone())),
+            (None, Some(path)) => std::fs::read_to_string(path)
+                .map(Some)
+                .map_err(|e| format!("cannot read prompt file `{path}`: {e}")),
+            (None, None) => Ok(None),
         }
     }
 }
@@ -350,14 +364,17 @@ fn print_usage() {
         "usage: hex <command> [args]",
         "",
         "  list [--json]                    list runnable graphs (project/user/built-in)",
-        "  validate <graph> [--input k=v]   check schema, references, bounded cycles",
-        "  graph <graph> [--input k=v]      render the graph (ascii)",
-        "  run <graph> [--input k=v] [--json]   start a new run",
+        "  validate <graph>                 check schema, references, bounded cycles",
+        "  graph <graph>                    render the graph (ascii)",
+        "  run <graph> [-p <text> | -f <file>] [--json]   start a new run",
         "  resume <run-id> [--json]         continue the same run from its journal",
         "  status <run-id> [--json]         projected run status",
         "  watch <run-id> [--json]          print the run's event stream",
         "  cancel <run-id>                  record a terminal cancellation",
         "  emit <event>                     (worker-side) propose a routing event",
+        "",
+        "  -p, --prompt <text>              operator prompt (fills {{prompt}} in the graph)",
+        "  -f, --file <path>                read the prompt from a file",
     ] {
         eprintln!("{line}");
     }
@@ -372,32 +389,40 @@ mod tests {
     }
 
     #[test]
-    fn parses_positionals_json_and_inputs() {
-        let p = Parsed::from(&args(&[
-            "critique-loop",
-            "--json",
-            "--input",
-            "task=fix the bug",
-            "--input",
-            "repo=hex",
-        ]));
+    fn parses_positional_prompt_and_json() {
+        let p = Parsed::from(&args(&["critique-loop", "--json", "-p", "fix the bug"]));
         assert_eq!(p.positional, vec!["critique-loop".to_owned()]);
         assert!(p.json);
-        assert_eq!(p.inputs.get("task").map(String::as_str), Some("fix the bug"));
-        assert_eq!(p.inputs.get("repo").map(String::as_str), Some("hex"));
+        assert_eq!(p.resolve_prompt().unwrap().as_deref(), Some("fix the bug"));
     }
 
     #[test]
-    fn parses_glued_input_form() {
-        let p = Parsed::from(&args(&["g", "--input=task=x"]));
-        assert_eq!(p.inputs.get("task").map(String::as_str), Some("x"));
+    fn long_prompt_flag_works() {
+        let p = Parsed::from(&args(&["g", "--prompt", "do the thing"]));
+        assert_eq!(p.resolve_prompt().unwrap().as_deref(), Some("do the thing"));
         assert!(!p.json);
     }
 
     #[test]
-    fn input_value_may_contain_equals_signs() {
-        let p = Parsed::from(&args(&["g", "--input", "expr=a=b=c"]));
-        assert_eq!(p.inputs.get("expr").map(String::as_str), Some("a=b=c"));
+    fn prompt_and_file_together_is_an_error() {
+        let p = Parsed::from(&args(&["g", "-p", "x", "-f", "prompt.md"]));
+        assert!(p.resolve_prompt().is_err());
+    }
+
+    #[test]
+    fn no_prompt_resolves_to_none() {
+        let p = Parsed::from(&args(&["g"]));
+        assert_eq!(p.resolve_prompt().unwrap(), None);
+    }
+
+    #[test]
+    fn file_flag_reads_the_prompt_from_disk() {
+        let dir = std::env::temp_dir().join(format!("hex-cli-p-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prompt.md");
+        std::fs::write(&path, "prompt from file").unwrap();
+        let p = Parsed::from(&args(&["g", "-f", path.to_str().unwrap()]));
+        assert_eq!(p.resolve_prompt().unwrap().as_deref(), Some("prompt from file"));
     }
 
     #[test]

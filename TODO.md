@@ -33,7 +33,7 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
       as the flagship demo.
 - [x] Presets: named, parametrized graphs resolved **project
       (`.hex/graphs/`) > user (`~/.config/hex/graphs/`) > built-in** —
-      `hex run critique-loop --input task="…"`. ("Preset", not "pipeline" —
+      `hex run critique-loop -p "…"`. ("Preset", not "pipeline" —
       the term pipeline stays banned as a Graph synonym.)
 - [x] Config: layered `~/.config/hex/config.yaml` + project `.hex/config.yaml`
       (project wins) — worker registry (argv template, headless flags, model,
@@ -42,6 +42,14 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
 - [x] Authoring automation: a shipped **authoring skill** (SKILL.md teaching
       an agent to write + `hex validate` graph YAML) right after MVP;
       `hex graph new` architect command and MCP prompts deferred.
+- [x] Operator input surface (resolved 2026-07-20): the CLI takes **one**
+      operator value — the prompt — via `-p/--prompt <text>` or `-f/--file
+      <path>`, filling `{{prompt}}` in node prompts. No `--input k=v`. Named
+      *typed* inputs/outputs live on **nodes** (internal graph dataflow), not
+      the operator surface. Rationale: every surveyed workflow tool parametrizes
+      with named/typed values, but the operator only needs to say "what to do";
+      richer parametrization is graph-internal. Keep orchestration/run-config
+      (budget, worker, isolation) on CLI flags, never on the prompt channel.
 
 ## Phase 0 — restructure the scaffold ✅
 
@@ -60,7 +68,7 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
 
 ## Phase 1 — slim MVP: claude + codex critique loop ✅
 
-Goal (met): `hex run critique-loop --input task="…"` runs end-to-end — codex
+Goal (met): `hex run critique-loop -p "…"` runs end-to-end — codex
 implements, claude critiques, loop until approved + gate passes — and a killed
 run resumes from its journal. 58 tests + clippy green; verified end-to-end
 against the real `hex` binary, and hardened through a cross-model review round
@@ -72,7 +80,7 @@ fail-closed, typed timeout disposition, evidence/correlation guards).
 - [x] Config loading: `~/.config/hex/config.yaml` + `.hex/config.yaml`
       (project wins), layered over a built-in codex/claude registry.
 - [x] YAML loader → Graph IR (kind-as-key, co-located `on:` map, `defaults:`,
-      block-scalar prompts, `inputs:` parametrization). Templates/extends and
+      block-scalar prompts, single operator `{{prompt}}`). Templates/extends and
       reusable `gates:`/`use:` remain Phase 2.
 - [x] Validator (minimum honest set): references, reachability, terminal
       reachability, **bounded-cycle enforcement**, `may_propose` coverage.
@@ -93,7 +101,7 @@ fail-closed, typed timeout disposition, evidence/correlation guards).
       (`human` stubs to Phase 2, fails closed).
 - [x] Budgets: attempts + elapsed time + per-node cycle visits; fail-closed.
 - [x] Preset resolution: `.hex/graphs/` > `~/.config/hex/graphs/` > built-in;
-      ships built-in `critique-loop` with `--input` parameters.
+      ships built-in `critique-loop`; operator prompt via `-p`/`-f` fills `{{prompt}}`.
 - [x] Verbs: `list` `run` `resume` `status` `watch` `cancel` `validate` `graph`
       `emit`; `--json`/NDJSON; stable exit codes (0 success / 1 non-success /
       2 usage). `hex run` with no graph lists what's runnable.
@@ -170,6 +178,13 @@ Everything deliberately cut from the MVP.
       all-or-nothing), fan-in reducer/quorum.
 - [ ] Sub-agents & watchdogs as kernel-routed graph constructs (subgraph
       nodes / observer gates) — never coordination inside `hex-worker`.
+- [ ] **Typed node inputs/outputs** (internal graph dataflow): a node produces
+      typed output an edge maps into a downstream node's typed input, so a
+      reviewer sees the implementer's concrete diff/plan — not a re-summary.
+      Distinct from the operator prompt; interpolation grows from just
+      `{{prompt}}` to `{{node.output}}`-style references. Pairs with `map`/
+      `join` (a fan-out item is one typed value). Design the type set
+      (string/enum/path/bool/list) with validation + defaults at this point.
 - [ ] Per-node worktrees; serialized integration queue + integration gate
       (generation parallel, acceptance conservative and serialized).
 - [ ] Per-node cost/token budgets where workers report usage.

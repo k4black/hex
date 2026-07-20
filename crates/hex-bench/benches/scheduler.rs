@@ -1,6 +1,5 @@
 //! Benchmarks for the kernel hot path (`schedule`) and the runtime YAML loader.
 
-use std::collections::BTreeMap;
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -39,12 +38,10 @@ fn bench_schedule(c: &mut Criterion) {
 
 fn bench_load(c: &mut Criterion) {
     let source = include_str!("../../hex-runtime/src/presets/critique-loop.yaml");
-    let mut inputs = BTreeMap::new();
-    inputs.insert("task".to_owned(), "bench".to_owned());
     let defaults = DefaultsSpec::default();
     c.bench_function("runtime_load_critique_loop", |b| {
         b.iter(|| {
-            hex_runtime::loader::load(black_box(source), black_box(&inputs), black_box(&defaults))
+            hex_runtime::loader::load(black_box(source), black_box(Some("bench")), black_box(&defaults))
                 .expect("loads")
         });
     });

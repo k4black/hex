@@ -164,13 +164,18 @@ Layered config, project wins: `~/.config/hex/config.yaml` (user) ←
 each external agent (argv template, headless flags, model, declared
 capabilities) — plus default budgets/context/isolation.
 
-A **preset** is a named, parametrized graph resolved through three layers:
-`.hex/graphs/` (project) > `~/.config/hex/graphs/` (user) > built-in. hex
-ships `critique-loop` (codex implements → claude critiques → gate) as the
-flagship built-in:
+A **preset** is a named graph resolved through three layers: `.hex/graphs/`
+(project) > `~/.config/hex/graphs/` (user) > built-in. hex ships `critique-loop`
+(codex implements → claude critiques → gate) as the flagship built-in.
+
+The operator supplies exactly one thing — the **prompt** — inline or from a
+file; it fills `{{prompt}}` wherever the graph's node prompts reference it
+(richer per-node typed inputs/outputs are internal graph dataflow, not an
+operator flag):
 
 ```bash
-hex run critique-loop --input task="fix the flaky auth test"
+hex run critique-loop -p "fix the flaky auth test"
+hex run critique-loop -f prompts/task.md
 ```
 
 An authoring skill (SKILL.md shipped in-repo) teaches coding agents to draft
@@ -217,8 +222,9 @@ what's deferred: [`TODO.md`](TODO.md).
 cargo build --workspace     # build everything
 cargo test  --workspace     # 58 tests
 cargo clippy --workspace --all-targets
-hex validate critique-loop --input task=demo
-hex run critique-loop --input task="fix the flaky auth test"
+hex list
+hex validate critique-loop
+hex run critique-loop -p "fix the flaky auth test"
 ```
 
 ## Design

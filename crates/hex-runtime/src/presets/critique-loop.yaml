@@ -3,11 +3,8 @@ name: critique-loop
 
 # The flagship built-in: codex implements, claude critiques, a gate proves it,
 # and the loop repeats until the change is approved AND the tests pass.
-# Run it with:  hex run critique-loop --input task="…"
-
-inputs:
-  task:
-    required: true
+# Run it with:  hex run critique-loop -p "…"   (or -f prompt.md)
+# `{{prompt}}` below is filled with the operator's prompt.
 
 defaults:
   worker: codex
@@ -25,7 +22,7 @@ nodes:
       prompt: |
         You are making a focused change in this repository.
 
-        Task: {{task}}
+        Task: {{prompt}}
 
         Implement the smallest change that satisfies the task. When you are
         done, run:  hex emit ready_for_review
@@ -37,7 +34,7 @@ nodes:
     agent:
       worker: claude
       prompt: |
-        Review the current working-tree changes against this task: {{task}}
+        Review the current working-tree changes against this prompt: {{prompt}}
 
         Judge correctness, scope, and quality. If the change is acceptable run:
           hex emit approved

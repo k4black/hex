@@ -36,6 +36,21 @@ accept: { require: [test.passed] }
 "#,
     )
     .expect("graph");
+    // A second graph that references the operator prompt (`{{prompt}}`).
+    std::fs::write(
+        root.join(".hex").join("graphs").join("promptdemo.yaml"),
+        r#"
+version: 1
+name: promptdemo
+entry: build
+defaults: { budget: { attempts: 4 } }
+nodes:
+  build: { agent: { worker: builder, prompt: "do {{prompt}}", may_propose: [ready] }, on: { ready: done } }
+  done:  { terminal: succeeded }
+accept: { require: [] }
+"#,
+    )
+    .expect("prompt graph");
     root
 }
 
@@ -106,12 +121,30 @@ fn run_json_is_machine_readable_on_stdout() {
 }
 
 #[test]
-fn run_without_required_input_fails_clearly() {
+fn run_without_a_needed_prompt_fails_clearly() {
     let dir = project("missing");
-    // critique-loop declares `task` required; run must refuse before executing.
-    let out = hex(&dir, &["run", "critique-loop"]);
+    // promptdemo references {{prompt}}; run must refuse before executing.
+    let out = hex(&dir, &["run", "promptdemo"]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(stderr(&out).contains("missing required input"));
+    assert!(stderr(&out).contains("needs a prompt"), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn run_with_prompt_flag_succeeds() {
+    let dir = project("prompt");
+    let out = hex(&dir, &["run", "promptdemo", "-p", "the task"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("succeeded"));
+}
+
+#[test]
+fn run_with_prompt_file_succeeds() {
+    let dir = project("promptfile");
+    let pf = dir.join("prompt.md");
+    std::fs::write(&pf, "task from a file").expect("prompt file");
+    let out = hex(&dir, &["run", "promptdemo", "-f", pf.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("succeeded"));
 }
 
 #[test]

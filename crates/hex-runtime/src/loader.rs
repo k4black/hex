@@ -23,8 +23,6 @@ struct RawGraph {
     name: String,
     entry: String,
     #[serde(default)]
-    inputs: BTreeMap<String, RawInput>,
-    #[serde(default)]
     defaults: RawDefaults,
     nodes: BTreeMap<String, RawNode>,
     #[serde(default)]
@@ -33,15 +31,6 @@ struct RawGraph {
 
 fn one() -> u32 {
     1
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawInput {
-    #[serde(default)]
-    required: bool,
-    #[serde(default)]
-    default: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -108,17 +97,17 @@ struct RawHuman {
     prompt: String,
 }
 
-/// Compile YAML `source` into the kernel IR, interpolating `inputs` and
-/// falling back to `config_defaults` where the graph omits its own.
+/// Compile YAML `source` into the kernel IR, interpolating the operator
+/// `prompt` into node prompts (`{{prompt}}`) and falling back to
+/// `config_defaults` where the graph omits its own.
+///
+/// The operator supplies exactly one value — the prompt (`-p`/`-f`). Richer
+/// per-node typed inputs/outputs are an internal graph-dataflow concern (see
+/// TODO Phase 2), not part of this operator surface.
 ///
 /// # Errors
-/// Fails on malformed YAML, a missing required input, an unknown node kind, or
-/// an unparseable duration.
-pub fn load(
-    source: &str,
-    inputs: &BTreeMap<String, String>,
-    config_defaults: &DefaultsSpec,
-) -> Result<Graph> {
+/// Fails on malformed YAML, an unknown node kind, or an unparseable duration.
+pub fn load(source: &str, prompt: Option<&str>, config_defaults: &DefaultsSpec) -> Result<Graph> {
     let raw: RawGraph = serde_yaml::from_str(source)?;
     if raw.version != 1 {
         return Err(HexError::new(format!(
@@ -127,7 +116,6 @@ pub fn load(
         )));
     }
 
-    let resolved_inputs = resolve_inputs(&raw.inputs, inputs);
     let default_worker = raw
         .defaults
         .worker
@@ -149,7 +137,7 @@ pub fn load(
             node,
             default_worker.as_deref(),
             default_context.as_deref(),
-            &resolved_inputs,
+            prompt,
         )?;
         for (on, to) in &node.on {
             edges.push(Edge {
@@ -178,42 +166,14 @@ pub fn load(
     })
 }
 
-/// Resolve interpolation values. Lenient by design: a missing required input is
-/// *not* an error here (so `validate`/`graph` can inspect a graph without
-/// supplying runtime inputs) — its `{{token}}` is simply left unsubstituted.
-/// Enforcement of required inputs happens at run time via [`missing_required`].
-fn resolve_inputs(
-    declared: &BTreeMap<String, RawInput>,
-    provided: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    let mut resolved = BTreeMap::new();
-    for (name, spec) in declared {
-        if let Some(value) = provided.get(name) {
-            resolved.insert(name.clone(), value.clone());
-        } else if let Some(default) = &spec.default {
-            resolved.insert(name.clone(), default.clone());
-        }
-    }
-    // Provided-but-undeclared inputs are still usable for interpolation.
-    for (name, value) in provided {
-        resolved.entry(name.clone()).or_insert_with(|| value.clone());
-    }
-    resolved
-}
+/// The single interpolation token the operator prompt fills.
+pub const PROMPT_TOKEN: &str = "{{prompt}}";
 
-/// Names of required inputs that were neither provided nor defaulted. `run`
-/// enforces these; `validate`/`graph` do not.
-///
-/// # Errors
-/// Fails only if the YAML cannot be parsed.
-pub fn missing_required(source: &str, provided: &BTreeMap<String, String>) -> Result<Vec<String>> {
-    let raw: RawGraph = serde_yaml::from_str(source)?;
-    Ok(raw
-        .inputs
-        .into_iter()
-        .filter(|(name, spec)| spec.required && spec.default.is_none() && !provided.contains_key(name))
-        .map(|(name, _)| name)
-        .collect())
+/// Whether `source` references the operator prompt — i.e. a run needs `-p`/`-f`.
+/// `validate`/`graph` stay lenient (they never require it); only `run` enforces.
+#[must_use]
+pub fn uses_prompt(source: &str) -> bool {
+    source.contains(PROMPT_TOKEN)
 }
 
 fn compile_node(
@@ -221,7 +181,7 @@ fn compile_node(
     node: &RawNode,
     default_worker: Option<&str>,
     default_context: Option<&str>,
-    inputs: &BTreeMap<String, String>,
+    prompt: Option<&str>,
 ) -> Result<NodeSpec> {
     let declared = [
         node.agent.is_some(),
@@ -247,7 +207,7 @@ fn compile_node(
             .ok_or_else(|| HexError::new(format!("agent `{id}` has no worker and no default")))?;
         return Ok(NodeSpec::Agent {
             worker,
-            prompt: interpolate(&agent.prompt, inputs),
+            prompt: interpolate(&agent.prompt, prompt),
             may_propose: agent.may_propose.clone(),
             context: parse_context(agent.context.as_deref().or(default_context))?,
         });
@@ -269,7 +229,7 @@ fn compile_node(
     }
     if let Some(human) = &node.human {
         return Ok(NodeSpec::Human {
-            prompt: interpolate(&human.prompt, inputs),
+            prompt: interpolate(&human.prompt, prompt),
         });
     }
     unreachable!("declared exactly one kind")
@@ -341,13 +301,13 @@ fn parse_duration_ms(raw: &str) -> Result<u64> {
     Ok(ms)
 }
 
-/// Replace `{{name}}` tokens with input values. Unknown tokens are left as-is.
-fn interpolate(template: &str, inputs: &BTreeMap<String, String>) -> String {
-    let mut out = template.to_owned();
-    for (name, value) in inputs {
-        out = out.replace(&format!("{{{{{name}}}}}"), value);
+/// Replace the `{{prompt}}` token with the operator prompt. When no prompt is
+/// supplied (e.g. `validate`/`graph`) the token is left as-is.
+fn interpolate(template: &str, prompt: Option<&str>) -> String {
+    match prompt {
+        Some(value) => template.replace(PROMPT_TOKEN, value),
+        None => template.to_owned(),
     }
-    out
 }
 
 #[cfg(test)]
@@ -371,44 +331,35 @@ mod tests {
     }
 
     #[test]
-    fn interpolates_inputs_into_prompts() {
-        let mut inputs = BTreeMap::new();
-        inputs.insert("task".to_owned(), "fix the bug".to_owned());
-        let g = load(CRITIQUE, &inputs, &no_defaults()).expect("loads");
+    fn interpolates_the_prompt_into_node_prompts() {
+        let g = load(CRITIQUE, Some("fix the bug"), &no_defaults()).expect("loads");
         let NodeSpec::Agent { prompt, .. } = &g.node("implement").unwrap().spec else {
             panic!("implement is an agent");
         };
         assert!(prompt.contains("fix the bug"));
-        assert!(!prompt.contains("{{task}}"));
+        assert!(!prompt.contains(PROMPT_TOKEN));
     }
 
     #[test]
-    fn load_is_lenient_about_missing_required_inputs() {
-        // Structural load must succeed without inputs (for validate/graph);
+    fn load_is_lenient_without_a_prompt() {
+        // Structural load must succeed without a prompt (for validate/graph);
         // the token is simply left unsubstituted.
-        let g = load(CRITIQUE, &BTreeMap::new(), &no_defaults()).expect("lenient load");
+        let g = load(CRITIQUE, None, &no_defaults()).expect("lenient load");
         let NodeSpec::Agent { prompt, .. } = &g.node("implement").unwrap().spec else {
             panic!("implement is an agent");
         };
-        assert!(prompt.contains("{{task}}"));
+        assert!(prompt.contains(PROMPT_TOKEN));
     }
 
     #[test]
-    fn missing_required_is_reported_for_run() {
-        assert_eq!(
-            missing_required(CRITIQUE, &BTreeMap::new()).unwrap(),
-            vec!["task".to_owned()]
-        );
-        let mut inputs = BTreeMap::new();
-        inputs.insert("task".to_owned(), "x".to_owned());
-        assert!(missing_required(CRITIQUE, &inputs).unwrap().is_empty());
+    fn uses_prompt_detects_the_token() {
+        assert!(uses_prompt(CRITIQUE));
+        assert!(!uses_prompt("nodes:\n  a: { terminal: succeeded }\n"));
     }
 
     #[test]
     fn compiles_the_builtin_critique_loop() {
-        let mut inputs = BTreeMap::new();
-        inputs.insert("task".to_owned(), "x".to_owned());
-        let g = load(CRITIQUE, &inputs, &no_defaults()).expect("loads");
+        let g = load(CRITIQUE, Some("x"), &no_defaults()).expect("loads");
         assert_eq!(g.entry, "implement");
         assert_eq!(g.node("test").unwrap().spec.kind(), NodeKind::Gate);
         assert_eq!(g.budget.attempts, Some(12));
@@ -431,8 +382,7 @@ nodes:
   done:
     terminal: succeeded
 "#;
-        let inputs = BTreeMap::new();
-        let err = load(src, &inputs, &no_defaults()).unwrap_err();
+        let err = load(src, None, &no_defaults()).unwrap_err();
         assert!(err.to_string().contains("exactly one kind"));
     }
 }

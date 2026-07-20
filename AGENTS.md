@@ -136,7 +136,7 @@ scoped authority. _Avoid_: user, supervisor, controller.
 
 **Preset**: A named, parametrized graph in the library, resolved project
 (`.hex/graphs/`) > user (`~/.config/hex/graphs/`) > built-in; invoked as
-`hex run <preset> --input k=v`. _Avoid_: pipeline (banned Graph synonym),
+`hex run <preset> -p "<prompt>"`. _Avoid_: pipeline (banned Graph synonym),
 template (reserved for `templates:` node reuse inside a graph).
 
 **Interactive session**: An `agent` attempt with `interactive: true` — stays
@@ -163,6 +163,11 @@ sign-off, confirmation.
    co-located edges, inline block-scalar prompts. No custom mini-grammar; the
    kernel models the compiled IR only, and the loader lives in `hex-runtime`
    (not the kernel). `serde_yaml` is archived-but-fine for now.
+4b. **Operator input is one prompt.** The CLI takes only `-p/--prompt <text>`
+   or `-f/--file <path>`, filling `{{prompt}}` in node prompts — no `--input
+   k=v`. Named *typed* inputs/outputs are a **node** concern (internal graph
+   dataflow, Phase 5), never an operator flag. Keep run-config (budget, worker,
+   isolation) on their own CLI flags, off the prompt channel.
 5. The worker↔runtime channel is `hex emit <event>`: the runtime injects
    `HEX_EMIT_FILE`/`HEX_MAY_PROPOSE` etc.; the agent's argv must be able to
    reach the `hex` binary. `may_propose` is enforced both at emit and at ingest.

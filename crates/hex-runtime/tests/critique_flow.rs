@@ -20,7 +20,7 @@ defaults:
     attempts: 8
 nodes:
   implement:
-    agent: { worker: mock, prompt: "implement {{task}}", may_propose: [ready] }
+    agent: { worker: mock, prompt: "implement {{prompt}}", may_propose: [ready] }
     on: { ready: review }
   review:
     agent: { worker: mock, prompt: "review", may_propose: [approved, changes_requested] }
@@ -54,7 +54,7 @@ fn write_graph(root: &std::path::Path) -> PathBuf {
 
 fn inputs() -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
-    m.insert("task".to_owned(), "the thing".to_owned());
+    m.insert("prompt".to_owned(), "the thing".to_owned());
     m
 }
 
@@ -71,7 +71,7 @@ fn critique_loop_runs_to_success() {
     workers.insert("mock", Box::new(mock));
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers);
 
-    let report = runtime.start("test-critique", &inputs()).expect("run");
+    let report = runtime.start("test-critique", Some("the thing")).expect("run");
     assert_eq!(report.disposition, Disposition::Succeeded);
 
     // The acceptance evidence is really in the journal.
@@ -102,7 +102,7 @@ fn budget_exhaustion_fails_closed() {
     workers.insert("mock", Box::new(mock));
     let runtime = Runtime::with_workers(root, Config::builtin(), workers);
 
-    let report = runtime.start("test-critique", &inputs()).expect("run");
+    let report = runtime.start("test-critique", Some("the thing")).expect("run");
     assert_eq!(report.disposition, Disposition::BudgetExhausted);
 }
 
@@ -377,7 +377,7 @@ accept:
     workers.insert("mock", Box::new(mock));
     let runtime = Runtime::with_workers(root, Config::builtin(), workers);
 
-    let report = runtime.start("timeout", &BTreeMap::new()).expect("run");
+    let report = runtime.start("timeout", None).expect("run");
     assert_eq!(report.disposition, Disposition::TimedOut);
     // The disposition is backed by a single durable terminal event: a
     // disposition-bearing AttemptFailed (no separate RunFinished / crash window).

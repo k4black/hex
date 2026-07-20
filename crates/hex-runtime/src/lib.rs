@@ -145,19 +145,20 @@ impl Runtime {
         preset::list(&self.root)
     }
 
-    /// Compile + validate a graph reference without running it.
+    /// Compile + validate a graph reference without running it. Structural only:
+    /// no prompt is required (any `{{prompt}}` is left unsubstituted).
     ///
     /// # Errors
     /// Fails on resolution, parse, or validation errors.
-    pub fn validate(&self, reference: &str, inputs: &BTreeMap<String, String>) -> Result<Graph> {
+    pub fn validate(&self, reference: &str) -> Result<Graph> {
         let resolved = preset::resolve(reference, &self.root)?;
-        self.compile(&resolved.source, inputs)
+        self.compile(&resolved.source, None)
     }
 
     /// Compile already-resolved YAML `source` to a validated IR, using this
     /// runtime's live config defaults.
-    fn compile(&self, source: &str, inputs: &BTreeMap<String, String>) -> Result<Graph> {
-        self.compile_with(source, inputs, &self.config.defaults)
+    fn compile(&self, source: &str, prompt: Option<&str>) -> Result<Graph> {
+        self.compile_with(source, prompt, &self.config.defaults)
     }
 
     /// Compile with an explicit set of fallback defaults — used on resume so a
@@ -166,10 +167,10 @@ impl Runtime {
     fn compile_with(
         &self,
         source: &str,
-        inputs: &BTreeMap<String, String>,
+        prompt: Option<&str>,
         defaults: &config::DefaultsSpec,
     ) -> Result<Graph> {
-        let graph = loader::load(source, inputs, defaults)?;
+        let graph = loader::load(source, prompt, defaults)?;
         hex_kernel::validate(&graph).map_err(|issues| {
             let joined = issues
                 .iter()
@@ -209,7 +210,7 @@ impl Runtime {
                 "graph.yaml does not match graph.sha256 — snapshot was modified",
             ));
         }
-        // The run's creation record carries the hash, inputs, and defaults to
+        // The run's creation record carries the hash, prompt, and defaults to
         // verify + recompile against (one pass, not three).
         let (recorded_hash, inputs, defaults) = run_created(&events)
             .ok_or_else(|| HexError::new("journal has no run_created record to verify against"))?;
@@ -219,9 +220,9 @@ impl Runtime {
             ));
         }
 
-        // Recompile against the defaults recorded at creation (integrity-bound
-        // with its inputs + verified hash), not live config.
-        let graph = self.compile_with(&source, &inputs, &defaults)?;
+        // Recompile against the prompt + defaults recorded at creation
+        // (integrity-bound with the verified hash), not live config.
+        let graph = self.compile_with(&source, inputs.get("prompt").map(String::as_str), &defaults)?;
 
         // Fail closed on a malformed lifecycle before folding it into state.
         hex_kernel::check_journal(&graph, &events)
@@ -239,23 +240,18 @@ impl Runtime {
     ///
     /// # Errors
     /// Fails on resolution/validation, missing workers, or IO errors.
-    pub fn start(
-        &self,
-        reference: &str,
-        inputs: &BTreeMap<String, String>,
-    ) -> Result<RunReport> {
+    pub fn start(&self, reference: &str, prompt: Option<&str>) -> Result<RunReport> {
         // Resolve the source exactly once, then compile that same text — no
         // second resolution that could observe a changed file (TOCTOU).
         let resolved = preset::resolve(reference, &self.root)?;
-        // Required inputs are enforced at run time (validate/graph are lenient).
-        let missing = loader::missing_required(&resolved.source, inputs)?;
-        if !missing.is_empty() {
-            return Err(HexError::new(format!(
-                "missing required input(s): {} (pass with --input <name>=<value>)",
-                missing.join(", ")
-            )));
+        // A graph that references {{prompt}} needs one at run time (validate and
+        // graph stay lenient).
+        if prompt.is_none() && loader::uses_prompt(&resolved.source) {
+            return Err(HexError::new(
+                "this graph needs a prompt — pass -p/--prompt <text> or -f/--file <path>",
+            ));
         }
-        let graph = self.compile(&resolved.source, inputs)?;
+        let graph = self.compile(&resolved.source, prompt)?;
         check_workers(&graph, &self.workers)?;
 
         let (run_id, run_dir) = self.new_run()?;
@@ -287,7 +283,9 @@ impl Runtime {
             Actor::runtime(),
             EventBody::RunCreated {
                 graph_hash: hash,
-                inputs: inputs.clone(),
+                inputs: prompt
+                    .map(|p| BTreeMap::from([("prompt".to_owned(), p.to_owned())]))
+                    .unwrap_or_default(),
                 defaults: defaults_to_map(&self.config.defaults),
             },
         )?;
@@ -531,11 +529,11 @@ impl RunLock {
 pub trait RuntimeClient {
     /// List every runnable graph.
     fn list_graphs(&self) -> Vec<GraphEntry>;
-    /// Start a new run.
+    /// Start a new run with an optional operator prompt.
     ///
     /// # Errors
     /// Propagates resolution, validation, and IO failures.
-    fn start(&self, reference: &str, inputs: &BTreeMap<String, String>) -> Result<RunReport>;
+    fn start(&self, reference: &str, prompt: Option<&str>) -> Result<RunReport>;
     /// Resume an existing run.
     ///
     /// # Errors
@@ -562,8 +560,8 @@ impl RuntimeClient for Runtime {
     fn list_graphs(&self) -> Vec<GraphEntry> {
         Runtime::list_graphs(self)
     }
-    fn start(&self, reference: &str, inputs: &BTreeMap<String, String>) -> Result<RunReport> {
-        Runtime::start(self, reference, inputs)
+    fn start(&self, reference: &str, prompt: Option<&str>) -> Result<RunReport> {
+        Runtime::start(self, reference, prompt)
     }
     fn resume(&self, run_id: &str) -> Result<RunReport> {
         Runtime::resume(self, run_id)
