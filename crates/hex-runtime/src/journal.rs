@@ -122,14 +122,15 @@ impl Journal {
         })
     }
 
-    /// Open an existing journal for appending, continuing its sequence. If the
+    /// Open an existing journal for appending, continuing its sequence, and
+    /// return the events it scanned so the caller need not re-read them. If the
     /// file carries a torn tail (a crash mid-append), it is truncated to the
     /// last clean record first so the next append cannot concatenate onto a
     /// partial line.
     ///
     /// # Errors
     /// Fails if the file cannot be read/repaired or opened for append.
-    pub fn open_append(path: PathBuf) -> Result<Self> {
+    pub fn open_append(path: PathBuf) -> Result<(Self, Vec<Event>)> {
         let scanned = scan(&path)?;
         let file_len = std::fs::metadata(&path)?.len();
         if scanned.valid_len < file_len {
@@ -139,11 +140,14 @@ impl Journal {
         }
         let next_seq = scanned.events.last().map_or(0, |e| e.seq + 1);
         let file = OpenOptions::new().append(true).open(&path)?;
-        Ok(Self {
-            file,
-            path,
-            next_seq,
-        })
+        Ok((
+            Self {
+                file,
+                path,
+                next_seq,
+            },
+            scanned.events,
+        ))
     }
 
     /// Path of the underlying file.
@@ -248,7 +252,7 @@ mod tests {
                 .expect("write");
         }
         // Reopening must truncate the torn tail, so the next append lands clean.
-        let mut j = Journal::open_append(path.clone()).expect("reopen repairs");
+        let (mut j, _) = Journal::open_append(path.clone()).expect("reopen repairs");
         let ev = j
             .append(
                 "run_0",
@@ -290,7 +294,7 @@ mod tests {
             j.append("run_0", None, None, Actor::runtime(), EventBody::RunStarted)
                 .expect("append");
         }
-        let mut j = Journal::open_append(path.clone()).expect("reopen");
+        let (mut j, _) = Journal::open_append(path.clone()).expect("reopen");
         let ev = j
             .append("run_0", None, None, Actor::runtime(), EventBody::AttemptInterrupted)
             .expect("append");

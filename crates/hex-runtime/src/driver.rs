@@ -6,7 +6,7 @@
 //! and repeat until the kernel schedules nothing (terminal or blocked).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcCommand, Stdio};
+use std::process::Stdio;
 
 use hex_kernel::graph::NodeSpec;
 use hex_kernel::{Effect, Graph, RunState, reduce, schedule};
@@ -335,21 +335,13 @@ fn run_process(
     attempt_dir: &Path,
     deadline_ms: Option<u64>,
 ) -> std::result::Result<bool, ProcFail> {
-    let (program, args) = command
-        .split_first()
-        .ok_or_else(|| ProcFail::infra("gate/command has an empty argv"))?;
-    let stdout = std::fs::File::create(attempt_dir.join("stdout.log"))
-        .map_err(|e| ProcFail::infra(format!("cannot open gate stdout log: {e}")))?;
-    let stderr = std::fs::File::create(attempt_dir.join("stderr.log"))
-        .map_err(|e| ProcFail::infra(format!("cannot open gate stderr log: {e}")))?;
-    let mut child = ProcCommand::new(program)
-        .args(args)
-        .current_dir(workdir)
+    // Same spawn+log scaffold the agent adapter uses; gates just add stdin(null).
+    let mut cmd = hex_worker::logged_command(command, workdir, attempt_dir)
+        .map_err(|e| ProcFail::infra(format!("cannot prepare gate process: {e}")))?;
+    let mut child = cmd
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
         .spawn()
-        .map_err(|e| ProcFail::infra(format!("spawn `{program}` failed: {e}")))?;
+        .map_err(|e| ProcFail::infra(format!("spawn gate failed: {e}")))?;
     match hex_worker::wait_bounded(&mut child, deadline_ms) {
         Ok(Some(status)) => Ok(status.success()),
         Ok(None) => Err(ProcFail {
@@ -365,10 +357,11 @@ fn run_process(
 #[must_use]
 pub fn graph_hash(source: &str) -> String {
     use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
     let digest = Sha256::digest(source.as_bytes());
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }

@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
+use std::path::Path;
 use std::process::{Child, Command as ProcCommand, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -51,48 +52,40 @@ impl Worker for AgentWorker {
     }
 
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
-        let Some((program, args)) = self.command.split_first() else {
+        if self.command.is_empty() {
             return WorkOutcome::error(format!("worker `{}` has an empty command", self.name));
-        };
+        }
 
         let emit_file = request.attempt_dir.join("emitted");
         // Start clean so a resumed attempt never reads a stale signal.
         let _ = fs::remove_file(&emit_file);
 
         let uses_placeholder = self.command.iter().any(|a| a.contains("{prompt}"));
-        let rendered: Vec<String> = args
+        let rendered: Vec<String> = self
+            .command
             .iter()
             .map(|a| a.replace("{prompt}", &request.prompt))
             .collect();
 
-        let (stdout, stderr) = match (
-            File::create(request.attempt_dir.join("stdout.log")),
-            File::create(request.attempt_dir.join("stderr.log")),
-        ) {
-            (Ok(o), Ok(e)) => (o, e),
-            _ => return WorkOutcome::error("could not open attempt log files"),
+        // Shared spawn+log scaffold; the agent then adds its control env + stdin.
+        let mut cmd = match logged_command(&rendered, &request.workdir, &request.attempt_dir) {
+            Ok(cmd) => cmd,
+            Err(e) => return WorkOutcome::error(format!("could not prepare attempt: {e}")),
         };
-
-        let mut cmd = ProcCommand::new(program);
-        cmd.args(&rendered)
-            .current_dir(&request.workdir)
-            .env("HEX_RUN_ID", &request.run_id)
+        cmd.env("HEX_RUN_ID", &request.run_id)
             .env("HEX_NODE_ID", &request.node_id)
             .env("HEX_ATTEMPT_ID", &request.attempt_id)
             .env(EMIT_FILE_ENV, &emit_file)
             .env("HEX_MAY_PROPOSE", request.may_propose.join(","))
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr));
-
-        if uses_placeholder {
-            cmd.stdin(Stdio::null());
-        } else {
-            cmd.stdin(Stdio::piped());
-        }
+            .stdin(if uses_placeholder {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            });
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
-            Err(e) => return WorkOutcome::error(format!("spawn `{program}` failed: {e}")),
+            Err(e) => return WorkOutcome::error(format!("spawn `{}` failed: {e}", rendered[0])),
         };
 
         if !uses_placeholder
@@ -121,6 +114,27 @@ impl Worker for AgentWorker {
             Err(reason) => WorkOutcome::error(reason),
         }
     }
+}
+
+/// Build a [`ProcCommand`] for `argv` in `cwd`, capturing stdout/stderr to
+/// `attempt_dir/{stdout,stderr}.log`. The caller adds any env/stdin and spawns.
+/// Shared by the agent adapter and the runtime's gate executor so both spawn a
+/// child and capture its logs the same way.
+///
+/// # Errors
+/// Fails on an empty argv or if a log file cannot be created.
+pub fn logged_command(argv: &[String], cwd: &Path, attempt_dir: &Path) -> std::io::Result<ProcCommand> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"))?;
+    let stdout = File::create(attempt_dir.join("stdout.log"))?;
+    let stderr = File::create(attempt_dir.join("stderr.log"))?;
+    let mut cmd = ProcCommand::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    Ok(cmd)
 }
 
 /// Wait for `child`, killing it if it outlives `deadline_ms`. `Ok(None)` means

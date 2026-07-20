@@ -17,7 +17,7 @@ use hex_proto::Capability;
 pub mod agent;
 pub mod mock;
 
-pub use agent::{AgentWorker, wait_bounded};
+pub use agent::{AgentWorker, logged_command, wait_bounded};
 pub use mock::MockWorker;
 
 /// What the runtime hands a worker to run one attempt.

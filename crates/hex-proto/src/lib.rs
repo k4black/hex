@@ -75,6 +75,28 @@ pub enum Disposition {
     TimedOut,
 }
 
+impl Disposition {
+    /// The canonical snake_case name — the *same* spelling serde uses on the
+    /// wire, so every surface (CLI text, `--json`, journal) agrees. Adding a
+    /// variant forces this match to be updated (compiler-checked).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Disposition::Succeeded => "succeeded",
+            Disposition::Failed => "failed",
+            Disposition::Cancelled => "cancelled",
+            Disposition::BudgetExhausted => "budget_exhausted",
+            Disposition::TimedOut => "timed_out",
+        }
+    }
+}
+
+impl std::fmt::Display for Disposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Append-only fact recorded in a run journal. The journal is authoritative;
 /// all status/graph views are projections *computed* from these events, never
 /// stored as a second source of truth.

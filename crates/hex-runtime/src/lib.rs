@@ -160,16 +160,16 @@ impl Runtime {
         Ok(graph)
     }
 
-    /// Load a run with full integrity checks, returning its graph, journal, and
-    /// replayed state. The single verified path behind `resume`, `status`, and
-    /// `cancel`: it checks the run id, the snapshot hash triple, the recorded
-    /// creation hash (required), the persisted defaults, and journal lifecycle
-    /// before folding.
-    fn load_verified(&self, run_id: &str) -> Result<(Graph, Vec<Event>, State)> {
+    /// Verify already-scanned `events` against their on-disk snapshot and fold
+    /// them into state — the single verified path behind `resume`, `status`, and
+    /// `cancel`. Checks the run id, the snapshot hash triple, the required
+    /// creation hash, the recorded defaults, and the journal lifecycle before
+    /// folding. Taking `events` the caller already holds means one journal scan
+    /// per operation (`resume`/`cancel` get them from the writer they open).
+    fn verify_and_fold(&self, run_id: &str, events: Vec<Event>) -> Result<(Graph, State)> {
         let run_dir = self.run_dir(run_id)?;
         let source = std::fs::read_to_string(run_dir.join("graph.yaml"))
             .map_err(|_| HexError::new(format!("run `{run_id}` not found")))?;
-        let events = journal::read_all(&run_dir.join("events.jsonl"))?;
 
         // The journal's own run id must match the directory/operator id.
         if let Some(first) = events.first()
@@ -188,18 +188,18 @@ impl Runtime {
                 "graph.yaml does not match graph.sha256 — snapshot was modified",
             ));
         }
-        let recorded = recorded_graph_hash(&events)
-            .ok_or_else(|| HexError::new("journal has no run_created hash to verify against"))?;
-        if recorded != computed {
+        // The run's creation record carries the hash, inputs, and defaults to
+        // verify + recompile against (one pass, not three).
+        let (recorded_hash, inputs, defaults) = run_created(&events)
+            .ok_or_else(|| HexError::new("journal has no run_created record to verify against"))?;
+        if recorded_hash != computed {
             return Err(HexError::new(
                 "graph.yaml does not match the hash recorded at run creation",
             ));
         }
 
-        // Recompile against the defaults recorded in the run's RunCreated event
-        // (integrity-bound with its inputs + verified hash), not live config.
-        let defaults = recorded_defaults(&events);
-        let inputs = recorded_inputs(&events);
+        // Recompile against the defaults recorded at creation (integrity-bound
+        // with its inputs + verified hash), not live config.
         let graph = self.compile_with(&source, &inputs, &defaults)?;
 
         // Fail closed on a malformed lifecycle before folding it into state.
@@ -210,9 +210,8 @@ impl Runtime {
         for event in &events {
             state = reduce(&graph, state, event);
         }
-        Ok((graph, events, state))
+        Ok((graph, state))
     }
-
 
     /// Start a new run of `reference`, parametrized by `inputs`. Blocks until
     /// the run reaches a terminal disposition (foreground MVP).
@@ -287,10 +286,12 @@ impl Runtime {
         // succeeds after a real crash.
         let _lock = RunLock::acquire(&run_dir)?;
 
-        let (graph, _events, state) = self.load_verified(run_id)?;
+        // One scan: the writer hands back the events it read (torn tail already
+        // repaired), which we verify + fold rather than reading the journal again.
+        let (journal, events) = Journal::open_append(run_dir.join("events.jsonl"))?;
+        let (graph, state) = self.verify_and_fold(run_id, events)?;
         check_workers(&graph, &self.workers)?;
 
-        let journal = Journal::open_append(run_dir.join("events.jsonl"))?;
         let mut session = Session::new(
             &graph,
             &self.workers,
@@ -317,7 +318,7 @@ impl Runtime {
 
         // Orphaned attempt (started, no terminal): mark it interrupted — with
         // its exact node + attempt id — then re-attempt, never silently rerun.
-        if session.state().awaiting {
+        if session.state().awaiting() {
             let node = session.state().current.clone();
             let attempt = session.state().current_attempt.clone();
             session.record(
@@ -341,7 +342,9 @@ impl Runtime {
     /// # Errors
     /// Fails if the run does not exist or cannot be replayed.
     pub fn status(&self, run_id: &str) -> Result<StatusReport> {
-        let (_, _, state) = self.load_verified(run_id)?;
+        let events = journal::read_all(&self.run_dir(run_id)?.join("events.jsonl"))
+            .map_err(|_| HexError::new(format!("run `{run_id}` not found")))?;
+        let (_, state) = self.verify_and_fold(run_id, events)?;
         Ok(StatusReport {
             run_id: run_id.to_owned(),
             status: state.status.clone(),
@@ -380,11 +383,13 @@ impl Runtime {
                  foreground run is not supported in the slim MVP",
             )
         })?;
-        let (_, _, state) = self.load_verified(run_id)?;
+        // One scan: open the writer (repairs a torn tail, returns events), then
+        // verify + fold those same events.
+        let (mut journal, events) = Journal::open_append(run_dir.join("events.jsonl"))?;
+        let (_, state) = self.verify_and_fold(run_id, events)?;
         if state.is_finished() {
             return Ok(());
         }
-        let mut journal = Journal::open_append(run_dir.join("events.jsonl"))?;
         journal.append(
             run_id,
             None,
@@ -399,31 +404,17 @@ impl Runtime {
 
 }
 
-/// Recover the `--input` values a run was created with from its journal.
-fn recorded_inputs(events: &[Event]) -> BTreeMap<String, String> {
-    for event in events {
-        if let EventBody::RunCreated { inputs, .. } = &event.body {
-            return inputs.clone();
-        }
-    }
-    BTreeMap::new()
-}
-
-/// The graph hash recorded at run creation, if present.
-fn recorded_graph_hash(events: &[Event]) -> Option<String> {
+/// The run's creation record — hash, inputs, and effective defaults — read in a
+/// single pass over the journal.
+fn run_created(events: &[Event]) -> Option<(String, BTreeMap<String, String>, config::DefaultsSpec)> {
     events.iter().find_map(|e| match &e.body {
-        EventBody::RunCreated { graph_hash, .. } => Some(graph_hash.clone()),
+        EventBody::RunCreated {
+            graph_hash,
+            inputs,
+            defaults,
+        } => Some((graph_hash.clone(), inputs.clone(), defaults_from_map(defaults))),
         _ => None,
     })
-}
-
-/// The effective compile defaults recorded at run creation.
-fn recorded_defaults(events: &[Event]) -> config::DefaultsSpec {
-    let map = events.iter().find_map(|e| match &e.body {
-        EventBody::RunCreated { defaults, .. } => Some(defaults.clone()),
-        _ => None,
-    });
-    defaults_from_map(&map.unwrap_or_default())
 }
 
 /// Encode compile defaults as a stable string map for the RunCreated event.

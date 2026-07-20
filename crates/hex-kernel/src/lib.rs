@@ -37,6 +37,17 @@ pub enum Status {
     Finished(Disposition),
 }
 
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Status::Created => f.write_str("created"),
+            Status::Running => f.write_str("running"),
+            Status::Paused => f.write_str("paused"),
+            Status::Finished(d) => write!(f, "finished:{d}"),
+        }
+    }
+}
+
 /// Projected state of one run: `state = fold(reduce, journal)`. Never
 /// persisted as authority — always rebuildable from the journal.
 #[derive(Debug, Clone, Default)]
@@ -45,26 +56,18 @@ pub struct RunState {
     pub status: Status,
     /// The node currently active (about to run, or in-flight).
     pub current: Option<String>,
-    /// The id of the in-flight attempt, if any (for correlation + resume).
+    /// The id of the in-flight attempt, if any. `Some` exactly when an attempt
+    /// is running — so it doubles as the "awaiting" flag (see
+    /// [`RunState::awaiting`]) and drives correlation + resume.
     pub current_attempt: Option<String>,
-    /// Whether an attempt is in-flight for [`RunState::current`].
-    pub awaiting: bool,
     /// Total attempts started across the whole run.
     pub attempts_total: u32,
-    /// Attempts started per node.
-    pub attempts_per_node: BTreeMap<String, u32>,
     /// Times each node has been entered (cycle-visit accounting).
     pub visits: BTreeMap<String, u32>,
     /// The last routing signal each node produced (drives acceptance).
     pub signals: BTreeMap<String, String>,
     /// When scheduling started (Unix epoch ms), for elapsed budgets.
     pub started_at_ms: u64,
-    /// Sequence number of the last event folded in.
-    pub last_seq: u64,
-    /// The `--input` values the run was parametrized with.
-    pub inputs: BTreeMap<String, String>,
-    /// Hash of the exact graph snapshot this run executes.
-    pub graph_hash: String,
 }
 
 impl RunState {
@@ -81,6 +84,13 @@ impl RunState {
     #[must_use]
     pub fn is_finished(&self) -> bool {
         matches!(self.status, Status::Finished(_))
+    }
+
+    /// Whether an attempt is in flight for [`RunState::current`] — i.e. an
+    /// attempt has started and has not yet produced a terminal event.
+    #[must_use]
+    pub fn awaiting(&self) -> bool {
+        self.current_attempt.is_some()
     }
 }
 
@@ -135,12 +145,9 @@ pub enum Acceptance {
 /// single source of every state transition, **including routing**.
 #[must_use]
 pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
-    state.last_seq = event.seq;
     match &event.body {
-        EventBody::RunCreated { graph_hash, inputs, .. } => {
+        EventBody::RunCreated { .. } => {
             state.status = Status::Created;
-            state.graph_hash = graph_hash.clone();
-            state.inputs = inputs.clone();
         }
         EventBody::RunStarted => {
             state.status = Status::Running;
@@ -150,26 +157,24 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
         }
         EventBody::AttemptStarted { .. } => {
             // Fail closed on an attempt-start that does not target the projected
-            // current node (a forged/misordered record): ignore it rather than
-            // marking the wrong node in flight.
-            if state.current.is_none() || event.node_id != state.current {
+            // current node, or that carries no attempt id: ignore it rather than
+            // marking the wrong (or an anonymous) attempt in flight.
+            if state.current.is_none()
+                || event.node_id != state.current
+                || event.attempt_id.is_none()
+            {
                 return state;
             }
-            state.awaiting = true;
             state.attempts_total += 1;
             state.current_attempt = event.attempt_id.clone();
-            if let Some(cur) = &state.current {
-                *state.attempts_per_node.entry(cur.clone()).or_insert(0) += 1;
-            }
         }
         EventBody::AttemptInterrupted => {
-            // Orphaned attempt: clear the in-flight flag so the same node is
-            // re-scheduled as a fresh attempt. Correlated like other attempt
-            // outcomes so a forged interruption cannot desync the projection.
+            // Orphaned attempt: clear the in-flight attempt so the same node is
+            // re-scheduled fresh. Correlated like other attempt outcomes so a
+            // forged interruption cannot desync the projection.
             if !correlated(&state, event) {
                 return state;
             }
-            state.awaiting = false;
             state.current_attempt = None;
         }
         EventBody::Signal { name } => {
@@ -179,7 +184,6 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             if !correlated(&state, event) {
                 return state;
             }
-            state.awaiting = false;
             state.current_attempt = None;
             if let Some(cur) = state.current.clone() {
                 state.signals.insert(cur.clone(), name.clone());
@@ -200,7 +204,6 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             if !correlated(&state, event) {
                 return state;
             }
-            state.awaiting = false;
             state.current_attempt = None;
             // Terminal in one atomic event: the failure and its disposition are
             // recorded together, so a crash can never leave a failed attempt
@@ -227,7 +230,7 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
 /// `now_ms` is injected so the kernel stays clock-free and testable.
 #[must_use]
 pub fn schedule(graph: &Graph, state: &RunState, now_ms: u64) -> Vec<Effect> {
-    if state.status != Status::Running || state.awaiting {
+    if state.status != Status::Running || state.awaiting() {
         return Vec::new();
     }
     let Some(cur) = state.current.clone() else {
@@ -314,8 +317,7 @@ fn terminal(disposition: Disposition) -> Effect {
 /// an attempt to actually be in flight — a `Signal`/`AttemptFailed` arriving
 /// while nothing is awaiting is spurious and must not alter the projection.
 fn correlated(state: &RunState, event: &Event) -> bool {
-    state.awaiting
-        && state.current_attempt.is_some()
+    state.current_attempt.is_some()
         && event.node_id == state.current
         && event.attempt_id == state.current_attempt
 }
@@ -405,7 +407,7 @@ mod tests {
             ],
         );
         assert_eq!(s.current.as_deref(), Some("test"));
-        assert!(!s.awaiting);
+        assert!(!s.awaiting());
     }
 
     #[test]
@@ -423,6 +425,7 @@ mod tests {
             },
         );
         started.node_id = Some("implement".to_owned()); // must target the current node
+        started.attempt_id = Some("att_1".to_owned()); // and carry an attempt id
         let s2 = reduce(&g, s, &started);
         assert!(schedule(&g, &s2, 0).is_empty());
     }
@@ -522,7 +525,7 @@ mod tests {
         forged.attempt_id = Some("att_999".to_owned()); // wrong attempt
         let after = reduce(&g, s, &forged);
         assert_eq!(after.current.as_deref(), Some("implement"), "must not route");
-        assert!(after.awaiting, "spurious signal leaves the attempt in-flight");
+        assert!(after.awaiting(), "spurious signal leaves the attempt in-flight");
     }
 
     #[test]

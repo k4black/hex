@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
-use hex_runtime::{Disposition, Runtime, Status};
+use hex_runtime::{Disposition, Runtime};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -90,7 +90,7 @@ fn cmd_graph(args: &[String]) -> Result<ExitCode, String> {
         let nodes: Vec<_> = graph
             .nodes
             .values()
-            .map(|n| serde_json::json!({"id": n.id, "kind": kind_name(n.spec.kind())}))
+            .map(|n| serde_json::json!({"id": n.id, "kind": n.spec.kind().as_str()}))
             .collect();
         let edges: Vec<_> = graph
             .edges
@@ -104,7 +104,7 @@ fn cmd_graph(args: &[String]) -> Result<ExitCode, String> {
     println!("graph: {}   entry: {}", graph.name, graph.entry);
     println!("nodes:");
     for node in graph.nodes.values() {
-        println!("  {} [{}]", node.id, kind_name(node.spec.kind()));
+        println!("  {} [{}]", node.id, node.spec.kind().as_str());
     }
     println!("edges:");
     for edge in &graph.edges {
@@ -122,12 +122,12 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         let v = serde_json::json!({
             "run_id": report.run_id,
             "origin": report.origin,
-            "disposition": disposition_name(report.disposition),
+            "disposition": report.disposition,
         });
         println!("{v}");
     } else {
         println!("run {} ({})", report.run_id, report.origin);
-        println!("disposition: {}", disposition_name(report.disposition));
+        println!("disposition: {}", report.disposition);
     }
     Ok(exit_for(report.disposition))
 }
@@ -140,12 +140,12 @@ fn cmd_resume(args: &[String]) -> Result<ExitCode, String> {
     if parsed.json {
         let v = serde_json::json!({
             "run_id": report.run_id,
-            "disposition": disposition_name(report.disposition),
+            "disposition": report.disposition,
         });
         println!("{v}");
     } else {
         println!("resumed {}", report.run_id);
-        println!("disposition: {}", disposition_name(report.disposition));
+        println!("disposition: {}", report.disposition);
     }
     Ok(exit_for(report.disposition))
 }
@@ -158,14 +158,14 @@ fn cmd_status(args: &[String]) -> Result<ExitCode, String> {
     if parsed.json {
         let v = serde_json::json!({
             "run_id": s.run_id,
-            "status": status_name(&s.status),
+            "status": s.status.to_string(),
             "current": s.current,
             "attempts": s.attempts,
         });
         println!("{v}");
     } else {
         println!("run: {}", s.run_id);
-        println!("status: {}", status_name(&s.status));
+        println!("status: {}", s.status);
         if let Some(c) = &s.current {
             println!("current: {c}");
         }
@@ -277,36 +277,6 @@ fn exit_for(d: Disposition) -> ExitCode {
     }
 }
 
-fn disposition_name(d: Disposition) -> &'static str {
-    match d {
-        Disposition::Succeeded => "succeeded",
-        Disposition::Failed => "failed",
-        Disposition::Cancelled => "cancelled",
-        Disposition::BudgetExhausted => "budget_exhausted",
-        Disposition::TimedOut => "timed_out",
-    }
-}
-
-fn status_name(s: &Status) -> String {
-    match s {
-        Status::Created => "created".to_owned(),
-        Status::Running => "running".to_owned(),
-        Status::Paused => "paused".to_owned(),
-        Status::Finished(d) => format!("finished:{}", disposition_name(*d)),
-    }
-}
-
-fn kind_name(kind: hex_runtime::NodeKind) -> &'static str {
-    use hex_runtime::NodeKind as K;
-    match kind {
-        K::Agent => "agent",
-        K::Command => "command",
-        K::Gate => "gate",
-        K::Human => "human",
-        K::Terminal => "terminal",
-    }
-}
-
 fn event_summary(body: &hex_runtime::EventBody) -> String {
     use hex_runtime::EventBody as B;
     match body {
@@ -317,11 +287,9 @@ fn event_summary(body: &hex_runtime::EventBody) -> String {
         }
         B::AttemptInterrupted => "attempt_interrupted".to_owned(),
         B::Signal { name } => format!("signal {name}"),
-        B::AttemptFailed { reason, disposition } => {
-            format!("attempt_failed [{}]: {reason}", disposition_name(*disposition))
-        }
+        B::AttemptFailed { reason, disposition } => format!("attempt_failed [{disposition}]: {reason}"),
         B::BudgetExhausted { detail } => format!("budget_exhausted: {detail}"),
-        B::RunFinished { disposition } => format!("run_finished: {}", disposition_name(*disposition)),
+        B::RunFinished { disposition } => format!("run_finished: {disposition}"),
         B::Note { text } => format!("note: {text}"),
     }
 }

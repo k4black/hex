@@ -24,6 +24,26 @@ pub enum NodeKind {
     Terminal,
 }
 
+impl NodeKind {
+    /// The canonical lowercase name of this kind.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeKind::Agent => "agent",
+            NodeKind::Command => "command",
+            NodeKind::Gate => "gate",
+            NodeKind::Human => "human",
+            NodeKind::Terminal => "terminal",
+        }
+    }
+}
+
+impl std::fmt::Display for NodeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Per-node context policy: whether each attempt gets a fresh worker session.
 /// (The slim MVP only implements `Fresh`.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
