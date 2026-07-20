@@ -141,6 +141,13 @@ Everything deliberately cut from the MVP.
       progress while a run drives. `hex watch --follow` live-tails a run's
       journal as events append (poll the file; works from a second terminal
       while the run executes).
+- [ ] Proper ASCII graph rendering for `hex graph`: a real laid-out diagram
+      (boxes + arrows, cycles visible), not today's flat node/edge list; keep
+      `--format ascii|mermaid|dot` so the same IR renders to each.
+- [ ] Live agent-output preview during a run: under the streamed event lines,
+      show the last ~8–12 lines of the *currently in-flight attempt's* stdout,
+      refreshing in place as the agent prints (tail `attempts/<id>/stdout.log`;
+      TTY-only, collapses to the final event line when the attempt ends).
 - [ ] Dynamic shell completions (bash/zsh/fish): Tab-complete graph names from
       `hex list`, run-ids, verbs, and flags.
 
