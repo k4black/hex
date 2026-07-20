@@ -62,10 +62,14 @@ pub struct StatusReport {
 
 /// The in-process runtime: owns config + the worker registry and executes runs
 /// under a project root (the directory containing `.hex/`).
+/// A callback invoked with each event as it is journaled during a run.
+pub type EventObserver = Box<dyn Fn(&Event)>;
+
 pub struct Runtime {
     root: PathBuf,
     config: Config,
     workers: Workers,
+    observer: Option<EventObserver>,
 }
 
 impl Runtime {
@@ -81,6 +85,7 @@ impl Runtime {
             root,
             config,
             workers,
+            observer: None,
         })
     }
 
@@ -92,7 +97,16 @@ impl Runtime {
             root,
             config,
             workers,
+            observer: None,
         }
+    }
+
+    /// Install a callback invoked with every event as it is journaled during a
+    /// `run`/`resume`, so a foreground caller can stream live progress.
+    #[must_use]
+    pub fn on_event(mut self, observer: EventObserver) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// The `.hex/runs` directory under the project root.
@@ -233,6 +247,14 @@ impl Runtime {
         // Resolve the source exactly once, then compile that same text — no
         // second resolution that could observe a changed file (TOCTOU).
         let resolved = preset::resolve(reference, &self.root)?;
+        // Required inputs are enforced at run time (validate/graph are lenient).
+        let missing = loader::missing_required(&resolved.source, inputs)?;
+        if !missing.is_empty() {
+            return Err(HexError::new(format!(
+                "missing required input(s): {} (pass with --input <name>=<value>)",
+                missing.join(", ")
+            )));
+        }
         let graph = self.compile(&resolved.source, inputs)?;
         check_workers(&graph, &self.workers)?;
 
@@ -256,6 +278,7 @@ impl Runtime {
             self.root.clone(),
             journal,
             State::default(),
+            self.observer.as_deref(),
         );
 
         session.record(
@@ -307,6 +330,7 @@ impl Runtime {
             self.root.clone(),
             journal,
             state,
+            self.observer.as_deref(),
         );
 
         if session.state().is_finished() {

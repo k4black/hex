@@ -17,6 +17,9 @@ use crate::error::{HexError, Result};
 use crate::journal::{Journal, now_ms};
 use crate::workers::Workers;
 
+/// A callback invoked with each event as it is journaled, for live progress.
+pub type Observer<'a> = &'a dyn Fn(&hex_proto::Event);
+
 /// One run's mutable execution context: the graph, its workers, the journal,
 /// and the projected state folded from it.
 pub struct Session<'a> {
@@ -27,10 +30,14 @@ pub struct Session<'a> {
     workdir: PathBuf,
     journal: Journal,
     state: RunState,
+    observer: Option<Observer<'a>>,
 }
 
 impl<'a> Session<'a> {
-    /// Build a session over an already-open journal and replayed state.
+    /// Build a session over an already-open journal and replayed state. The
+    /// optional `observer` is called with every event as it is journaled, so a
+    /// foreground caller can stream live progress instead of waiting silently.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         graph: &'a Graph,
         workers: &'a Workers,
@@ -39,6 +46,7 @@ impl<'a> Session<'a> {
         workdir: PathBuf,
         journal: Journal,
         state: RunState,
+        observer: Option<Observer<'a>>,
     ) -> Self {
         Self {
             graph,
@@ -48,6 +56,7 @@ impl<'a> Session<'a> {
             workdir,
             journal,
             state,
+            observer,
         }
     }
 
@@ -68,6 +77,9 @@ impl<'a> Session<'a> {
         let event = self
             .journal
             .append(&self.run_id, node_id, attempt_id, actor, body)?;
+        if let Some(observe) = self.observer {
+            observe(&event);
+        }
         self.state = reduce(self.graph, std::mem::take(&mut self.state), &event);
         Ok(())
     }

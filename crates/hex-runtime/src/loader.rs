@@ -127,7 +127,7 @@ pub fn load(
         )));
     }
 
-    let resolved_inputs = resolve_inputs(&raw.inputs, inputs)?;
+    let resolved_inputs = resolve_inputs(&raw.inputs, inputs);
     let default_worker = raw
         .defaults
         .worker
@@ -178,25 +178,42 @@ pub fn load(
     })
 }
 
+/// Resolve interpolation values. Lenient by design: a missing required input is
+/// *not* an error here (so `validate`/`graph` can inspect a graph without
+/// supplying runtime inputs) — its `{{token}}` is simply left unsubstituted.
+/// Enforcement of required inputs happens at run time via [`missing_required`].
 fn resolve_inputs(
     declared: &BTreeMap<String, RawInput>,
     provided: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>> {
+) -> BTreeMap<String, String> {
     let mut resolved = BTreeMap::new();
     for (name, spec) in declared {
         if let Some(value) = provided.get(name) {
             resolved.insert(name.clone(), value.clone());
         } else if let Some(default) = &spec.default {
             resolved.insert(name.clone(), default.clone());
-        } else if spec.required {
-            return Err(HexError::new(format!("missing required input `{name}`")));
         }
     }
     // Provided-but-undeclared inputs are still usable for interpolation.
     for (name, value) in provided {
         resolved.entry(name.clone()).or_insert_with(|| value.clone());
     }
-    Ok(resolved)
+    resolved
+}
+
+/// Names of required inputs that were neither provided nor defaulted. `run`
+/// enforces these; `validate`/`graph` do not.
+///
+/// # Errors
+/// Fails only if the YAML cannot be parsed.
+pub fn missing_required(source: &str, provided: &BTreeMap<String, String>) -> Result<Vec<String>> {
+    let raw: RawGraph = serde_yaml::from_str(source)?;
+    Ok(raw
+        .inputs
+        .into_iter()
+        .filter(|(name, spec)| spec.required && spec.default.is_none() && !provided.contains_key(name))
+        .map(|(name, _)| name)
+        .collect())
 }
 
 fn compile_node(
@@ -366,9 +383,25 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_input_errors() {
-        let err = load(CRITIQUE, &BTreeMap::new(), &no_defaults()).unwrap_err();
-        assert!(err.to_string().contains("task"));
+    fn load_is_lenient_about_missing_required_inputs() {
+        // Structural load must succeed without inputs (for validate/graph);
+        // the token is simply left unsubstituted.
+        let g = load(CRITIQUE, &BTreeMap::new(), &no_defaults()).expect("lenient load");
+        let NodeSpec::Agent { prompt, .. } = &g.node("implement").unwrap().spec else {
+            panic!("implement is an agent");
+        };
+        assert!(prompt.contains("{{task}}"));
+    }
+
+    #[test]
+    fn missing_required_is_reported_for_run() {
+        assert_eq!(
+            missing_required(CRITIQUE, &BTreeMap::new()).unwrap(),
+            vec!["task".to_owned()]
+        );
+        let mut inputs = BTreeMap::new();
+        inputs.insert("task".to_owned(), "x".to_owned());
+        assert!(missing_required(CRITIQUE, &inputs).unwrap().is_empty());
     }
 
     #[test]

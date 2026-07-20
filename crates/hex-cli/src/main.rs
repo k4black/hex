@@ -56,6 +56,19 @@ fn open_runtime() -> Result<Runtime, String> {
     Runtime::new(root).map_err(|e| e.to_string())
 }
 
+/// A runtime that streams each event to stderr as it happens, so a foreground
+/// `run`/`resume` shows live progress instead of blocking silently. stdout is
+/// left clean for the final summary / `--json`.
+fn open_runtime_streaming() -> Result<Runtime, String> {
+    Ok(open_runtime()?.on_event(Box::new(|e| eprintln!("  {}", event_line(e)))))
+}
+
+/// A one-line rendering of an event for progress/watch output.
+fn event_line(e: &hex_runtime::Event) -> String {
+    let node = e.node_id.as_deref().map_or(String::new(), |n| format!(" {n}"));
+    format!("#{}{} {}", e.seq, node, event_summary(&e.body))
+}
+
 fn cmd_list(args: &[String]) -> Result<ExitCode, String> {
     let parsed = Parsed::from(args);
     print_graph_list(&open_runtime()?, parsed.json);
@@ -145,7 +158,7 @@ fn cmd_graph(args: &[String]) -> Result<ExitCode, String> {
 
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let parsed = Parsed::from(args);
-    let runtime = open_runtime()?;
+    let runtime = open_runtime_streaming()?;
     // `hex run` with no graph lists what you can run instead of erroring.
     let Some(reference) = parsed.positional.first() else {
         print_graph_list(&runtime, parsed.json);
@@ -169,7 +182,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
 fn cmd_resume(args: &[String]) -> Result<ExitCode, String> {
     let parsed = Parsed::from(args);
     let run_id = parsed.positional.first().ok_or("usage: hex resume <run-id>")?;
-    let runtime = open_runtime()?;
+    let runtime = open_runtime_streaming()?;
     let report = runtime.resume(run_id).map_err(|e| e.to_string())?;
     if parsed.json {
         let v = serde_json::json!({
@@ -219,8 +232,7 @@ fn cmd_watch(args: &[String]) -> Result<ExitCode, String> {
         if parsed.json {
             println!("{}", serde_json::to_string(event).map_err(|e| e.to_string())?);
         } else {
-            let node = event.node_id.as_deref().map_or(String::new(), |n| format!(" {n}"));
-            println!("#{}{} {}", event.seq, node, event_summary(&event.body));
+            println!("{}", event_line(event));
         }
     }
     Ok(ExitCode::SUCCESS)
