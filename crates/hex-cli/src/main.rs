@@ -362,3 +362,46 @@ fn print_usage() {
         eprintln!("{line}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn parses_positionals_json_and_inputs() {
+        let p = Parsed::from(&args(&[
+            "critique-loop",
+            "--json",
+            "--input",
+            "task=fix the bug",
+            "--input",
+            "repo=hex",
+        ]));
+        assert_eq!(p.positional, vec!["critique-loop".to_owned()]);
+        assert!(p.json);
+        assert_eq!(p.inputs.get("task").map(String::as_str), Some("fix the bug"));
+        assert_eq!(p.inputs.get("repo").map(String::as_str), Some("hex"));
+    }
+
+    #[test]
+    fn parses_glued_input_form() {
+        let p = Parsed::from(&args(&["g", "--input=task=x"]));
+        assert_eq!(p.inputs.get("task").map(String::as_str), Some("x"));
+        assert!(!p.json);
+    }
+
+    #[test]
+    fn input_value_may_contain_equals_signs() {
+        let p = Parsed::from(&args(&["g", "--input", "expr=a=b=c"]));
+        assert_eq!(p.inputs.get("expr").map(String::as_str), Some("a=b=c"));
+    }
+
+    #[test]
+    fn empty_args_have_no_positional() {
+        assert!(Parsed::from(&args(&[])).positional.is_empty());
+    }
+}
