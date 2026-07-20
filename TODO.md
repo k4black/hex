@@ -50,6 +50,15 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
       with named/typed values, but the operator only needs to say "what to do";
       richer parametrization is graph-internal. Keep orchestration/run-config
       (budget, worker, isolation) on CLI flags, never on the prompt channel.
+- [x] Dependency choices (resolved 2026-07-20): adopt small, well-maintained
+      crates over hand-rolling where they cut real code — `clap` (CLI parsing,
+      derive), `thiserror` (runtime error type), `yaml_serde` (maintained
+      serde_yaml fork), `fs4` (advisory locks, fs2 successor), `uuid` (run-id
+      suffixes), `humantime` (budget durations); dev: `assert_cmd` + `tempfile`
+      (binary end-to-end tests). Nothing lands in `hex-kernel` — it stays pure
+      (proto-only). Deferred crates are annotated on their phase items below
+      (`schemars`/`jsonschema` P2, `clap_complete` P3, `rmcp` P4/P7, `tokio` P6,
+      `ratatui` P7).
 
 ## Phase 0 — restructure the scaffold ✅
 
@@ -117,7 +126,8 @@ The robustness cut from the MVP: make the kernel/runtime trustworthy before
 adding surface. (Split out from the old mega "Phase 2"; UX/authoring is Phase 3.)
 
 - [ ] Full validator: schema + published JSON Schema, worker-capability
-      matching; canonical `format`.
+      matching; canonical `format`. _Candidate crates:_ `schemars` (derive the
+      JSON Schema from the loader's `Raw*` structs) + `jsonschema` (validate).
 - [ ] `templates:`/`extends:`, run-level reusable `gates:` + `accept.require`.
 - [ ] `command` node kind (shared executor with `gate`).
 - [ ] Atomic `state.json` snapshot projection. (Torn-tail repair, monotonic-seq
@@ -145,11 +155,15 @@ Phase-2 kernel; none change kernel semantics.
 
 - [ ] Verbs: `pause`, `capabilities`; `graph --format mermaid|dot` (ascii
       shipped in Phase 1).
-- [ ] Polished CLI UX: aligned tables, TTY-aware color with `--no-color`,
-      `--quiet`/`--verbose`, human-friendly diagnostics with source spans, and
-      progress while a run drives. `hex watch --follow` live-tails a run's
-      journal as events append (poll the file; works from a second terminal
-      while the run executes).
+- [~] Polished CLI UX. **Shipped 2026-07-20 with the `clap` migration:** one
+      unified help (bare `hex` renders the same clap help as `--help`, to stderr
+      / exit 2), every command + argument documented, a global `--json` flag,
+      value-name hints (`<TEXT>`/`<PATH>`/`<NODE>`), an examples block,
+      `propagate_version`, and an `ls` alias for `list`. **Remaining:** aligned
+      tables, TTY-aware color with `--no-color` (+ `NO_COLOR`), `--quiet`/
+      `--verbose`, human-friendly diagnostics with source spans, and `hex watch
+      --follow` to live-tail a run's journal as events append (poll the file;
+      works from a second terminal while the run executes).
 - [ ] Proper ASCII graph rendering for `hex graph`: a real laid-out diagram
       (boxes + arrows, cycles visible), not today's flat node/edge list; keep
       `--format ascii|mermaid|dot` so the same IR renders to each.
@@ -158,10 +172,13 @@ Phase-2 kernel; none change kernel semantics.
       refreshing in place as the agent prints (tail `attempts/<id>/stdout.log`;
       TTY-only, collapses to the final event line when the attempt ends).
 - [ ] Dynamic shell completions (bash/zsh/fish): Tab-complete graph names from
-      `hex list`, run-ids, verbs, and flags.
-- [ ] Strict argument parsing: reject unknown flags and enforce per-verb arity
-      instead of silently folding extras into positionals (today `hex list x`
-      or a `--jsonn` typo pass quietly).
+      `hex list`, run-ids, verbs, and flags. _Candidate crate:_ `clap_complete`
+      (now trivial — the CLI is on clap derive) + `clap_complete` dynamic
+      completers for the graph-name/run-id value hints.
+- [x] Strict argument parsing (shipped 2026-07-20 with the `clap` migration):
+      unknown flags/commands, extra positionals, and prompt-source conflicts now
+      fail with exit 2 instead of folding into positionals. Pinned by
+      `clap_rejects_bad_invocations_with_exit_2` in `crates/hex-cli/tests/cli.rs`.
 - [ ] **Authoring skill**: SKILL.md shipped in-repo teaching an agent to
       draft graph YAML from a task description and iterate against
       `hex validate` / `hex graph`.
@@ -194,7 +211,9 @@ Phase-2 kernel; none change kernel semantics.
 - [ ] `hex respond` / steering flow from any client; sessions resumable via
       `hex resume` after interruption.
 - [ ] Worker channel, transport 2: MCP tool hooks (`propose(event)`,
-      `finish_session(status)`) lowering to the same `Command`.
+      `finish_session(status)`) lowering to the same `Command`. _Candidate
+      crate:_ `rmcp` (the official Rust MCP SDK) — shared with the Phase 7
+      `hex-mcp` server.
 - [ ] `context: compact` (structured handoff then fresh).
 
 ## Phase 5 — approval + safe coding workflows
@@ -213,7 +232,10 @@ Phase-2 kernel; none change kernel semantics.
 ## Phase 6 — explicit concurrency & sub-agents
 
 - [ ] TODO(design): parallelism + sub-agent grammar in the YAML surface —
-      revisit "even simpler YAML" at the same time.
+      revisit "even simpler YAML" at the same time. _Candidate crate (if real
+      concurrency is needed):_ `tokio` + `tokio::process` — a big commitment;
+      the functional core stays sync, so only adopt when the scheduler must
+      drive attempts concurrently. Defer until forced.
 - [ ] `map`/`parallel`/`join` as explicit scheduler constructs: declared
       capacity, isolation, write ownership, fail policy (fail-fast/continue/
       all-or-nothing), fan-in reducer/quorum.
@@ -243,6 +265,8 @@ Phase-2 kernel; none change kernel semantics.
       budget — plus a live multi-run online-log/agent view.
 - [ ] `hex-dashboard` TUI: projection consumer + `RuntimeClient`; renders the
       live active-runs/agents/log views and can also start/control runs.
+      _Candidate crate:_ `ratatui` (TUI); pairs with `rmcp` if the dashboard
+      talks to a remote runtime.
 
 ## Only after demand
 
