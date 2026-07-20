@@ -162,7 +162,7 @@ sign-off, confirmation.
 4. Surface syntax is **standard YAML only** — kind-as-key + `on:` map,
    co-located edges, inline block-scalar prompts. No custom mini-grammar; the
    kernel models the compiled IR only, and the loader lives in `hex-runtime`
-   (not the kernel). `serde_yaml` is archived-but-fine for now.
+   (not the kernel). YAML via `yaml_serde` (the maintained serde_yaml fork).
 4b. **Operator input is one prompt.** The CLI takes only `-p/--prompt <text>`
    or `-f/--file <path>`, filling `{{prompt}}` in node prompts — no `--input
    k=v`. Named *typed* inputs/outputs are a **node** concern (internal graph

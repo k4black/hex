@@ -108,7 +108,7 @@ struct RawHuman {
 /// # Errors
 /// Fails on malformed YAML, an unknown node kind, or an unparseable duration.
 pub fn load(source: &str, prompt: Option<&str>, config_defaults: &DefaultsSpec) -> Result<Graph> {
-    let raw: RawGraph = serde_yaml::from_str(source)?;
+    let raw: RawGraph = yaml_serde::from_str(source)?;
     if raw.version != 1 {
         return Err(HexError::new(format!(
             "unsupported graph version {} (expected 1)",
@@ -287,23 +287,22 @@ fn parse_disposition(raw: &str) -> Result<Disposition> {
 }
 
 /// Parse a duration like `30m`, `45s`, `2h`, `500ms` into milliseconds.
+///
+/// Units follow `humantime`, which is wider than the old `ms|s|m|h` set: it also
+/// accepts `d`/`w`/`M`(month)/`y` and compound forms (`1h30m`). Note `m` is
+/// minutes and `M` is months. Budgets are millisecond-resolution, so a positive
+/// sub-millisecond duration (e.g. `1ns`) is rejected rather than silently
+/// floored to a 0ms budget that would time out instantly.
 fn parse_duration_ms(raw: &str) -> Result<u64> {
-    let raw = raw.trim();
-    let split = raw
-        .find(|c: char| c.is_ascii_alphabetic())
-        .ok_or_else(|| HexError::new(format!("duration `{raw}` has no unit")))?;
-    let (num, unit) = raw.split_at(split);
-    let value: u64 = num
-        .trim()
-        .parse()
-        .map_err(|_| HexError::new(format!("duration `{raw}` has a bad number")))?;
-    let ms = match unit {
-        "ms" => value,
-        "s" => value * 1_000,
-        "m" => value * 60_000,
-        "h" => value * 3_600_000,
-        other => return Err(HexError::new(format!("unknown duration unit `{other}`"))),
-    };
+    let dur = humantime::parse_duration(raw.trim())
+        .map_err(|e| HexError::new(format!("duration `{raw}`: {e}")))?;
+    let ms = u64::try_from(dur.as_millis())
+        .map_err(|_| HexError::new(format!("duration `{raw}` is too large")))?;
+    if ms == 0 && !dur.is_zero() {
+        return Err(HexError::new(format!(
+            "duration `{raw}` is below the 1ms resolution of budgets"
+        )));
+    }
     Ok(ms)
 }
 
@@ -334,6 +333,13 @@ mod tests {
         assert_eq!(parse_duration_ms("30m").unwrap(), 1_800_000);
         assert_eq!(parse_duration_ms("2h").unwrap(), 7_200_000);
         assert!(parse_duration_ms("30x").is_err());
+        // humantime widens the grammar: compound forms now parse.
+        assert_eq!(parse_duration_ms("1h30m").unwrap(), 5_400_000);
+        // A positive sub-millisecond value must not silently become a 0ms
+        // (instantly-exhausted) budget.
+        assert!(parse_duration_ms("1ns").is_err());
+        // An explicit zero is fine.
+        assert_eq!(parse_duration_ms("0s").unwrap(), 0);
     }
 
     #[test]

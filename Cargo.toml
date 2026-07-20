@@ -18,12 +18,19 @@ hex-worker = { path = "crates/hex-worker" }
 hex-runtime = { path = "crates/hex-runtime" }
 
 # External, shared across the workspace so versions stay aligned.
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+yaml_serde = "0.10"          # maintained serde_yaml fork ("The YAML Organization")
 sha2 = "0.10"
-fs2 = "0.4"
+fs4 = { version = "1", features = ["sync"] }   # OS advisory file locks (maintained fs2 successor)
+uuid = { version = "1", features = ["v4"] }    # collision-resistant run-id suffixes
+humantime = "2"              # parse `30m`/`2h`/`500ms` budget durations
+thiserror = "2"              # derive Display/Error on the runtime error type
 criterion = "0.7"
+# Dev-only: test the `hex` binary end-to-end.
+assert_cmd = "2"
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

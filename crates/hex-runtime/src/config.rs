@@ -89,7 +89,7 @@ impl Config {
 
     fn read(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        Ok(serde_yaml::from_str(&text)?)
+        Ok(yaml_serde::from_str(&text)?)
     }
 
     /// Merge `other` over `self` (other wins), for the user→project layering.

@@ -528,21 +528,16 @@ fn validate_run_id(run_id: &str) -> Result<()> {
     }
 }
 
-/// A short, high-entropy suffix for run ids (no external RNG dependency).
+/// A high-entropy, hyphen-free suffix for run ids. `simple()` keeps it
+/// `[0-9a-f]` only, satisfying [`validate_run_id`]'s path-safe grammar.
 fn random_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    format!("{:08x}", nanos ^ pid.wrapping_mul(2_654_435_761))
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// An exclusive per-run lock enforcing the single-writer invariant: only one
 /// process may drive (or append a terminal to) a run at a time.
 ///
-/// It is an **OS advisory lock** on an open file (`fs2`), so the kernel
+/// It is an **OS advisory lock** on an open file (`fs4`), so the kernel
 /// releases it automatically if the holder is SIGKILLed — a crashed run can be
 /// resumed, while a live run cannot be double-driven. The `run.lock` file
 /// merely anchors the lock; its presence alone never blocks anyone.
@@ -552,21 +547,23 @@ struct RunLock {
 
 impl RunLock {
     fn acquire(run_dir: &Path) -> Result<Self> {
-        use fs2::FileExt;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(run_dir.join("run.lock"))?;
-        match file.try_lock_exclusive() {
+        // Call the fs4 trait method by path: on a Rust >= 1.89 toolchain the
+        // inherent `File::try_lock` (stabilized then) would otherwise shadow it,
+        // and this crate targets rust 1.85 where only fs4 provides locking.
+        match fs4::FileExt::try_lock(&file) {
             Ok(()) => {
                 let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
                 Ok(Self { _file: file })
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(HexError::new(
+            Err(fs4::TryLockError::WouldBlock) => Err(HexError::new(
                 "run is already active (locked by a live process); refusing a concurrent writer",
             )),
-            Err(e) => Err(e.into()),
+            Err(fs4::TryLockError::Error(e)) => Err(e.into()),
         }
     }
 }
@@ -647,4 +644,30 @@ pub fn project_root() -> Result<PathBuf> {
 /// Propagates config load failures.
 pub fn open(root: &Path) -> Result<Runtime> {
     Runtime::new(root.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The advisory lock is real (a no-op would let the second acquire succeed)
+    /// and is released when the holder drops — the same fd-close path the OS
+    /// takes when a run's process is SIGKILLed, which is what makes a crashed
+    /// run resumable while a live one cannot be double-driven.
+    #[test]
+    fn run_lock_rejects_a_second_holder_and_releases_on_drop() {
+        let dir = std::env::temp_dir().join(format!("hex-runlock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let held = RunLock::acquire(&dir).expect("first acquire");
+        assert!(
+            RunLock::acquire(&dir).is_err(),
+            "a second concurrent writer must be refused while the lock is held"
+        );
+
+        drop(held);
+        RunLock::acquire(&dir).expect("acquire succeeds once the holder releases");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -1,10 +1,11 @@
 //! One error type for the runtime's fallible IO and parsing paths.
 
-use std::fmt;
+use thiserror::Error;
 
 /// A runtime error with a human-readable message. Kept deliberately simple —
 /// the runtime maps these to stable CLI exit codes and stderr diagnostics.
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("{0}")]
 pub struct HexError(pub String);
 
 impl HexError {
@@ -14,22 +15,14 @@ impl HexError {
     }
 }
 
-impl fmt::Display for HexError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for HexError {}
-
 impl From<std::io::Error> for HexError {
     fn from(e: std::io::Error) -> Self {
         Self(format!("io: {e}"))
     }
 }
 
-impl From<serde_yaml::Error> for HexError {
-    fn from(e: serde_yaml::Error) -> Self {
+impl From<yaml_serde::Error> for HexError {
+    fn from(e: yaml_serde::Error) -> Self {
         Self(format!("yaml: {e}"))
     }
 }

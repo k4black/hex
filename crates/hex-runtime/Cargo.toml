@@ -14,9 +14,12 @@ hex-kernel = { workspace = true }
 hex-worker = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 sha2 = { workspace = true }
-fs2 = { workspace = true }
+fs4 = { workspace = true }
+uuid = { workspace = true }
+humantime = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
