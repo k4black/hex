@@ -14,12 +14,24 @@ use crate::error::{HexError, Result};
 /// The built-in critique loop, embedded so a fresh checkout can run it.
 const CRITIQUE_LOOP: &str = include_str!("presets/critique-loop.yaml");
 
+/// Names of the graphs shipped in the binary.
+const BUILTINS: &[&str] = &["critique-loop"];
+
 /// A resolved graph source plus a label describing where it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
     /// The YAML source text.
     pub source: String,
     /// Human-readable origin (path or `built-in:<name>`), for diagnostics.
+    pub origin: String,
+}
+
+/// A graph available to run, and where it resolves from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The name to pass to `hex run`.
+    pub name: String,
+    /// Where it resolves from (a path, or `built-in`).
     pub origin: String,
 }
 
@@ -74,6 +86,47 @@ fn builtin(name: &str) -> Option<&'static str> {
     }
 }
 
+/// List every runnable graph across the three layers, deduped by name with the
+/// winning layer's origin (project > user > built-in — the same precedence
+/// [`resolve`] uses). Sorted by name.
+#[must_use]
+pub fn list(project_root: &Path) -> Vec<Entry> {
+    use std::collections::BTreeMap;
+    // Insert lowest precedence first so higher layers overwrite the origin.
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    for name in BUILTINS {
+        found.insert((*name).to_owned(), "built-in".to_owned());
+    }
+    if let Some(dir) = user_graphs_dir() {
+        collect_yaml(&dir, &mut found);
+    }
+    collect_yaml(&project_root.join(".hex").join("graphs"), &mut found);
+    found
+        .into_iter()
+        .map(|(name, origin)| Entry { name, origin })
+        .collect()
+}
+
+/// Record each `*.yaml`/`*.yml` file in `dir` as `<stem> -> <path>` (overwriting
+/// lower-precedence origins). A missing directory is simply skipped.
+fn collect_yaml(dir: &Path, found: &mut std::collections::BTreeMap<String, String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_yaml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "yaml" || e == "yml");
+        if is_yaml
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            found.insert(stem.to_owned(), path.display().to_string());
+        }
+    }
+}
+
 fn user_graphs_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".config").join("hex").join("graphs"))
@@ -98,5 +151,21 @@ mod tests {
     #[test]
     fn missing_path_is_a_hard_error() {
         assert!(resolve("./missing.yaml", Path::new("/nonexistent")).is_err());
+    }
+
+    #[test]
+    fn list_includes_builtins_and_project_graphs() {
+        let root = std::env::temp_dir().join(format!("hex-list-{}", std::process::id()));
+        let graphs = root.join(".hex").join("graphs");
+        std::fs::create_dir_all(&graphs).expect("mkdir");
+        std::fs::write(graphs.join("mine.yaml"), "version: 1").expect("write");
+
+        let entries = list(&root);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"critique-loop"), "built-in listed");
+        assert!(names.contains(&"mine"), "project graph listed");
+        // Project origin is a real path, not the built-in label.
+        let mine = entries.iter().find(|e| e.name == "mine").unwrap();
+        assert!(mine.origin.contains("mine.yaml"));
     }
 }

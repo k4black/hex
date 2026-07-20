@@ -20,6 +20,7 @@ pub mod workers;
 pub use error::{HexError, Result};
 pub use hex_kernel::graph::NodeKind;
 pub use hex_kernel::{Graph, RunState, Status};
+pub use preset::Entry as GraphEntry;
 pub use hex_proto::{Actor, Command, Disposition, Event, EventBody, PROTOCOL_VERSION};
 pub use workers::Workers;
 
@@ -122,6 +123,12 @@ impl Runtime {
             }
         }
         Err(HexError::new("could not allocate a unique run id"))
+    }
+
+    /// List every runnable graph (project > user > built-in).
+    #[must_use]
+    pub fn list_graphs(&self) -> Vec<GraphEntry> {
+        preset::list(&self.root)
     }
 
     /// Compile + validate a graph reference without running it.
@@ -498,6 +505,8 @@ impl RunLock {
 /// dashboard are all thin clients over this trait — never parallel
 /// implementations. Authority is scoped per actor, not per surface.
 pub trait RuntimeClient {
+    /// List every runnable graph.
+    fn list_graphs(&self) -> Vec<GraphEntry>;
     /// Start a new run.
     ///
     /// # Errors
@@ -526,6 +535,9 @@ pub trait RuntimeClient {
 }
 
 impl RuntimeClient for Runtime {
+    fn list_graphs(&self) -> Vec<GraphEntry> {
+        Runtime::list_graphs(self)
+    }
     fn start(&self, reference: &str, inputs: &BTreeMap<String, String>) -> Result<RunReport> {
         Runtime::start(self, reference, inputs)
     }

@@ -94,9 +94,9 @@ fail-closed, typed timeout disposition, evidence/correlation guards).
 - [x] Budgets: attempts + elapsed time + per-node cycle visits; fail-closed.
 - [x] Preset resolution: `.hex/graphs/` > `~/.config/hex/graphs/` > built-in;
       ships built-in `critique-loop` with `--input` parameters.
-- [x] Verbs: `run` `resume` `status` `watch` `cancel` `validate` `graph`
+- [x] Verbs: `list` `run` `resume` `status` `watch` `cancel` `validate` `graph`
       `emit`; `--json`/NDJSON; stable exit codes (0 success / 1 non-success /
-      2 usage).
+      2 usage). `hex run` with no graph lists what's runnable.
 - [x] Isolation: `shared` only (the run's workspace is the project cwd).
 - [x] Tests: kernel property basics (terminal schedules nothing; replay ==
       projection; unbounded cycles rejected) + kill-and-resume integration +

@@ -34,6 +34,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 
     match verb.as_str() {
         "emit" => cmd_emit(rest),
+        "list" => cmd_list(rest),
         "validate" => cmd_validate(rest),
         "graph" => cmd_graph(rest),
         "run" => cmd_run(rest),
@@ -53,6 +54,35 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 fn open_runtime() -> Result<Runtime, String> {
     let root = hex_runtime::project_root().map_err(|e| e.to_string())?;
     Runtime::new(root).map_err(|e| e.to_string())
+}
+
+fn cmd_list(args: &[String]) -> Result<ExitCode, String> {
+    let parsed = Parsed::from(args);
+    print_graph_list(&open_runtime()?, parsed.json);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Print the runnable graphs (shared by `hex list` and bare `hex run`).
+fn print_graph_list(runtime: &Runtime, json: bool) {
+    let graphs = runtime.list_graphs();
+    if json {
+        let items: Vec<_> = graphs
+            .iter()
+            .map(|g| serde_json::json!({"name": g.name, "origin": g.origin}))
+            .collect();
+        println!("{}", serde_json::json!({ "graphs": items }));
+        return;
+    }
+    if graphs.is_empty() {
+        println!("no graphs found (add one to .hex/graphs/ or ~/.config/hex/graphs/)");
+        return;
+    }
+    println!("available graphs:");
+    let width = graphs.iter().map(|g| g.name.len()).max().unwrap_or(0);
+    for g in &graphs {
+        println!("  {:<width$}  {}", g.name, g.origin, width = width);
+    }
+    println!("\nrun one with:  hex run <name> [--input k=v]");
 }
 
 fn cmd_validate(args: &[String]) -> Result<ExitCode, String> {
@@ -115,8 +145,12 @@ fn cmd_graph(args: &[String]) -> Result<ExitCode, String> {
 
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let parsed = Parsed::from(args);
-    let reference = parsed.positional.first().ok_or("usage: hex run <graph> [--input k=v]")?;
     let runtime = open_runtime()?;
+    // `hex run` with no graph lists what you can run instead of erroring.
+    let Some(reference) = parsed.positional.first() else {
+        print_graph_list(&runtime, parsed.json);
+        return Ok(ExitCode::SUCCESS);
+    };
     let report = runtime.start(reference, &parsed.inputs).map_err(|e| e.to_string())?;
     if parsed.json {
         let v = serde_json::json!({
@@ -303,6 +337,7 @@ fn print_usage() {
     for line in [
         "usage: hex <command> [args]",
         "",
+        "  list [--json]                    list runnable graphs (project/user/built-in)",
         "  validate <graph> [--input k=v]   check schema, references, bounded cycles",
         "  graph <graph> [--input k=v]      render the graph (ascii)",
         "  run <graph> [--input k=v] [--json]   start a new run",

@@ -182,9 +182,10 @@ The same verbs work from the CLI, MCP, and dashboard; all support `--json` /
 NDJSON, stable exit codes, and `capabilities` introspection.
 
 ```text
+hex list                 list runnable graphs (project > user > built-in)
 hex validate <graph>     schema, references, bounded cycles, capability match
 hex graph <graph>        render (ascii/mermaid/dot)
-hex run <graph>          start a NEW run
+hex run [<graph>]        start a NEW run (no graph → list what's runnable)
 hex resume <run>         continue the SAME run (after pause or crash)
 hex pause|cancel <run>   operator control
 hex status <run>         projected run status
