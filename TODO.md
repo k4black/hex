@@ -128,6 +128,13 @@ Everything deliberately cut from the MVP.
       `hex validate` / `hex graph`.
 - [ ] `hex init` (scaffold `.hex/` + example graph) + `hex doctor` (workers
       installed/authed/versions).
+- [ ] Polished CLI UX: aligned tables, TTY-aware color with `--no-color`,
+      `--quiet`/`--verbose`, human-friendly diagnostics with source spans, and
+      progress while a run drives. `hex watch --follow` live-tails a run's
+      journal as events append (poll the file; works from a second terminal
+      while the run executes).
+- [ ] Dynamic shell completions (bash/zsh/fish): Tab-complete graph names from
+      `hex list`, run-ids, verbs, and flags.
 
 ## Phase 3 — interactive sessions & MCP transport
 
@@ -151,7 +158,7 @@ Everything deliberately cut from the MVP.
 - [ ] Changed-file/diff artifacts; content-addressed artifact store.
 - [ ] Worktree cleanup + manual integration helpers (still no auto-merge).
 - [ ] Builder commands (`hex add`/`hex connect`) mutating the YAML in place.
-- [ ] `triage`-style diagnostics + exportable run bundle; shell completion.
+- [ ] `triage`-style diagnostics + exportable run bundle.
 - [ ] Config, richer policy layer: permissions, notifications, cost policies.
 
 ## Phase 5 — explicit concurrency & sub-agents
@@ -175,8 +182,11 @@ Everything deliberately cut from the MVP.
       authoring prompts/templates exposed over MCP.
 - [ ] `hex graph new` architect command (worker drafts a graph from a
       description, validates, writes the file).
-- [ ] `hex-dashboard` TUI: projection consumer + `RuntimeClient`; can also
-      start/control runs.
+- [ ] Live operator views (need the controller to know what's live): `hex ps`
+      — active runs with current node, in-flight worker/agent, and remaining
+      budget — plus a live multi-run online-log/agent view.
+- [ ] `hex-dashboard` TUI: projection consumer + `RuntimeClient`; renders the
+      live active-runs/agents/log views and can also start/control runs.
 
 ## Only after demand
 
