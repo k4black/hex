@@ -40,6 +40,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "resume" => cmd_resume(rest),
         "status" => cmd_status(rest),
         "watch" => cmd_watch(rest),
+        "logs" => cmd_logs(rest),
         "cancel" => cmd_cancel(rest),
         "-h" | "--help" | "help" => {
             print_usage();
@@ -245,6 +246,53 @@ fn cmd_watch(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn cmd_logs(args: &[String]) -> Result<ExitCode, String> {
+    let parsed = Parsed::from(args)?;
+    let run_id = parsed
+        .positional
+        .first()
+        .ok_or("usage: hex logs <run-id> [--node <id>] [--json]")?;
+    let runtime = open_runtime()?;
+    let logs = runtime.logs(run_id).map_err(|e| e.to_string())?;
+    let logs: Vec<_> = logs
+        .into_iter()
+        .filter(|l| parsed.node.as_deref().is_none_or(|n| l.node_id.as_deref() == Some(n)))
+        .collect();
+
+    if parsed.json {
+        let items: Vec<_> = logs
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "attempt_id": l.attempt_id,
+                    "node_id": l.node_id,
+                    "worker": l.worker,
+                    "stdout": l.stdout,
+                    "stderr": l.stderr,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "attempts": items }));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    for l in &logs {
+        let node = l.node_id.as_deref().unwrap_or("?");
+        let via = l.worker.as_deref().map_or(String::new(), |w| format!(" via {w}"));
+        println!("── {} [{node}]{via} ──", l.attempt_id);
+        if !l.stdout.trim().is_empty() {
+            print!("{}", l.stdout);
+            if !l.stdout.ends_with('\n') {
+                println!();
+            }
+        }
+        if !l.stderr.trim().is_empty() {
+            eprint!("{}", l.stderr);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_cancel(args: &[String]) -> Result<ExitCode, String> {
     let parsed = Parsed::from(args)?;
     let run_id = parsed.positional.first().ok_or("usage: hex cancel <run-id>")?;
@@ -288,6 +336,7 @@ struct Parsed {
     positional: Vec<String>,
     prompt: Option<String>,
     file: Option<String>,
+    node: Option<String>,
     json: bool,
 }
 
@@ -296,11 +345,20 @@ impl Parsed {
         let mut positional = Vec::new();
         let mut prompt = None;
         let mut file = None;
+        let mut node = None;
         let mut json = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
                 "--json" => json = true,
+                "--node" => {
+                    node = Some(
+                        args.get(i + 1)
+                            .ok_or_else(|| "--node requires a node id".to_owned())?
+                            .clone(),
+                    );
+                    i += 1;
+                }
                 "-p" | "--prompt" => {
                     if prompt.is_some() || file.is_some() {
                         return Err("pass only one of -p/--prompt or -f/--file".to_owned());
@@ -331,6 +389,7 @@ impl Parsed {
             positional,
             prompt,
             file,
+            node,
             json,
         })
     }
@@ -389,6 +448,7 @@ fn print_usage() {
         "  resume <run-id> [--json]         continue the same run from its journal",
         "  status <run-id> [--json]         projected run status",
         "  watch <run-id> [--json]          print the run's event stream",
+        "  logs <run-id> [--node <id>] [--json]   per-attempt agent stdout/stderr",
         "  cancel <run-id>                  record a terminal cancellation",
         "  emit <event>                     (worker-side) propose a routing event",
         "",

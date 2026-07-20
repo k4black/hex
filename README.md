@@ -195,7 +195,7 @@ hex resume <run>         continue the SAME run (after pause or crash)
 hex pause|cancel <run>   operator control
 hex status <run>         projected run status
 hex watch <run>          stream events (NDJSON with --json)
-hex logs <run>           attempt output
+hex logs <run> [--node <id>]   per-attempt agent stdout/stderr
 hex emit <event>         worker→runtime, scoped-token control
 hex respond <req>        human answer (interactive Q&A; later: approve/reject)
 ```

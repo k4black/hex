@@ -157,6 +157,31 @@ fn unsafe_run_id_is_rejected() {
 }
 
 #[test]
+fn logs_show_per_attempt_output() {
+    let dir = project("logs");
+    // A worker that prints something before emitting, so there's stdout to show.
+    std::fs::write(
+        dir.join(".hex").join("config.yaml"),
+        "workers:\n  builder:\n    command: [sh, -c, 'echo HELLO-FROM-AGENT; printf ready > \"$HEX_EMIT_FILE\"']\n",
+    )
+    .expect("config");
+    let run = hex(&dir, &["run", "demo", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(stdout(&run).trim()).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+
+    let out = hex(&dir, &["logs", run_id]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let s = stdout(&out);
+    assert!(s.contains("HELLO-FROM-AGENT"), "agent stdout shown: {s}");
+    assert!(s.contains("[build]"), "attempt header shows the node: {s}");
+
+    // --node filters to a single node's attempts.
+    let only = hex(&dir, &["logs", run_id, "--node", "build"]);
+    assert!(stdout(&only).contains("HELLO-FROM-AGENT"));
+    assert!(!stdout(&only).contains("[test]"), "filtered to build only");
+}
+
+#[test]
 fn status_and_watch_reflect_a_finished_run() {
     let dir = project("status");
     let run = hex(&dir, &["run", "demo", "--json"]);

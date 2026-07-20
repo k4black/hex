@@ -60,6 +60,21 @@ pub struct StatusReport {
     pub disposition: Option<Disposition>,
 }
 
+/// The captured output of one attempt (an agent's or gate's stdout/stderr).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptLog {
+    /// The attempt id.
+    pub attempt_id: String,
+    /// The node it ran.
+    pub node_id: Option<String>,
+    /// The worker that ran it (agent attempts only).
+    pub worker: Option<String>,
+    /// Captured stdout.
+    pub stdout: String,
+    /// Captured stderr.
+    pub stderr: String,
+}
+
 /// The in-process runtime: owns config + the worker registry and executes runs
 /// under a project root (the directory containing `.hex/`).
 /// A callback invoked with each event as it is journaled during a run.
@@ -389,7 +404,7 @@ impl Runtime {
         })
     }
 
-    /// Read every event of a run (for `watch`/`logs`).
+    /// Read every event of a run (for `watch`).
     ///
     /// # Errors
     /// Fails if the run does not exist.
@@ -399,6 +414,33 @@ impl Runtime {
             return Err(HexError::new(format!("run `{run_id}` not found")));
         }
         journal::read_all(&path)
+    }
+
+    /// The captured per-attempt output of a run, in attempt order — each
+    /// attempt's `stdout.log`/`stderr.log`, mapped to its node via the journal.
+    ///
+    /// # Errors
+    /// Fails if the run does not exist.
+    pub fn logs(&self, run_id: &str) -> Result<Vec<AttemptLog>> {
+        let run_dir = self.run_dir(run_id)?;
+        let attempts = run_dir.join("attempts");
+        let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+        let mut logs = Vec::new();
+        for event in self.events(run_id)? {
+            if let EventBody::AttemptStarted { worker, .. } = &event.body
+                && let Some(attempt_id) = &event.attempt_id
+            {
+                let dir = attempts.join(attempt_id);
+                logs.push(AttemptLog {
+                    attempt_id: attempt_id.clone(),
+                    node_id: event.node_id.clone(),
+                    worker: worker.clone(),
+                    stdout: read(dir.join("stdout.log")),
+                    stderr: read(dir.join("stderr.log")),
+                });
+            }
+        }
+        Ok(logs)
     }
 
     /// Cancel a run: if it has not finished, record a terminal `Cancelled`.
@@ -555,6 +597,11 @@ pub trait RuntimeClient {
     /// # Errors
     /// Fails if the run does not exist.
     fn events(&self, run_id: &str) -> Result<Vec<Event>>;
+    /// Per-attempt captured output of a run.
+    ///
+    /// # Errors
+    /// Fails if the run does not exist.
+    fn logs(&self, run_id: &str) -> Result<Vec<AttemptLog>>;
     /// Cancel a run.
     ///
     /// # Errors
@@ -577,6 +624,9 @@ impl RuntimeClient for Runtime {
     }
     fn events(&self, run_id: &str) -> Result<Vec<Event>> {
         Runtime::events(self, run_id)
+    }
+    fn logs(&self, run_id: &str) -> Result<Vec<AttemptLog>> {
+        Runtime::logs(self, run_id)
     }
     fn cancel(&self, run_id: &str) -> Result<()> {
         Runtime::cancel(self, run_id)

@@ -102,9 +102,10 @@ fail-closed, typed timeout disposition, evidence/correlation guards).
 - [x] Budgets: attempts + elapsed time + per-node cycle visits; fail-closed.
 - [x] Preset resolution: `.hex/graphs/` > `~/.config/hex/graphs/` > built-in;
       ships built-in `critique-loop`; operator prompt via `-p`/`-f` fills `{{prompt}}`.
-- [x] Verbs: `list` `run` `resume` `status` `watch` `cancel` `validate` `graph`
-      `emit`; `--json`/NDJSON; stable exit codes (0 success / 1 non-success /
-      2 usage). `hex run` with no graph lists what's runnable.
+- [x] Verbs: `list` `run` `resume` `status` `watch` `logs` `cancel` `validate`
+      `graph` `emit`; `--json`/NDJSON; stable exit codes (0 success / 1
+      non-success / 2 usage). `hex run` with no graph lists what's runnable;
+      `hex logs [--node <id>]` shows per-attempt agent output.
 - [x] Isolation: `shared` only (the run's workspace is the project cwd).
 - [x] Tests: kernel property basics (terminal schedules nothing; replay ==
       projection; unbounded cycles rejected) + kill-and-resume integration +
@@ -128,7 +129,8 @@ Everything deliberately cut from the MVP.
       inputs + resolved defaults), superseding the source-hash + defaults-in-
       `RunCreated` integrity check shipped in Phase 1.
 - [ ] Repeated-failure circuit breaker + progress-signature stall detection.
-- [ ] Verbs: `pause`, `logs`, `graph` (ascii/mermaid/dot); `capabilities`.
+- [ ] Verbs: `pause`, `capabilities`; `graph --format mermaid|dot` (ascii
+      shipped in Phase 1).
 - [ ] Isolation: per-run `worktree` opt-in (branch left for manual
       integration; no auto-merge).
 - [ ] **Authoring skill**: SKILL.md shipped in-repo teaching an agent to
