@@ -103,7 +103,7 @@ struct RawHuman {
 ///
 /// The operator supplies exactly one value — the prompt (`-p`/`-f`). Richer
 /// per-node typed inputs/outputs are an internal graph-dataflow concern (see
-/// TODO Phase 5), not part of this operator surface.
+/// TODO Phase 6), not part of this operator surface.
 ///
 /// # Errors
 /// Fails on malformed YAML, an unknown node kind, or an unparseable duration.
@@ -268,7 +268,7 @@ fn parse_context(raw: Option<&str>) -> Result<Context> {
         // `continue` is a real IR variant but the slim MVP only runs fresh
         // sessions; accepting it would silently ignore the author's intent.
         Some("continue") => Err(HexError::new(
-            "context `continue` is not supported yet (Phase 3); only `fresh`",
+            "context `continue` is not supported yet (Phase 4); only `fresh`",
         )),
         Some(other) => Err(HexError::new(format!(
             "unknown context `{other}` (expected fresh)"

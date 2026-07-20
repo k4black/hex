@@ -111,9 +111,10 @@ fail-closed, typed timeout disposition, evidence/correlation guards).
       projection; unbounded cycles rejected) + kill-and-resume integration +
       critique-loop e2e + budget-exhaustion e2e on the mock worker.
 
-## Phase 2 — hardening + authoring
+## Phase 2 — hardening & correctness
 
-Everything deliberately cut from the MVP.
+The robustness cut from the MVP: make the kernel/runtime trustworthy before
+adding surface. (Split out from the old mega "Phase 2"; UX/authoring is Phase 3.)
 
 - [ ] Full validator: schema + published JSON Schema, worker-capability
       matching; canonical `format`.
@@ -129,15 +130,21 @@ Everything deliberately cut from the MVP.
       inputs + resolved defaults), superseding the source-hash + defaults-in-
       `RunCreated` integrity check shipped in Phase 1.
 - [ ] Repeated-failure circuit breaker + progress-signature stall detection.
-- [ ] Verbs: `pause`, `capabilities`; `graph --format mermaid|dot` (ascii
-      shipped in Phase 1).
+- [ ] Graph-surface versioning before the format is externally relied on: bump
+      `version` on surface changes and keep a replay compiler per version, so a
+      snapshot written by an older hex still resumes. Moot pre-release (no
+      persisted runs, `.hex/runs` gitignored); required before 1.0. Pairs with
+      the canonical compiled-snapshot item above.
 - [ ] Isolation: per-run `worktree` opt-in (branch left for manual
       integration; no auto-merge).
-- [ ] **Authoring skill**: SKILL.md shipped in-repo teaching an agent to
-      draft graph YAML from a task description and iterate against
-      `hex validate` / `hex graph`.
-- [ ] `hex init` (scaffold `.hex/` + example graph) + `hex doctor` (workers
-      installed/authed/versions).
+
+## Phase 3 — operator experience, authoring & presets
+
+Make hex pleasant to drive and to author for. All build on the hardened
+Phase-2 kernel; none change kernel semantics.
+
+- [ ] Verbs: `pause`, `capabilities`; `graph --format mermaid|dot` (ascii
+      shipped in Phase 1).
 - [ ] Polished CLI UX: aligned tables, TTY-aware color with `--no-color`,
       `--quiet`/`--verbose`, human-friendly diagnostics with source spans, and
       progress while a run drives. `hex watch --follow` live-tails a run's
@@ -155,13 +162,30 @@ Everything deliberately cut from the MVP.
 - [ ] Strict argument parsing: reject unknown flags and enforce per-verb arity
       instead of silently folding extras into positionals (today `hex list x`
       or a `--jsonn` typo pass quietly).
-- [ ] Graph-surface versioning before the format is externally relied on: bump
-      `version` on surface changes and keep a replay compiler per version, so a
-      snapshot written by an older hex still resumes. Moot pre-release (no
-      persisted runs, `.hex/runs` gitignored); required before 1.0. Pairs with
-      the canonical compiled-snapshot item above.
+- [ ] **Authoring skill**: SKILL.md shipped in-repo teaching an agent to
+      draft graph YAML from a task description and iterate against
+      `hex validate` / `hex graph`.
+- [ ] `hex init` (scaffold `.hex/` + example graph) + `hex doctor` (workers
+      installed/authed/versions).
+- [ ] **Grow the built-in preset library** beyond `critique-loop`, using the
+      role vocabulary the research surveys — Ralph "hats" and AutoLoop roles:
+      planner / implementer / reviewer / tester as *topology + prompts*, not
+      separate processes (roles stay node metadata, never new kinds). Ship a
+      small, opinionated set of bounded graphs for the task types autonomous
+      loops actually work on (greenfield, mechanical changes, dependency bumps,
+      well-specified defects, TDD):
+      - `fix-until-green` — implement → test loop, tests the only backpressure,
+        no reviewer (the pure Ralph pattern).
+      - `tdd` — write-failing-test → implement → test-green loop.
+      - `plan-then-build` — plan → (human-approve gate, Phase 5) → implement →
+        test → review.
+      - `review-only` — reviewer + gate over the current diff, no implementer
+        (CI-style check; pairs with the review-only critique-loop flow).
+      Factor shared role prompts into reusable node `templates:` (Phase 2) so
+      presets compose one planner/reviewer definition. Resolution + authoring
+      already exist (`hex list`, 3-layer lookup); this is content, not mechanism.
 
-## Phase 3 — interactive sessions & MCP transport
+## Phase 4 — interactive sessions & MCP transport
 
 - [ ] `interactive: true` agent policy: live human↔agent conversation
       (grill-me/Q&A), every turn journaled (`worker.message`/`human.message`),
@@ -173,7 +197,7 @@ Everything deliberately cut from the MVP.
       `finish_session(status)`) lowering to the same `Command`.
 - [ ] `context: compact` (structured handoff then fresh).
 
-## Phase 4 — approval + safe coding workflows
+## Phase 5 — approval + safe coding workflows
 
 - [ ] Approval `human` node (blocking decision on a finished proposal:
       approve/reject/edit with actor + rationale) — e.g. plan → human approves
@@ -186,7 +210,7 @@ Everything deliberately cut from the MVP.
 - [ ] `triage`-style diagnostics + exportable run bundle.
 - [ ] Config, richer policy layer: permissions, notifications, cost policies.
 
-## Phase 5 — explicit concurrency & sub-agents
+## Phase 6 — explicit concurrency & sub-agents
 
 - [ ] TODO(design): parallelism + sub-agent grammar in the YAML surface —
       revisit "even simpler YAML" at the same time.
@@ -206,7 +230,7 @@ Everything deliberately cut from the MVP.
       (generation parallel, acceptance conservative and serialized).
 - [ ] Per-node cost/token budgets where workers report usage.
 
-## Phase 6 — daemon & remote surfaces
+## Phase 7 — daemon & remote surfaces
 
 - [ ] Per-run background controller; `RuntimeClient::Remote` over a run-local
       socket + scoped token (`hex run --background`, attach/detach).

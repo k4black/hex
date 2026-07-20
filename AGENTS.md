@@ -166,7 +166,7 @@ sign-off, confirmation.
 4b. **Operator input is one prompt.** The CLI takes only `-p/--prompt <text>`
    or `-f/--file <path>`, filling `{{prompt}}` in node prompts — no `--input
    k=v`. Named *typed* inputs/outputs are a **node** concern (internal graph
-   dataflow, Phase 5), never an operator flag. Keep run-config (budget, worker,
+   dataflow, Phase 6), never an operator flag. Keep run-config (budget, worker,
    isolation) on their own CLI flags, off the prompt channel.
 5. The worker↔runtime channel is `hex emit <event>`: the runtime injects
    `HEX_EMIT_FILE`/`HEX_MAY_PROPOSE` etc.; the agent's argv must be able to
