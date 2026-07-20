@@ -69,7 +69,7 @@ fn event_line(e: &hex_runtime::Event) -> String {
 }
 
 fn cmd_list(args: &[String]) -> Result<ExitCode, String> {
-    let parsed = Parsed::from(args);
+    let parsed = Parsed::from(args)?;
     print_graph_list(&open_runtime()?, parsed.json);
     Ok(ExitCode::SUCCESS)
 }
@@ -98,7 +98,7 @@ fn print_graph_list(runtime: &Runtime, json: bool) {
 }
 
 fn cmd_validate(args: &[String]) -> Result<ExitCode, String> {
-    let parsed = Parsed::from(args);
+    let parsed = Parsed::from(args)?;
     let reference = parsed.positional.first().ok_or("usage: hex validate <graph>")?;
     let runtime = open_runtime()?;
     match runtime.validate(reference) {
@@ -124,7 +124,7 @@ fn cmd_validate(args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn cmd_graph(args: &[String]) -> Result<ExitCode, String> {
-    let parsed = Parsed::from(args);
+    let parsed = Parsed::from(args)?;
     let reference = parsed.positional.first().ok_or("usage: hex graph <graph>")?;
     let runtime = open_runtime()?;
     let graph = runtime.validate(reference).map_err(|e| e.to_string())?;
@@ -156,7 +156,7 @@ fn cmd_graph(args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
-    let parsed = Parsed::from(args);
+    let parsed = Parsed::from(args)?;
     let runtime = open_runtime_streaming()?;
     // `hex run` with no graph lists what you can run instead of erroring.
     let Some(reference) = parsed.positional.first() else {
@@ -182,7 +182,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn cmd_resume(args: &[String]) -> Result<ExitCode, String> {
-    let parsed = Parsed::from(args);
+    let parsed = Parsed::from(args)?;
     let run_id = parsed.positional.first().ok_or("usage: hex resume <run-id>")?;
     let runtime = open_runtime_streaming()?;
     let report = runtime.resume(run_id).map_err(|e| e.to_string())?;
@@ -200,7 +200,7 @@ fn cmd_resume(args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn cmd_status(args: &[String]) -> Result<ExitCode, String> {
-    let parsed = Parsed::from(args);
+    let parsed = Parsed::from(args)?;
     let run_id = parsed.positional.first().ok_or("usage: hex status <run-id>")?;
     let runtime = open_runtime()?;
     let s = runtime.status(run_id).map_err(|e| e.to_string())?;
@@ -226,7 +226,7 @@ fn cmd_status(args: &[String]) -> Result<ExitCode, String> {
 fn cmd_watch(args: &[String]) -> Result<ExitCode, String> {
     // Foreground MVP: runs finish synchronously, so `watch` prints the recorded
     // event stream. Live tailing arrives with the background controller.
-    let parsed = Parsed::from(args);
+    let parsed = Parsed::from(args)?;
     let run_id = parsed.positional.first().ok_or("usage: hex watch <run-id>")?;
     let runtime = open_runtime()?;
     let events = runtime.events(run_id).map_err(|e| e.to_string())?;
@@ -241,7 +241,7 @@ fn cmd_watch(args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn cmd_cancel(args: &[String]) -> Result<ExitCode, String> {
-    let parsed = Parsed::from(args);
+    let parsed = Parsed::from(args)?;
     let run_id = parsed.positional.first().ok_or("usage: hex cancel <run-id>")?;
     let runtime = open_runtime()?;
     runtime.cancel(run_id).map_err(|e| e.to_string())?;
@@ -287,7 +287,7 @@ struct Parsed {
 }
 
 impl Parsed {
-    fn from(args: &[String]) -> Self {
+    fn from(args: &[String]) -> Result<Self, String> {
         let mut positional = Vec::new();
         let mut prompt = None;
         let mut file = None;
@@ -297,23 +297,37 @@ impl Parsed {
             match args[i].as_str() {
                 "--json" => json = true,
                 "-p" | "--prompt" => {
-                    prompt = args.get(i + 1).cloned();
+                    if prompt.is_some() || file.is_some() {
+                        return Err("pass only one of -p/--prompt or -f/--file".to_owned());
+                    }
+                    prompt = Some(
+                        args.get(i + 1)
+                            .ok_or_else(|| format!("{} requires a value", args[i]))?
+                            .clone(),
+                    );
                     i += 1;
                 }
                 "-f" | "--file" => {
-                    file = args.get(i + 1).cloned();
+                    if prompt.is_some() || file.is_some() {
+                        return Err("pass only one of -p/--prompt or -f/--file".to_owned());
+                    }
+                    file = Some(
+                        args.get(i + 1)
+                            .ok_or_else(|| format!("{} requires a path", args[i]))?
+                            .clone(),
+                    );
                     i += 1;
                 }
                 other => positional.push(other.to_owned()),
             }
             i += 1;
         }
-        Self {
+        Ok(Self {
             positional,
             prompt,
             file,
             json,
-        }
+        })
     }
 
     /// Resolve the operator prompt from `-p` (inline) or `-f` (file). At most
