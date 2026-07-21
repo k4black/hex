@@ -88,9 +88,7 @@ impl Worker for AgentWorker {
             Err(e) => return WorkOutcome::error(format!("spawn `{}` failed: {e}", rendered[0])),
         };
 
-        if !uses_placeholder
-            && let Some(mut stdin) = child.stdin.take()
-        {
+        if !uses_placeholder && let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             let _ = stdin.write_all(request.prompt.as_bytes());
             // drop closes stdin
@@ -105,7 +103,9 @@ impl Worker for AgentWorker {
         // A nonzero exit is an infrastructure/agent failure, not a routing
         // proposal — never accept a signal from a process that failed.
         if !status.success() {
-            let code = status.code().map_or_else(|| "signal".to_owned(), |c| c.to_string());
+            let code = status
+                .code()
+                .map_or_else(|| "signal".to_owned(), |c| c.to_string());
             return WorkOutcome::error(format!("agent exited nonzero (exit {code})"));
         }
 
@@ -123,7 +123,11 @@ impl Worker for AgentWorker {
 ///
 /// # Errors
 /// Fails on an empty argv or if a log file cannot be created.
-pub fn logged_command(argv: &[String], cwd: &Path, attempt_dir: &Path) -> std::io::Result<ProcCommand> {
+pub fn logged_command(
+    argv: &[String],
+    cwd: &Path,
+    attempt_dir: &Path,
+) -> std::io::Result<ProcCommand> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"))?;
@@ -140,7 +144,10 @@ pub fn logged_command(argv: &[String], cwd: &Path, attempt_dir: &Path) -> std::i
 /// Wait for `child`, killing it if it outlives `deadline_ms`. `Ok(None)` means
 /// the deadline fired and the child was killed. Shared by the agent adapter and
 /// the runtime's gate executor so both honor per-attempt time budgets.
-pub fn wait_bounded(child: &mut Child, deadline_ms: Option<u64>) -> std::io::Result<Option<ExitStatus>> {
+pub fn wait_bounded(
+    child: &mut Child,
+    deadline_ms: Option<u64>,
+) -> std::io::Result<Option<ExitStatus>> {
     let Some(budget) = deadline_ms else {
         return child.wait().map(Some);
     };
@@ -169,8 +176,11 @@ fn read_signal(emit_file: &std::path::Path, may_propose: &[String]) -> Result<St
     const MAX_EMIT_BYTES: u64 = 64 * 1024;
     let file = fs::File::open(emit_file).map_err(|_| "agent emitted no signal".to_owned())?;
     let mut contents = String::new();
-    std::io::Read::read_to_string(&mut std::io::Read::take(file, MAX_EMIT_BYTES), &mut contents)
-        .map_err(|e| format!("could not read emit file: {e}"))?;
+    std::io::Read::read_to_string(
+        &mut std::io::Read::take(file, MAX_EMIT_BYTES),
+        &mut contents,
+    )
+    .map_err(|e| format!("could not read emit file: {e}"))?;
     let distinct: BTreeSet<&str> = contents
         .lines()
         .map(str::trim)
@@ -183,13 +193,18 @@ fn read_signal(emit_file: &std::path::Path, may_propose: &[String]) -> Result<St
             if may_propose.iter().any(|allowed| allowed == signal) {
                 Ok(signal.to_owned())
             } else {
-                Err(format!("agent emitted `{signal}` which is not in may_propose"))
+                Err(format!(
+                    "agent emitted `{signal}` which is not in may_propose"
+                ))
             }
         }
         _ => {
             let mut names: Vec<&str> = distinct.into_iter().collect();
             names.sort_unstable();
-            Err(format!("agent emitted multiple signals: {}", names.join(", ")))
+            Err(format!(
+                "agent emitted multiple signals: {}",
+                names.join(", ")
+            ))
         }
     }
 }

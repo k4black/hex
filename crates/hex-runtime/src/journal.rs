@@ -296,7 +296,13 @@ mod tests {
         }
         let (mut j, _) = Journal::open_append(path.clone()).expect("reopen");
         let ev = j
-            .append("run_0", None, None, Actor::runtime(), EventBody::AttemptInterrupted)
+            .append(
+                "run_0",
+                None,
+                None,
+                Actor::runtime(),
+                EventBody::AttemptInterrupted,
+            )
             .expect("append");
         assert_eq!(ev.seq, 1);
     }

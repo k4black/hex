@@ -140,7 +140,12 @@ fn collect_yaml(dir: &Path, found: &mut std::collections::BTreeMap<String, Strin
 
 fn user_graphs_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config").join("hex").join("graphs"))
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("hex")
+            .join("graphs"),
+    )
 }
 
 #[cfg(test)]

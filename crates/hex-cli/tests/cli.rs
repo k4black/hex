@@ -86,7 +86,11 @@ fn no_args_prints_help_to_stderr_and_exits_2() {
     // And it must match `hex --help` (which clap prints to stdout, exit 0).
     let help = hex(dir.path(), &["--help"]);
     assert!(help.status.success());
-    assert_eq!(err, stdout(&help), "bare-hex and --help must be identical text");
+    assert_eq!(
+        err,
+        stdout(&help),
+        "bare-hex and --help must be identical text"
+    );
 }
 
 #[test]
@@ -126,8 +130,16 @@ fn list_shows_builtin_and_project_graphs() {
 fn validate_and_graph_need_no_prompt() {
     let dir = project();
     // Regression: structural commands must not demand an operator prompt.
-    assert!(hex(dir.path(), &["validate", "critique-loop"]).status.success());
-    assert!(hex(dir.path(), &["graph", "critique-loop"]).status.success());
+    assert!(
+        hex(dir.path(), &["validate", "critique-loop"])
+            .status
+            .success()
+    );
+    assert!(
+        hex(dir.path(), &["graph", "critique-loop"])
+            .status
+            .success()
+    );
 }
 
 #[test]
@@ -137,7 +149,10 @@ fn run_drives_to_success_and_streams_progress() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(stdout(&out).contains("succeeded"));
     // Progress is streamed to stderr as events are journaled.
-    assert!(stderr(&out).contains("run_started"), "live progress on stderr");
+    assert!(
+        stderr(&out).contains("run_started"),
+        "live progress on stderr"
+    );
     assert!(stderr(&out).contains("run_finished"));
 }
 
@@ -159,7 +174,11 @@ fn run_without_a_needed_prompt_fails_clearly() {
     // promptdemo references {{prompt}}; run must refuse before executing.
     let out = hex(dir.path(), &["run", "promptdemo"]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(stderr(&out).contains("needs a prompt"), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("needs a prompt"),
+        "stderr: {}",
+        stderr(&out)
+    );
 }
 
 #[test]
@@ -175,7 +194,10 @@ fn run_with_prompt_file_succeeds() {
     let dir = project();
     let pf = dir.path().join("prompt.md");
     std::fs::write(&pf, "task from a file").expect("prompt file");
-    let out = hex(dir.path(), &["run", "promptdemo", "-f", pf.to_str().unwrap()]);
+    let out = hex(
+        dir.path(),
+        &["run", "promptdemo", "-f", pf.to_str().unwrap()],
+    );
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(stdout(&out).contains("succeeded"));
 }

@@ -524,8 +524,15 @@ mod tests {
         forged.node_id = Some("implement".to_owned());
         forged.attempt_id = Some("att_999".to_owned()); // wrong attempt
         let after = reduce(&g, s, &forged);
-        assert_eq!(after.current.as_deref(), Some("implement"), "must not route");
-        assert!(after.awaiting(), "spurious signal leaves the attempt in-flight");
+        assert_eq!(
+            after.current.as_deref(),
+            Some("implement"),
+            "must not route"
+        );
+        assert!(
+            after.awaiting(),
+            "spurious signal leaves the attempt in-flight"
+        );
     }
 
     #[test]

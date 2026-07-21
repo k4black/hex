@@ -51,7 +51,10 @@ impl Worker for MockWorker {
             .and_then(VecDeque::pop_front);
         match next {
             Some(signal) => WorkOutcome::signal(signal),
-            None => WorkOutcome::error(format!("mock: no scripted signal for `{}`", request.node_id)),
+            None => WorkOutcome::error(format!(
+                "mock: no scripted signal for `{}`",
+                request.node_id
+            )),
         }
     }
 }
@@ -77,7 +80,10 @@ mod tests {
     #[test]
     fn emits_scripted_signals_in_order() {
         let w = MockWorker::new().on("review", &["changes_requested", "approved"]);
-        assert_eq!(w.run(&request("review")), WorkOutcome::signal("changes_requested"));
+        assert_eq!(
+            w.run(&request("review")),
+            WorkOutcome::signal("changes_requested")
+        );
         assert_eq!(w.run(&request("review")), WorkOutcome::signal("approved"));
         assert!(w.run(&request("review")).error.is_some());
     }

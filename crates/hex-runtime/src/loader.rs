@@ -146,7 +146,13 @@ pub fn load(source: &str, prompt: Option<&str>, config_defaults: &DefaultsSpec) 
                 to: to.clone(),
             });
         }
-        nodes.insert(id.clone(), Node { id: id.clone(), spec });
+        nodes.insert(
+            id.clone(),
+            Node {
+                id: id.clone(),
+                spec,
+            },
+        );
     }
 
     let accept = raw
@@ -242,9 +248,11 @@ fn compile_node(
 }
 
 fn compile_requirement(raw: &str) -> Result<Requirement> {
-    let (node, signal) = raw
-        .split_once('.')
-        .ok_or_else(|| HexError::new(format!("acceptance requirement `{raw}` must be `node.signal`")))?;
+    let (node, signal) = raw.split_once('.').ok_or_else(|| {
+        HexError::new(format!(
+            "acceptance requirement `{raw}` must be `node.signal`"
+        ))
+    })?;
     Ok(Requirement {
         node: node.to_owned(),
         signal: signal.to_owned(),

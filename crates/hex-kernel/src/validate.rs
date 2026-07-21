@@ -127,7 +127,10 @@ fn check_routing(graph: &Graph, issues: &mut Vec<Issue>) {
                     if !edge_signals.contains(sig) {
                         issues.push(Issue::new(
                             "E-proposal-no-edge",
-                            format!("agent `{}` may propose `{sig}` but no edge handles it", node.id),
+                            format!(
+                                "agent `{}` may propose `{sig}` but no edge handles it",
+                                node.id
+                            ),
                         ));
                     }
                 }
@@ -248,7 +251,10 @@ pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<(), Issue> {
 
     for (i, e) in events.iter().enumerate() {
         if e.schema_version != PROTOCOL_VERSION {
-            return Err(bad(i, format!("unsupported schema_version {}", e.schema_version)));
+            return Err(bad(
+                i,
+                format!("unsupported schema_version {}", e.schema_version),
+            ));
         }
         if phase == Phase::Finished {
             // Only inert diagnostics may trail a terminal.
@@ -299,7 +305,10 @@ pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<(), Issue> {
             }
             EventBody::AttemptFailed { disposition, .. } => {
                 if !attempt_matches(active, e) {
-                    return Err(bad(i, "attempt_failed does not match the in-flight attempt"));
+                    return Err(bad(
+                        i,
+                        "attempt_failed does not match the in-flight attempt",
+                    ));
                 }
                 if !matches!(disposition, Disposition::Failed | Disposition::TimedOut) {
                     return Err(bad(i, "attempt_failed carries a non-failure disposition"));
@@ -309,7 +318,10 @@ pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<(), Issue> {
             }
             EventBody::AttemptInterrupted => {
                 if !attempt_matches(active, e) {
-                    return Err(bad(i, "attempt_interrupted does not match the in-flight attempt"));
+                    return Err(bad(
+                        i,
+                        "attempt_interrupted does not match the in-flight attempt",
+                    ));
                 }
                 active = None; // current stays; the node is re-attempted
             }
@@ -336,7 +348,10 @@ fn attempt_matches(active: Option<(&str, &str)>, event: &Event) -> bool {
 }
 
 fn bad(index: usize, why: impl Into<String>) -> Issue {
-    Issue::new("E-journal-lifecycle", format!("event {index}: {}", why.into()))
+    Issue::new(
+        "E-journal-lifecycle",
+        format!("event {index}: {}", why.into()),
+    )
 }
 
 /// A routing signal name: lowercase, starts with a letter, `[a-z0-9_]` after.

@@ -41,8 +41,12 @@ fn bench_load(c: &mut Criterion) {
     let defaults = DefaultsSpec::default();
     c.bench_function("runtime_load_critique_loop", |b| {
         b.iter(|| {
-            hex_runtime::loader::load(black_box(source), black_box(Some("bench")), black_box(&defaults))
-                .expect("loads")
+            hex_runtime::loader::load(
+                black_box(source),
+                black_box(Some("bench")),
+                black_box(&defaults),
+            )
+            .expect("loads")
         });
     });
 }
