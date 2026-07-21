@@ -1,0 +1,45 @@
+version: 1
+name: review
+
+# CI-style review: one reviewer judges the current working-tree diff — no
+# implementer. Approves → succeeded; requests changes → failed (there is nothing
+# to re-implement here). Pair it with your own edits, or with a run of another
+# preset, then check the diff.
+# Run it with:  hex run review -p "what to check for"
+
+defaults:
+  worker: codex
+  context: fresh
+  budget:
+    attempts: 2
+
+entry: review
+
+nodes:
+  review:
+    agent:
+      read_only: true
+      prompt: |
+        Review the current working-tree changes.
+
+        What to check for: {{prompt}}
+
+        Run `git diff` (and `git status`) to see the changes — review only, do
+        not edit files. If they are acceptable, run:
+          hex emit approved
+        Otherwise explain what needs to change in your final message (shown by
+        `hex logs`) and run:
+          hex emit changes_requested
+      may_propose: [approved, changes_requested]
+    on:
+      approved: done
+      changes_requested: rejected
+
+  done:
+    terminal: succeeded
+
+  rejected:
+    terminal: failed
+
+accept:
+  require: [review.approved]

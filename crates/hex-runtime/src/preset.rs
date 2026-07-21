@@ -11,11 +11,21 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{HexError, Result};
 
-/// The built-in critique loop, embedded so a fresh checkout can run it.
+/// The built-in workflow library, embedded so a fresh checkout can run them.
 const CRITIQUE_LOOP: &str = include_str!("presets/critique-loop.yaml");
+const IMPLEMENT_UNTIL_GREEN: &str = include_str!("presets/implement-until-green.yaml");
+const TDD: &str = include_str!("presets/tdd.yaml");
+const PLAN_BUILD_REVIEW: &str = include_str!("presets/plan-build-review.yaml");
+const REVIEW: &str = include_str!("presets/review.yaml");
 
 /// Names of the graphs shipped in the binary.
-const BUILTINS: &[&str] = &["critique-loop"];
+const BUILTINS: &[&str] = &[
+    "critique-loop",
+    "implement-until-green",
+    "tdd",
+    "plan-build-review",
+    "review",
+];
 
 /// A resolved graph source plus a label describing where it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +101,10 @@ pub fn resolve(reference: &str, project_root: &Path) -> Result<Resolved> {
 fn builtin(name: &str) -> Option<&'static str> {
     match name {
         "critique-loop" => Some(CRITIQUE_LOOP),
+        "implement-until-green" => Some(IMPLEMENT_UNTIL_GREEN),
+        "tdd" => Some(TDD),
+        "plan-build-review" => Some(PLAN_BUILD_REVIEW),
+        "review" => Some(REVIEW),
         _ => None,
     }
 }

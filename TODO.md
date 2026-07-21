@@ -177,6 +177,50 @@ Phase-2 kernel; none change kernel semantics.
       `attempt_finished` + `AttemptView`); the CLI renders on a background
       thread — the worker/kernel are untouched. TTY-only; `--no-preview`/
       `--json`/non-TTY fall back to plain line streaming.
+- [ ] **Structured tool-call feed** in the preview (and richer `hex logs`):
+      parse each agent's line-delimited-JSON stream into a normalized
+      `ToolCallEvent {kind, target, status, exit_code?}` and render the last N
+      (commands run, files changed, tokens) instead of raw stdout. Per-agent
+      streams (researched 2026-07-21): codex `exec --json` JSONL
+      (`item.completed` `command_execution`/`file_change`/…), claude
+      `--output-format stream-json --verbose` (`assistant.tool_use` /
+      `user.tool_result`), opencode `run --format json` or `serve` + `GET /event`
+      SSE. Common denominator = one JSON object per stdout line → normalize.
+      Schemas are all vendor-unstable → tolerate unknown types.
+- [x] **Typed worker adapters** (shipped 2026-07-21): `CodexWorker`/
+      `ClaudeWorker`/`OpencodeWorker` each own their argv, result-capture, and
+      permission policy behind the `Worker` trait; `CommandWorker` is the generic
+      argv escape hatch. Config selects via `kind:`. Permissioning is per-agent
+      and never a blanket bypass: **codex** runs under its OS sandbox
+      (`--sandbox workspace-write`: repo+tmp writable, `.git`/network blocked) —
+      a real boundary; **claude** uses an auto classifier (`--permission-mode
+      acceptEdits` + `--allowedTools` for the coding essentials incl. `Bash` +
+      `--disallowedTools` denying destructive/exfil/publish commands) — a
+      defense-in-depth deny-list, not an OS boundary (prefix matching is
+      bypassable via shell chaining); **opencode** still uses `--auto` (blanket
+      approve — a proper `opencode.json` `permission` block is deferred, see
+      below). `read_only` is advisory only (see "Enforced read-only"). opencode
+      uses a `JsonlLastText` capture (`--auto --format json`).
+- [ ] **opencode permission classifier**: generate a per-run `opencode.json`
+      `permission` block (`bash` allow/deny mirroring the Claude deny-list,
+      `edit` scoped, `external_directory: deny`) so opencode matches codex/claude
+      instead of a blanket `--auto` approve.
+- [ ] **Configurable Claude permission policy**: today the allow/deny lists are
+      hardcoded in `ClaudeWorker`. Expose an operator override (worker config)
+      and an explicit, clearly-unsafe `bypass` opt-in for use only inside real
+      isolation (worktree/container).
+- [ ] **Live-verify + finish worker flags** (needs agent auth — not smoke-tested
+      here): confirm codex `--output-last-message`/`--sandbox`, claude
+      `--output-format json`, opencode `run --format json`; opencode
+      `event_server` capability (`serve` + SSE) for richer fidelity.
+- [ ] **Enforced read-only** for reviewer nodes: today `read_only` is advisory
+      (prompt-only) because a real read-only sandbox also blocks the `hex emit`
+      file channel. Needs a control transport outside the sandboxed workspace
+      (e.g. MCP tool hook, or an emit dir the sandbox whitelists) so a reviewer
+      can be sandbox-enforced read-only *and* still route its verdict.
+- [ ] tdd's red/green gates run the whole `cargo test` suite, so they can't
+      isolate the *new* test (an unrelated pre-existing failure reads as "red").
+      Per-test targeting once node I/O can pass the test name to the gate.
 - [ ] Dynamic shell completions (bash/zsh/fish): Tab-complete graph names from
       `hex list`, run-ids, verbs, and flags. _Candidate crate:_ `clap_complete`
       (now trivial — the CLI is on clap derive) + `clap_complete` dynamic
@@ -190,23 +234,22 @@ Phase-2 kernel; none change kernel semantics.
       `hex validate` / `hex graph`.
 - [ ] `hex init` (scaffold `.hex/` + example graph) + `hex doctor` (workers
       installed/authed/versions).
-- [ ] **Grow the built-in preset library** beyond `critique-loop`, using the
-      role vocabulary the research surveys — Ralph "hats" and AutoLoop roles:
-      planner / implementer / reviewer / tester as *topology + prompts*, not
-      separate processes (roles stay node metadata, never new kinds). Ship a
-      small, opinionated set of bounded graphs for the task types autonomous
-      loops actually work on (greenfield, mechanical changes, dependency bumps,
-      well-specified defects, TDD):
-      - `fix-until-green` — implement → test loop, tests the only backpressure,
-        no reviewer (the pure Ralph pattern).
-      - `tdd` — write-failing-test → implement → test-green loop.
-      - `plan-then-build` — plan → (human-approve gate, Phase 5) → implement →
-        test → review.
-      - `review-only` — reviewer + gate over the current diff, no implementer
-        (CI-style check; pairs with the review-only critique-loop flow).
-      Factor shared role prompts into reusable node `templates:` (Phase 2) so
-      presets compose one planner/reviewer definition. Resolution + authoring
-      already exist (`hex list`, 3-layer lookup); this is content, not mechanism.
+- [x] **Built-in preset library** (shipped 2026-07-21), roles as topology +
+      prompts (never new kinds): `implement-until-green` (Ralph: implement→test),
+      `tdd` (spec→implement→test), `plan-build-review` (plan→implement→test→
+      review), `review` (reviewer over the diff). claude implements/plans, codex
+      reviews (cross-model); `critique-loop` realigned to match. Gates run
+      `cargo test` (documented as a starting point to edit per stack). Prompts
+      inlined (no `templates:` yet — Phase 2).
+- [x] **Result-I/O handoff** (shipped 2026-07-21; a light slice of the Phase-6
+      typed node I/O): the runtime captures each agent's final message via a
+      `HEX_RESULT_FILE` sink (codex `--output-last-message`, claude json
+      `.result`), stored as `NodeResult`; a downstream prompt references it as
+      `{{node.result}}`, interpolated at attempt-start and wrapped as untrusted.
+      An agent that finishes cleanly without emitting gets a synthesized reserved
+      `done` signal (implicit completion); >1-outcome nodes still `hex emit`.
+      Full typed inputs/outputs (`schemars`, `{{node.output}}` typed fields,
+      per-node dataflow contracts) remain Phase 6.
 
 ## Phase 4 — interactive sessions & MCP transport
 

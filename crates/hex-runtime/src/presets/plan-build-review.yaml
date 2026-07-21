@@ -1,0 +1,90 @@
+version: 1
+name: plan-build-review
+
+# The full pipeline: plan → implement → test → review. The planner's result is
+# handed to the implementer and reviewer as {{plan.result}}; a different model
+# (codex) reviews than wrote the code (claude). Passes only when the tests pass
+# AND the reviewer approves. plan/implement finish without emitting (implicit
+# `done`); review emits its verdict.
+# Run it with:  hex run plan-build-review -p "…"
+#
+# The gate runs `cargo test`; copy to .hex/graphs/ and edit it for your stack.
+
+defaults:
+  worker: claude
+  context: fresh
+  budget:
+    attempts: 16
+    elapsed: 45m
+
+entry: plan
+
+nodes:
+  plan:
+    agent:
+      prompt: |
+        Produce a short, concrete implementation plan for this task.
+
+        Task: {{prompt}}
+
+        Decompose it into a few ordered steps naming the files/functions to
+        change and how you will verify it. Keep it tight — one bounded change,
+        no scope creep. Put the plan in your final message. Finish when done.
+    on:
+      done: implement
+
+  implement:
+    agent:
+      prompt: |
+        Implement the task by following the plan.
+
+        Task: {{prompt}}
+
+        Plan to follow:
+        {{plan.result}}
+
+        If a reviewer sent it back, address this feedback (empty on the first
+        pass):
+        {{review.result}}
+
+        Make the smallest change that satisfies the plan and keeps the test
+        suite passing. Run `cargo test` yourself to check. Finish when done.
+    on:
+      done: test
+
+  test:
+    gate:
+      run: [cargo, test]
+    on:
+      passed: review
+      failed: implement
+
+  review:
+    agent:
+      worker: codex
+      read_only: true
+      prompt: |
+        Review the change that was just implemented.
+
+        Task: {{prompt}}
+
+        The plan it was meant to follow:
+        {{plan.result}}
+
+        Run `git diff` to see the change. Judge correctness, scope, and quality
+        against the task and plan — review only, do not edit files. If it is
+        acceptable, run:
+          hex emit approved
+        Otherwise put concrete, actionable feedback in your final message (it is
+        handed back to the implementer) and run:
+          hex emit changes_requested
+      may_propose: [approved, changes_requested]
+    on:
+      approved: done
+      changes_requested: implement
+
+  done:
+    terminal: succeeded
+
+accept:
+  require: [test.passed, review.approved]

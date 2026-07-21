@@ -68,6 +68,11 @@ pub enum NodeSpec {
         may_propose: Vec<String>,
         /// Context policy.
         context: Context,
+        /// Whether the agent should not modify the workspace (a reviewer).
+        /// Advisory only: workers cannot enforce a hard read-only sandbox
+        /// without also blocking the `hex emit` control channel, so this is
+        /// conveyed via the node's prompt, not an OS boundary (see the worker).
+        read_only: bool,
     },
     /// Run a deterministic validator; produces `passed`/`failed`.
     Gate {
@@ -229,6 +234,7 @@ impl Builder {
                 prompt: prompt.to_owned(),
                 may_propose: may_propose.iter().map(|s| (*s).to_owned()).collect(),
                 context: Context::Fresh,
+                read_only: false,
             },
         );
         self

@@ -670,6 +670,7 @@ version = "0.0.0"
 dependencies = [
  "hex-kernel",
  "hex-proto",
+ "serde_json",
 ]
 
 [[package]]

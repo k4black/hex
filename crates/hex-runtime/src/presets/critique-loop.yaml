@@ -1,13 +1,14 @@
 version: 1
 name: critique-loop
 
-# The flagship built-in: codex implements, claude critiques, a gate proves it,
-# and the loop repeats until the change is approved AND the tests pass.
+# The flagship built-in: claude implements, codex critiques (a different model
+# reviews than wrote the code), a gate proves it, and the loop repeats until the
+# change is approved AND the tests pass.
 # Run it with:  hex run critique-loop -p "…"   (or -f prompt.md)
 # `{{prompt}}` below is filled with the operator's prompt.
 
 defaults:
-  worker: codex
+  worker: claude
   context: fresh
   budget:
     attempts: 12
@@ -18,11 +19,15 @@ entry: implement
 nodes:
   implement:
     agent:
-      worker: codex
+      worker: claude
       prompt: |
         You are making a focused change in this repository.
 
         Task: {{prompt}}
+
+        If a reviewer sent it back, address this feedback (empty on the first
+        pass):
+        {{review.result}}
 
         Implement the smallest change that satisfies the task. When you are
         done, run:  hex emit ready_for_review
@@ -32,13 +37,15 @@ nodes:
 
   review:
     agent:
-      worker: claude
+      worker: codex
       prompt: |
         Review the current working-tree changes against this prompt: {{prompt}}
 
-        Judge correctness, scope, and quality. If the change is acceptable run:
+        Judge correctness, scope, and quality — review only, do not edit files.
+        If the change is acceptable, run:
           hex emit approved
-        Otherwise leave concrete feedback in the working tree and run:
+        Otherwise put concrete, actionable feedback in your final message (it is
+        handed back to the implementer) and run:
           hex emit changes_requested
       may_propose: [approved, changes_requested]
     on:

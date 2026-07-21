@@ -83,6 +83,9 @@ enum Command {
         /// Read the operator prompt from a file instead of `--prompt`
         #[arg(short, long, value_name = "PATH", conflicts_with = "prompt")]
         file: Option<String>,
+        /// Name this run (used in the run id; else <workflow>-<short-uuid>)
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
     },
     /// Resume the SAME run from its journal (after a pause or crash)
     Resume {
@@ -99,13 +102,16 @@ enum Command {
         /// Run id, as printed by `hex run`
         run_id: String,
     },
-    /// Show per-attempt agent stdout/stderr for a run
+    /// Show each attempt's final message (`--full` for full stdout/stderr)
     Logs {
         /// Run id, as printed by `hex run`
         run_id: String,
         /// Show only this node's attempts
         #[arg(long, value_name = "NODE")]
         node: Option<String>,
+        /// Show full captured stdout/stderr, not just each attempt's final message
+        #[arg(long)]
+        full: bool,
     },
     /// Cancel a run (records a terminal cancellation event)
     Cancel {
@@ -153,11 +159,19 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             graph,
             prompt,
             file,
-        } => cmd_run(graph.as_deref(), &prompt, &file, json, no_preview),
+            name,
+        } => cmd_run(
+            graph.as_deref(),
+            &prompt,
+            &file,
+            name.as_deref(),
+            json,
+            no_preview,
+        ),
         Command::Resume { run_id } => cmd_resume(&run_id, json, no_preview),
         Command::Status { run_id } => cmd_status(&run_id, json),
         Command::Watch { run_id } => cmd_watch(&run_id, json),
-        Command::Logs { run_id, node } => cmd_logs(&run_id, node.as_deref(), json),
+        Command::Logs { run_id, node, full } => cmd_logs(&run_id, node.as_deref(), full, json),
         Command::Cancel { run_id } => cmd_cancel(&run_id, json),
         Command::Emit { event } => cmd_emit(&event),
     }
@@ -280,6 +294,7 @@ fn cmd_run(
     reference: Option<&str>,
     prompt: &Option<String>,
     file: &Option<String>,
+    name: Option<&str>,
     json: bool,
     no_preview: bool,
 ) -> Result<ExitCode, String> {
@@ -291,7 +306,7 @@ fn cmd_run(
     };
     let prompt = resolve_prompt(prompt, file)?;
     let report = runtime
-        .start(reference, prompt.as_deref())
+        .start(reference, prompt.as_deref(), name)
         .map_err(|e| e.to_string())?;
     if json {
         let v = serde_json::json!({
@@ -363,7 +378,7 @@ fn cmd_watch(run_id: &str, json: bool) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_logs(run_id: &str, node: Option<&str>, json: bool) -> Result<ExitCode, String> {
+fn cmd_logs(run_id: &str, node: Option<&str>, full: bool, json: bool) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     let logs = runtime.logs(run_id).map_err(|e| e.to_string())?;
     let logs: Vec<_> = logs
@@ -379,6 +394,7 @@ fn cmd_logs(run_id: &str, node: Option<&str>, json: bool) -> Result<ExitCode, St
                     "attempt_id": l.attempt_id,
                     "node_id": l.node_id,
                     "worker": l.worker,
+                    "result": l.result,
                     "stdout": l.stdout,
                     "stderr": l.stderr,
                 })
@@ -395,17 +411,38 @@ fn cmd_logs(run_id: &str, node: Option<&str>, json: bool) -> Result<ExitCode, St
             .as_deref()
             .map_or(String::new(), |w| format!(" via {w}"));
         println!("── {} [{node}]{via} ──", l.attempt_id);
-        if !l.stdout.trim().is_empty() {
-            print!("{}", l.stdout);
-            if !l.stdout.ends_with('\n') {
-                println!();
+        let out_tty = std::io::stdout().is_terminal();
+        let err_tty = std::io::stderr().is_terminal();
+        if full {
+            // Full captured output, dimmed. Each stream is colored by its OWN
+            // TTY, so redirecting one doesn't leak ANSI into the other.
+            if !l.stdout.trim().is_empty() {
+                print!("{}", grey(&l.stdout, out_tty));
+                if !l.stdout.ends_with('\n') {
+                    println!();
+                }
             }
-        }
-        if !l.stderr.trim().is_empty() {
-            eprint!("{}", l.stderr);
+            if !l.stderr.trim().is_empty() {
+                eprint!("{}", grey(&l.stderr, err_tty));
+            }
+        } else {
+            // Default: just the attempt's final message, dimmed (on stdout).
+            match &l.result {
+                Some(text) => println!("{}", grey(text, out_tty)),
+                None => println!("{}", grey("(no final message captured)", out_tty)),
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Dim `s` to grey when its target stream `is_tty` (and NO_COLOR is unset).
+fn grey(s: &str, is_tty: bool) -> String {
+    if is_tty && std::env::var_os("NO_COLOR").is_none() {
+        format!("\x1b[90m{s}\x1b[0m")
+    } else {
+        s.to_owned()
+    }
 }
 
 fn cmd_cancel(run_id: &str, json: bool) -> Result<ExitCode, String> {
@@ -486,6 +523,7 @@ fn event_summary(body: &hex_runtime::EventBody) -> String {
         }
         B::AttemptInterrupted => "attempt_interrupted".to_owned(),
         B::Signal { name } => format!("signal {name}"),
+        B::NodeResult { text } => format!("result ({} chars)", text.chars().count()),
         B::AttemptFailed {
             reason,
             disposition,
@@ -515,6 +553,7 @@ mod tests {
             graph,
             prompt,
             file,
+            ..
         }) = cli.command
         else {
             panic!("expected run command");
@@ -582,14 +621,15 @@ mod tests {
     }
 
     #[test]
-    fn logs_node_filter_parses() {
-        let cli = parse(&["logs", "run_1", "--node", "build", "--json"]).unwrap();
+    fn logs_flags_parse() {
+        let cli = parse(&["logs", "run_1", "--node", "build", "--full", "--json"]).unwrap();
         assert!(cli.json);
-        let Some(Command::Logs { run_id, node }) = cli.command else {
+        let Some(Command::Logs { run_id, node, full }) = cli.command else {
             panic!("expected logs command");
         };
         assert_eq!(run_id, "run_1");
         assert_eq!(node.as_deref(), Some("build"));
+        assert!(full);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use hex_proto::{Actor, Disposition, EventBody};
 use hex_runtime::config::Config;
 use hex_runtime::journal::Journal;
 use hex_runtime::{Runtime, Status, Workers};
-use hex_worker::MockWorker;
+use hex_worker::{CommandWorker, MockWorker, ResultCapture};
 
 /// A critique loop whose agents are the `mock` worker and whose gate is `true`.
 const GRAPH: &str = r#"
@@ -56,6 +56,85 @@ fn recorded_prompt() -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     m.insert("prompt".to_owned(), "the thing".to_owned());
     m
+}
+
+/// A two-node handoff graph: `plan` finishes with no emit (implicit `done`) and
+/// captures a result; `build` references it via `{{plan.result}}`.
+const HANDOFF_GRAPH: &str = r#"
+version: 1
+name: handoff
+entry: plan
+defaults: { budget: { attempts: 4 } }
+nodes:
+  plan:
+    agent: { worker: planner, prompt: "make a plan" }
+    on: { done: build }
+  build:
+    agent: { worker: builder, prompt: "build using {{plan.result}}", may_propose: [ready] }
+    on: { ready: done }
+  done:
+    terminal: succeeded
+accept: { require: [] }
+"#;
+
+#[test]
+fn node_result_is_captured_and_handed_to_the_downstream_prompt() {
+    let root = temp_root("handoff");
+    let dir = root.join(".hex").join("graphs");
+    std::fs::create_dir_all(&dir).expect("mkdir graphs");
+    std::fs::write(dir.join("handoff.yaml"), HANDOFF_GRAPH).expect("write graph");
+
+    // planner: writes a result to $HEX_RESULT_FILE and emits nothing (implicit
+    // completion). builder: has no {prompt} in argv, so its (interpolated)
+    // prompt is piped to stdin — capture it to a file to inspect the handoff.
+    let mut workers = Workers::new();
+    workers.insert(
+        "planner",
+        Box::new(
+            CommandWorker::new(
+                "planner",
+                sh("printf 'STEP-ONE-DID-X' > \"$HEX_RESULT_FILE\""),
+            )
+            .with_result_capture(Some(ResultCapture::File)),
+        ),
+    );
+    workers.insert(
+        "builder",
+        Box::new(CommandWorker::new(
+            "builder",
+            sh("cat > got-prompt.txt; printf ready > \"$HEX_EMIT_FILE\""),
+        )),
+    );
+    let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers);
+    let report = runtime.start("handoff", None, None).expect("run");
+    assert_eq!(
+        report.disposition,
+        Disposition::Succeeded,
+        "run reaches done"
+    );
+
+    // The builder's prompt contains the planner's captured result, wrapped as
+    // untrusted data — proving capture + implicit completion + interpolation.
+    let got = std::fs::read_to_string(root.join("got-prompt.txt")).expect("builder prompt");
+    assert!(
+        got.contains("STEP-ONE-DID-X"),
+        "plan result handed to builder: {got}"
+    );
+    assert!(
+        got.contains("untrusted"),
+        "result is wrapped as untrusted: {got}"
+    );
+
+    // The result is also in the journal as a NodeResult for `plan`.
+    let events = runtime.events(&report.run_id).expect("events");
+    assert!(events.iter().any(|e| matches!(
+        &e.body,
+        EventBody::NodeResult { text } if text == "STEP-ONE-DID-X"
+    )));
+}
+
+fn sh(script: &str) -> Vec<String> {
+    vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()]
 }
 
 /// A `ProgressSink` that records the driver's calls so a test can assert the
@@ -121,7 +200,7 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers)
         .with_progress(Box::new(rec.clone()));
     let report = runtime
-        .start("test-critique", Some("the thing"))
+        .start("test-critique", Some("the thing"), None)
         .expect("run");
     assert_eq!(report.disposition, Disposition::Succeeded);
 
@@ -213,7 +292,9 @@ fn progress_sink_pairs_start_and_finish_even_when_an_attempt_fails() {
     let rec = Recorder::default();
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers)
         .with_progress(Box::new(rec.clone()));
-    let report = runtime.start("test-critique", Some("x")).expect("run");
+    let report = runtime
+        .start("test-critique", Some("x"), None)
+        .expect("run");
     assert_eq!(report.disposition, Disposition::Failed);
 
     let log = rec.log.lock().unwrap();
@@ -260,7 +341,7 @@ fn progress_sink_finishes_even_when_the_worker_panics() {
     // backtrace to the test log; we deliberately don't touch the process-global
     // panic hook, which would race with other tests running in parallel.)
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.start("test-critique", Some("x"))
+        runtime.start("test-critique", Some("x"), None)
     }));
     assert!(
         outcome.is_err(),
@@ -295,7 +376,7 @@ fn critique_loop_runs_to_success() {
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers);
 
     let report = runtime
-        .start("test-critique", Some("the thing"))
+        .start("test-critique", Some("the thing"), None)
         .expect("run");
     assert_eq!(report.disposition, Disposition::Succeeded);
 
@@ -330,7 +411,7 @@ fn budget_exhaustion_fails_closed() {
     let runtime = Runtime::with_workers(root, Config::builtin(), workers);
 
     let report = runtime
-        .start("test-critique", Some("the thing"))
+        .start("test-critique", Some("the thing"), None)
         .expect("run");
     assert_eq!(report.disposition, Disposition::BudgetExhausted);
 }
@@ -626,7 +707,7 @@ accept:
     workers.insert("mock", Box::new(mock));
     let runtime = Runtime::with_workers(root, Config::builtin(), workers);
 
-    let report = runtime.start("timeout", None).expect("run");
+    let report = runtime.start("timeout", None, None).expect("run");
     assert_eq!(report.disposition, Disposition::TimedOut);
     // The disposition is backed by a single durable terminal event: a
     // disposition-bearing AttemptFailed (no separate RunFinished / crash window).

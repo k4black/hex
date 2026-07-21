@@ -167,6 +167,13 @@ pub enum EventBody {
         /// The event name edges match on.
         name: String,
     },
+    /// An attempt's captured final result text (an agent's last message). Not a
+    /// routing token — it carries the node's output so a downstream node can
+    /// reference it as `{{<node>.result}}`. Recorded before the routing signal.
+    NodeResult {
+        /// The captured result text (treated as untrusted data downstream).
+        text: String,
+    },
     /// An attempt failed to execute (worker crashed, timed out, emitted nothing
     /// valid). This is a *terminal* event: it carries the run's resulting
     /// disposition so a failure is one atomic durable fact — there is no window

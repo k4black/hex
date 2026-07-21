@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use hex_proto::{Disposition, Event, EventBody};
 
 pub mod graph;
+pub mod template;
 pub mod validate;
 
 pub use graph::{Budget, Context, Edge, Graph, Node, NodeKind, NodeSpec, Requirement};
@@ -66,6 +67,9 @@ pub struct RunState {
     pub visits: BTreeMap<String, u32>,
     /// The last routing signal each node produced (drives acceptance).
     pub signals: BTreeMap<String, String>,
+    /// The last captured result text each node produced, for `{{node.result}}`
+    /// handoff into a downstream node's prompt.
+    pub results: BTreeMap<String, String>,
     /// When scheduling started (Unix epoch ms), for elapsed budgets.
     pub started_at_ms: u64,
 }
@@ -167,6 +171,12 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             }
             state.attempts_total += 1;
             state.current_attempt = event.attempt_id.clone();
+            // A fresh attempt starts with no result: clear any prior one for this
+            // node so a re-visit that captures nothing can't hand downstream the
+            // previous attempt's stale text.
+            if let Some(cur) = &state.current {
+                state.results.remove(cur);
+            }
         }
         EventBody::AttemptInterrupted => {
             // Orphaned attempt: clear the in-flight attempt so the same node is
@@ -176,6 +186,11 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
                 return state;
             }
             state.current_attempt = None;
+            // Drop any result the interrupted attempt captured before crashing,
+            // so a re-attempt that produces none can't hand downstream stale text.
+            if let Some(cur) = &state.current {
+                state.results.remove(cur);
+            }
         }
         EventBody::Signal { name } => {
             // Only a signal correlated to the in-flight attempt advances the
@@ -215,6 +230,16 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
                 _ => Disposition::Failed,
             };
             state.status = Status::Finished(disposition);
+        }
+        EventBody::NodeResult { text } => {
+            // Recorded while the attempt is still in flight (before its signal),
+            // so it must correlate to the current attempt like other outcomes.
+            if !correlated(&state, event) {
+                return state;
+            }
+            if let Some(cur) = state.current.clone() {
+                state.results.insert(cur, text.clone());
+            }
         }
         EventBody::RunFinished { disposition } => {
             state.status = Status::Finished(*disposition);

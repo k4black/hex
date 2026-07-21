@@ -2,9 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use hex_worker::{AgentWorker, Worker};
+use hex_worker::{ClaudeWorker, CodexWorker, CommandWorker, OpencodeWorker, Worker};
 
-use crate::config::Config;
+use crate::config::{Config, WorkerKind};
 
 /// A name → worker-adapter registry. Built from config for real runs, or
 /// populated with mocks in tests.
@@ -42,10 +42,17 @@ impl Workers {
     pub fn from_config(config: &Config) -> Self {
         let mut workers = Self::new();
         for (name, spec) in &config.workers {
-            workers.insert(
-                name.clone(),
-                Box::new(AgentWorker::new(name.clone(), spec.command.clone())),
-            );
+            let model = spec.model.clone();
+            let worker: Box<dyn Worker> = match spec.kind {
+                WorkerKind::Codex => Box::new(CodexWorker::new(model)),
+                WorkerKind::Claude => Box::new(ClaudeWorker::new(model)),
+                WorkerKind::Opencode => Box::new(OpencodeWorker::new(model)),
+                WorkerKind::Command => Box::new(
+                    CommandWorker::new(name.clone(), spec.command.clone())
+                        .with_result_capture(spec.result.map(Into::into)),
+                ),
+            };
+            workers.insert(name.clone(), worker);
         }
         workers
     }

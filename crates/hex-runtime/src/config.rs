@@ -23,13 +23,62 @@ pub struct Config {
     pub defaults: DefaultsSpec,
 }
 
-/// How to invoke one external agent CLI.
+/// One entry in the worker registry. A typed `kind` (`codex`/`claude`/
+/// `opencode`) selects a built-in adapter that encapsulates that agent's argv,
+/// output parsing, and permission policy — config only overrides its `model`.
+/// The default `command` kind is the generic escape hatch: an explicit argv
+/// template (`{prompt}`/`{result}` tokens) plus how to capture its result.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkerSpec {
-    /// Argv template, executed directly (never a shell string). A `{prompt}`
-    /// token is replaced with the node's prompt; without one, the prompt is
-    /// piped to stdin.
+    /// Which adapter drives this worker.
+    #[serde(default)]
+    pub kind: WorkerKind,
+    /// Model override for a typed kind (e.g. `gpt-5`, `claude-...`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Argv template for `kind: command` (executed directly, never a shell).
+    #[serde(default)]
     pub command: Vec<String>,
+    /// Result capture for `kind: command` (typed kinds set their own).
+    #[serde(default)]
+    pub result: Option<ResultKind>,
+}
+
+/// Which adapter a worker uses.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerKind {
+    /// Generic argv template (default) — see [`WorkerSpec::command`].
+    #[default]
+    Command,
+    /// OpenAI Codex (`codex exec`).
+    Codex,
+    /// Claude Code headless (`claude -p`).
+    Claude,
+    /// opencode (`opencode run`).
+    Opencode,
+}
+
+/// Result-capture strategy in config form (maps to `hex_worker::ResultCapture`).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultKind {
+    /// The worker wrote its final message to the `{result}` file.
+    File,
+    /// stdout is a single JSON object; take `.result` (honoring `.is_error`).
+    JsonResult,
+    /// stdout is JSONL; take the last `type == "text"` line's `part.text`.
+    JsonlLastText,
+}
+
+impl From<ResultKind> for hex_worker::ResultCapture {
+    fn from(kind: ResultKind) -> Self {
+        match kind {
+            ResultKind::File => Self::File,
+            ResultKind::JsonResult => Self::JsonResult,
+            ResultKind::JsonlLastText => Self::JsonlLastText,
+        }
+    }
 }
 
 /// Global fallback defaults.
@@ -65,19 +114,16 @@ impl Config {
     /// Built-in registry so a fresh checkout can run `critique-loop`.
     #[must_use]
     pub fn builtin() -> Self {
+        let typed = |kind| WorkerSpec {
+            kind,
+            model: None,
+            command: Vec::new(),
+            result: None,
+        };
         let mut workers = BTreeMap::new();
-        workers.insert(
-            "codex".to_owned(),
-            WorkerSpec {
-                command: vec!["codex".to_owned(), "exec".to_owned(), "{prompt}".to_owned()],
-            },
-        );
-        workers.insert(
-            "claude".to_owned(),
-            WorkerSpec {
-                command: vec!["claude".to_owned(), "-p".to_owned(), "{prompt}".to_owned()],
-            },
-        );
+        workers.insert("codex".to_owned(), typed(WorkerKind::Codex));
+        workers.insert("claude".to_owned(), typed(WorkerKind::Claude));
+        workers.insert("opencode".to_owned(), typed(WorkerKind::Opencode));
         Self {
             workers,
             defaults: DefaultsSpec {
@@ -134,10 +180,14 @@ mod tests {
         over.workers.insert(
             "codex".to_owned(),
             WorkerSpec {
+                kind: WorkerKind::Command,
+                model: None,
                 command: vec!["my-codex".to_owned()],
+                result: None,
             },
         );
         base.merge(over);
+        assert_eq!(base.workers["codex"].kind, WorkerKind::Command);
         assert_eq!(base.workers["codex"].command, vec!["my-codex".to_owned()]);
         // Untouched entries survive.
         assert!(base.workers.contains_key("claude"));

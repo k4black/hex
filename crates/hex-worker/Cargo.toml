@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 hex-proto = { workspace = true }
 hex-kernel = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

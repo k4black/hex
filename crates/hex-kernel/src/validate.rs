@@ -73,6 +73,7 @@ pub fn validate(graph: &Graph) -> Result<(), Vec<Issue>> {
     check_routing(graph, &mut issues);
     check_signal_names(graph, &mut issues);
     check_acceptance(graph, &mut issues);
+    check_result_refs(graph, &mut issues);
 
     // Unbounded cycles are an error, not a warning.
     if has_cycle(graph) && !graph.budget.bounds_cycles() {
@@ -122,6 +123,14 @@ fn check_routing(graph: &Graph, issues: &mut Vec<Issue>) {
         match &node.spec {
             NodeSpec::Agent { may_propose, .. } => {
                 let proposable: BTreeSet<&str> = may_propose.iter().map(String::as_str).collect();
+                // `done` is reserved for runtime-synthesized implicit completion;
+                // an agent must not list it as something it proposes.
+                if proposable.contains(DONE_SIGNAL) {
+                    issues.push(Issue::new(
+                        "E-done-reserved",
+                        format!("agent `{}` lists reserved `done` in may_propose", node.id),
+                    ));
+                }
                 // Every proposable event must have an edge...
                 for sig in &proposable {
                     if !edge_signals.contains(sig) {
@@ -134,9 +143,11 @@ fn check_routing(graph: &Graph, issues: &mut Vec<Issue>) {
                         ));
                     }
                 }
-                // ...and every outgoing edge must be proposable.
+                // ...and every outgoing edge must be proposable — except the
+                // reserved `done`, synthesized by the runtime when an agent
+                // completes cleanly without emitting (implicit completion).
                 for sig in &edge_signals {
-                    if !proposable.contains(sig) {
+                    if *sig != DONE_SIGNAL && !proposable.contains(sig) {
                         issues.push(Issue::new(
                             "E-edge-not-proposable",
                             format!(
@@ -173,6 +184,61 @@ fn check_routing(graph: &Graph, issues: &mut Vec<Issue>) {
     }
 }
 
+/// The reserved routing signal the runtime synthesizes when an agent finishes
+/// cleanly without emitting (implicit completion). Not agent-proposable.
+pub const DONE_SIGNAL: &str = "done";
+
+/// Validate the template tokens in agent/human prompts: every `{{…}}` must be
+/// terminated, and every `{{<node>.result}}` must name a real *agent* node (only
+/// agents produce a result), so a downstream handoff can't silently interpolate
+/// to nothing or to an unresolved token.
+fn check_result_refs(graph: &Graph, issues: &mut Vec<Issue>) {
+    for node in graph.nodes.values() {
+        let prompt = match &node.spec {
+            NodeSpec::Agent { prompt, .. } | NodeSpec::Human { prompt } => prompt.as_str(),
+            _ => continue,
+        };
+        // Drive the shared template grammar (so validation and the runtime's
+        // interpolation can never disagree on what a token is).
+        for token in crate::template::tokens(prompt) {
+            let reff = match token {
+                crate::template::Token::Result(reff) => reff,
+                crate::template::Token::Unterminated(_) => {
+                    issues.push(Issue::new(
+                        "E-result-ref",
+                        format!(
+                            "node `{}` has an unterminated `{{{{` template token",
+                            node.id
+                        ),
+                    ));
+                    continue;
+                }
+                _ => continue, // text or `{{prompt}}` — not a result ref
+            };
+            match graph.nodes.get(reff) {
+                None => issues.push(Issue::new(
+                    "E-result-ref",
+                    format!(
+                        "node `{}` references `{{{{{reff}.result}}}}` but no node `{reff}` exists",
+                        node.id
+                    ),
+                )),
+                // Only agents capture a result; a gate/command/terminal/human
+                // reference would always interpolate to nothing.
+                Some(n) if n.spec.kind() != NodeKind::Agent => issues.push(Issue::new(
+                    "E-result-ref",
+                    format!(
+                        "node `{}` references `{{{{{reff}.result}}}}` but `{reff}` is a {} (only agents produce a result)",
+                        node.id,
+                        n.spec.kind().as_str()
+                    ),
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+}
+
 fn check_acceptance(graph: &Graph, issues: &mut Vec<Issue>) {
     for req in &graph.accept {
         let Some(node) = graph.nodes.get(&req.node) else {
@@ -185,7 +251,12 @@ fn check_acceptance(graph: &Graph, issues: &mut Vec<Issue>) {
         // The required signal must actually be producible by that node, or the
         // contract can never be satisfied and the run can never succeed.
         let producible = match &node.spec {
-            NodeSpec::Agent { may_propose, .. } => may_propose.iter().any(|s| s == &req.signal),
+            // An agent produces its `may_propose` signals, plus the synthesized
+            // `done` when it has a `done` edge (implicit completion).
+            NodeSpec::Agent { may_propose, .. } => {
+                may_propose.iter().any(|s| s == &req.signal)
+                    || (req.signal == DONE_SIGNAL && graph.route(&req.node, DONE_SIGNAL).is_some())
+            }
             NodeSpec::Gate { .. } | NodeSpec::Command { .. } => {
                 req.signal == "passed" || req.signal == "failed"
             }
@@ -248,6 +319,8 @@ pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<(), Issue> {
     // The projected current node (by routing) and the in-flight attempt.
     let mut current: Option<&str> = None;
     let mut active: Option<(&str, &str)> = None;
+    // Whether the in-flight attempt has already recorded its (single) result.
+    let mut result_seen = false;
 
     for (i, e) in events.iter().enumerate() {
         if e.schema_version != PROTOCOL_VERSION {
@@ -287,6 +360,7 @@ pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<(), Issue> {
                             return Err(bad(i, "attempt_started does not target the current node"));
                         }
                         active = Some((n, a));
+                        result_seen = false;
                     }
                     _ => return Err(bad(i, "attempt_started missing node/attempt id")),
                 }
@@ -330,6 +404,23 @@ pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<(), Issue> {
                     return Err(bad(i, "run_finished while an attempt is still in flight"));
                 }
                 phase = Phase::Finished;
+            }
+            // NodeResult rides inside an in-flight attempt (before its signal).
+            // Only an *agent* attempt produces a result, and at most one per
+            // attempt — so a stray/forged/duplicate record can't slip through
+            // and later surface as a bogus final message.
+            EventBody::NodeResult { .. } => {
+                if !attempt_matches(active, e) {
+                    return Err(bad(i, "node_result does not match the in-flight attempt"));
+                }
+                let node = active.and_then(|(n, _)| graph.nodes.get(n));
+                if node.map(|n| n.spec.kind()) != Some(NodeKind::Agent) {
+                    return Err(bad(i, "node_result on a non-agent attempt"));
+                }
+                if result_seen {
+                    return Err(bad(i, "more than one node_result for one attempt"));
+                }
+                result_seen = true;
             }
             EventBody::BudgetExhausted { .. } | EventBody::Note { .. } => {}
         }
@@ -554,6 +645,80 @@ mod tests {
     }
 
     #[test]
+    fn check_journal_accepts_one_node_result_on_an_agent_attempt() {
+        let g = cyclic(Budget {
+            attempts: Some(8),
+            ..Budget::default()
+        });
+        let mut events = started_journal();
+        events.push(ev(
+            3,
+            Some("implement"),
+            Some("att_1"),
+            EventBody::NodeResult {
+                text: "did it".to_owned(),
+            },
+        ));
+        assert!(check_journal(&g, &events).is_ok());
+    }
+
+    #[test]
+    fn check_journal_rejects_two_node_results_for_one_attempt() {
+        let g = cyclic(Budget {
+            attempts: Some(8),
+            ..Budget::default()
+        });
+        let mut events = started_journal();
+        for seq in 3..=4 {
+            events.push(ev(
+                seq,
+                Some("implement"),
+                Some("att_1"),
+                EventBody::NodeResult {
+                    text: "dup".to_owned(),
+                },
+            ));
+        }
+        assert!(check_journal(&g, &events).is_err());
+    }
+
+    #[test]
+    fn check_journal_rejects_node_result_on_a_gate_attempt() {
+        let g = cyclic(Budget {
+            attempts: Some(8),
+            ..Budget::default()
+        });
+        let mut events = started_journal();
+        // Route implement → test (a gate), start its attempt, then forge a result.
+        events.push(ev(
+            3,
+            Some("implement"),
+            Some("att_1"),
+            EventBody::Signal {
+                name: "ready".to_owned(),
+            },
+        ));
+        events.push(ev(
+            4,
+            Some("test"),
+            Some("att_2"),
+            EventBody::AttemptStarted {
+                idempotency_key: "k2".to_owned(),
+                worker: None,
+            },
+        ));
+        events.push(ev(
+            5,
+            Some("test"),
+            Some("att_2"),
+            EventBody::NodeResult {
+                text: "gates don't produce results".to_owned(),
+            },
+        ));
+        assert!(check_journal(&g, &events).is_err());
+    }
+
+    #[test]
     fn unsatisfiable_acceptance_is_rejected() {
         // Require a signal the referenced node can never emit.
         let g = Graph::builder("t", "a")
@@ -583,6 +748,119 @@ mod tests {
             .build();
         let issues = validate(&g).unwrap_err();
         assert!(issues.iter().any(|i| i.code == "E-bad-signal-name"));
+    }
+
+    #[test]
+    fn agent_with_done_edge_and_no_proposals_is_valid() {
+        // Implicit completion: an agent that emits nothing routes the reserved
+        // `done`, which needs no may_propose entry.
+        let g = Graph::builder("t", "implement")
+            .agent("implement", "w", "do it", &[])
+            .gate("test", &["true"])
+            .terminal("done", Disposition::Succeeded)
+            .edge("implement", "done", "test")
+            .edge("test", "passed", "done")
+            .edge("test", "failed", "implement")
+            .budget(Budget {
+                attempts: Some(4),
+                ..Budget::default()
+            })
+            .require("test", "passed")
+            .build();
+        assert!(validate(&g).is_ok(), "{:?}", validate(&g));
+    }
+
+    #[test]
+    fn unknown_result_reference_is_rejected() {
+        let g = Graph::builder("t", "a")
+            .agent("a", "w", "use {{ghost.result}}", &["go"])
+            .terminal("done", Disposition::Succeeded)
+            .edge("a", "go", "done")
+            .budget(Budget {
+                attempts: Some(2),
+                ..Budget::default()
+            })
+            .build();
+        let issues = validate(&g).unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.code == "E-result-ref"),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn result_reference_to_a_non_agent_is_rejected() {
+        // A gate produces `passed`/`failed`, never a captured result.
+        let g = Graph::builder("t", "a")
+            .agent("a", "w", "look at {{check.result}}", &["go"])
+            .gate("check", &["true"])
+            .terminal("done", Disposition::Succeeded)
+            .edge("a", "go", "check")
+            .edge("check", "passed", "done")
+            .edge("check", "failed", "a")
+            .budget(Budget {
+                attempts: Some(4),
+                ..Budget::default()
+            })
+            .require("check", "passed")
+            .build();
+        let issues = validate(&g).unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.code == "E-result-ref"),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn unterminated_template_token_is_rejected() {
+        let g = Graph::builder("t", "a")
+            .agent("a", "w", "look at {{ghost.result and go", &["go"])
+            .terminal("done", Disposition::Succeeded)
+            .edge("a", "go", "done")
+            .budget(Budget {
+                attempts: Some(2),
+                ..Budget::default()
+            })
+            .build();
+        let issues = validate(&g).unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.code == "E-result-ref"),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn acceptance_accepts_a_synthesized_done() {
+        // `accept.require: [a.done]` is satisfiable when `a` has a `done` edge.
+        let g = Graph::builder("t", "a")
+            .agent("a", "w", "p", &[])
+            .terminal("fin", Disposition::Succeeded)
+            .edge("a", "done", "fin")
+            .budget(Budget {
+                attempts: Some(2),
+                ..Budget::default()
+            })
+            .require("a", "done")
+            .build();
+        assert!(validate(&g).is_ok(), "{:?}", validate(&g));
+    }
+
+    #[test]
+    fn reserved_done_in_may_propose_is_rejected() {
+        let g = Graph::builder("t", "a")
+            .agent("a", "w", "p", &["done"])
+            .terminal("fin", Disposition::Succeeded)
+            .edge("a", "done", "fin")
+            .budget(Budget {
+                attempts: Some(2),
+                ..Budget::default()
+            })
+            .build();
+        let issues = validate(&g).unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.code == "E-done-reserved"),
+            "{issues:?}"
+        );
     }
 
     #[test]

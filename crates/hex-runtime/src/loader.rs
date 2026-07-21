@@ -83,6 +83,9 @@ struct RawAgent {
     may_propose: Vec<String>,
     #[serde(default)]
     context: Option<String>,
+    /// Read-only policy: the worker must not modify the workspace (a reviewer).
+    #[serde(default)]
+    read_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,17 +100,14 @@ struct RawHuman {
     prompt: String,
 }
 
-/// Compile YAML `source` into the kernel IR, interpolating the operator
-/// `prompt` into node prompts (`{{prompt}}`) and falling back to
-/// `config_defaults` where the graph omits its own.
-///
-/// The operator supplies exactly one value — the prompt (`-p`/`-f`). Richer
-/// per-node typed inputs/outputs are an internal graph-dataflow concern (see
-/// TODO Phase 6), not part of this operator surface.
+/// Compile YAML `source` into the kernel IR, falling back to `config_defaults`
+/// where the graph omits its own. Node prompts keep their `{{prompt}}` and
+/// `{{node.result}}` tokens verbatim; both are interpolated at attempt-start
+/// (the operator prompt is substituted last, as opaque data).
 ///
 /// # Errors
 /// Fails on malformed YAML, an unknown node kind, or an unparseable duration.
-pub fn load(source: &str, prompt: Option<&str>, config_defaults: &DefaultsSpec) -> Result<Graph> {
+pub fn load(source: &str, config_defaults: &DefaultsSpec) -> Result<Graph> {
     let raw: RawGraph = yaml_serde::from_str(source)?;
     if raw.version != 1 {
         return Err(HexError::new(format!(
@@ -137,7 +137,6 @@ pub fn load(source: &str, prompt: Option<&str>, config_defaults: &DefaultsSpec) 
             node,
             default_worker.as_deref(),
             default_context.as_deref(),
-            prompt,
         )?;
         for (on, to) in &node.on {
             edges.push(Edge {
@@ -172,19 +171,24 @@ pub fn load(source: &str, prompt: Option<&str>, config_defaults: &DefaultsSpec) 
     })
 }
 
-/// The single interpolation token the operator prompt fills.
-const PROMPT_TOKEN: &str = "{{prompt}}";
+/// The single interpolation token the operator prompt fills. Substituted at
+/// attempt-start (in the driver), *after* `{{node.result}}` interpolation and
+/// as a plain replace, so the operator value is opaque data — never re-scanned
+/// for template tokens.
+pub(crate) const PROMPT_TOKEN: &str = "{{prompt}}";
 
 /// Whether a compiled graph still references the operator prompt — i.e. a run
 /// needs `-p`/`-f`. Only agent and human prompts support interpolation, so
 /// comments and other YAML fields must not trigger this requirement.
 #[must_use]
 pub(super) fn uses_prompt(graph: &Graph) -> bool {
-    graph.nodes.values().any(|node| match &node.spec {
-        NodeSpec::Agent { prompt, .. } | NodeSpec::Human { prompt } => {
-            prompt.contains(PROMPT_TOKEN)
-        }
-        _ => false,
+    use hex_kernel::template::{Token, tokens};
+    graph.nodes.values().any(|node| {
+        let prompt = match &node.spec {
+            NodeSpec::Agent { prompt, .. } | NodeSpec::Human { prompt } => prompt,
+            _ => return false,
+        };
+        tokens(prompt).any(|t| t == Token::Prompt)
     })
 }
 
@@ -193,7 +197,6 @@ fn compile_node(
     node: &RawNode,
     default_worker: Option<&str>,
     default_context: Option<&str>,
-    prompt: Option<&str>,
 ) -> Result<NodeSpec> {
     let declared = [
         node.agent.is_some(),
@@ -219,9 +222,12 @@ fn compile_node(
             .ok_or_else(|| HexError::new(format!("agent `{id}` has no worker and no default")))?;
         return Ok(NodeSpec::Agent {
             worker,
-            prompt: interpolate(&agent.prompt, prompt),
+            // Keep `{{prompt}}`/`{{node.result}}` tokens as-authored; both are
+            // interpolated at attempt-start.
+            prompt: agent.prompt.clone(),
             may_propose: agent.may_propose.clone(),
             context: parse_context(agent.context.as_deref().or(default_context))?,
+            read_only: agent.read_only,
         });
     }
     if let Some(gate) = &node.gate {
@@ -241,7 +247,7 @@ fn compile_node(
     }
     if let Some(human) = &node.human {
         return Ok(NodeSpec::Human {
-            prompt: interpolate(&human.prompt, prompt),
+            prompt: human.prompt.clone(),
         });
     }
     unreachable!("declared exactly one kind")
@@ -314,15 +320,6 @@ fn parse_duration_ms(raw: &str) -> Result<u64> {
     Ok(ms)
 }
 
-/// Replace the `{{prompt}}` token with the operator prompt. When no prompt is
-/// supplied (e.g. `validate`/`graph`) the token is left as-is.
-fn interpolate(template: &str, prompt: Option<&str>) -> String {
-    match prompt {
-        Some(value) => template.replace(PROMPT_TOKEN, value),
-        None => template.to_owned(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,20 +348,10 @@ mod tests {
     }
 
     #[test]
-    fn interpolates_the_prompt_into_node_prompts() {
-        let g = load(CRITIQUE, Some("fix the bug"), &no_defaults()).expect("loads");
-        let NodeSpec::Agent { prompt, .. } = &g.node("implement").unwrap().spec else {
-            panic!("implement is an agent");
-        };
-        assert!(prompt.contains("fix the bug"));
-        assert!(!prompt.contains(PROMPT_TOKEN));
-    }
-
-    #[test]
-    fn load_is_lenient_without_a_prompt() {
-        // Structural load must succeed without a prompt (for validate/graph);
-        // the token is simply left unsubstituted.
-        let g = load(CRITIQUE, None, &no_defaults()).expect("lenient load");
+    fn load_keeps_the_prompt_token_for_runtime_substitution() {
+        // The operator prompt is substituted at attempt-start, not at load, so
+        // the compiled prompt keeps `{{prompt}}` verbatim.
+        let g = load(CRITIQUE, &no_defaults()).expect("loads");
         let NodeSpec::Agent { prompt, .. } = &g.node("implement").unwrap().spec else {
             panic!("implement is an agent");
         };
@@ -373,7 +360,7 @@ mod tests {
 
     #[test]
     fn uses_prompt_detects_the_token() {
-        let graph = load(CRITIQUE, None, &no_defaults()).expect("loads");
+        let graph = load(CRITIQUE, &no_defaults()).expect("loads");
         assert!(uses_prompt(&graph));
     }
 
@@ -388,13 +375,13 @@ nodes:
   done:
     terminal: succeeded
 "#;
-        let graph = load(source, None, &no_defaults()).expect("loads");
+        let graph = load(source, &no_defaults()).expect("loads");
         assert!(!uses_prompt(&graph));
     }
 
     #[test]
     fn compiles_the_builtin_critique_loop() {
-        let g = load(CRITIQUE, Some("x"), &no_defaults()).expect("loads");
+        let g = load(CRITIQUE, &no_defaults()).expect("loads");
         assert_eq!(g.entry, "implement");
         assert_eq!(g.node("test").unwrap().spec.kind(), NodeKind::Gate);
         assert_eq!(g.budget.attempts, Some(12));
@@ -417,7 +404,7 @@ nodes:
   done:
     terminal: succeeded
 "#;
-        let err = load(src, None, &no_defaults()).unwrap_err();
+        let err = load(src, &no_defaults()).unwrap_err();
         assert!(err.to_string().contains("exactly one kind"));
     }
 }

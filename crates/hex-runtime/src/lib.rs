@@ -70,6 +70,8 @@ pub struct AttemptLog {
     pub node_id: Option<String>,
     /// The worker that ran it (agent attempts only).
     pub worker: Option<String>,
+    /// The attempt's captured final message (an agent's last message), if any.
+    pub result: Option<String>,
     /// Captured stdout.
     pub stdout: String,
     /// Captured stderr.
@@ -135,14 +137,36 @@ impl Runtime {
         Ok(self.runs_dir().join(run_id))
     }
 
-    /// Allocate a collision-resistant run id by exclusively creating its
-    /// directory (retrying on the rare clash), so two concurrent starts can
-    /// never select the same directory and truncate each other.
-    fn new_run(&self) -> Result<(String, PathBuf)> {
+    /// Allocate a readable, collision-resistant run id by exclusively creating
+    /// its directory. Ids read `yyyy-MM-dd-<session>` when the operator names the
+    /// run, else `yyyy-MM-dd-<workflow>-<short-uuid>`; a same-day clash gets a
+    /// `-2`, `-3`, … suffix. Exclusive `create_dir` means two concurrent starts
+    /// can never select the same directory and truncate each other.
+    fn new_run(&self, workflow: &str, session: Option<&str>) -> Result<(String, PathBuf)> {
         let runs = self.runs_dir();
         std::fs::create_dir_all(&runs)?;
-        for _ in 0..1000 {
-            let id = format!("run_{}_{}", journal::now_ms(), random_suffix());
+        let date = today_utc();
+        let base = match session {
+            Some(name) => {
+                let s = slug(name);
+                if s.is_empty() {
+                    return Err(HexError::new(format!(
+                        "run name `{name}` has no usable characters"
+                    )));
+                }
+                format!("{date}-{s}")
+            }
+            None => match slug(workflow) {
+                w if w.is_empty() => format!("{date}-{}", random_suffix()),
+                w => format!("{date}-{w}-{}", short_uuid()),
+            },
+        };
+        for n in 1..=10_000u32 {
+            let id = if n == 1 {
+                base.clone()
+            } else {
+                format!("{base}-{n}")
+            };
             let dir = runs.join(&id);
             match std::fs::create_dir(&dir) {
                 Ok(()) => return Ok((id, dir)),
@@ -166,25 +190,21 @@ impl Runtime {
     /// Fails on resolution, parse, or validation errors.
     pub fn validate(&self, reference: &str) -> Result<Graph> {
         let resolved = preset::resolve(reference, &self.root)?;
-        self.compile(&resolved.source, None)
+        self.compile(&resolved.source)
     }
 
     /// Compile already-resolved YAML `source` to a validated IR, using this
-    /// runtime's live config defaults.
-    fn compile(&self, source: &str, prompt: Option<&str>) -> Result<Graph> {
-        self.compile_with(source, prompt, &self.config.defaults)
+    /// runtime's live config defaults. The operator prompt is not needed here —
+    /// `{{prompt}}` is substituted at attempt-start, not at compile.
+    fn compile(&self, source: &str) -> Result<Graph> {
+        self.compile_with(source, &self.config.defaults)
     }
 
     /// Compile with an explicit set of fallback defaults — used on resume so a
     /// run recompiles against the defaults it was *created* with, not whatever
     /// the mutable config happens to say now.
-    fn compile_with(
-        &self,
-        source: &str,
-        prompt: Option<&str>,
-        defaults: &config::DefaultsSpec,
-    ) -> Result<Graph> {
-        let graph = loader::load(source, prompt, defaults)?;
+    fn compile_with(&self, source: &str, defaults: &config::DefaultsSpec) -> Result<Graph> {
+        let graph = loader::load(source, defaults)?;
         hex_kernel::validate(&graph).map_err(|issues| {
             let joined = issues
                 .iter()
@@ -202,7 +222,7 @@ impl Runtime {
     /// creation hash, the recorded defaults, and the journal lifecycle before
     /// folding. Taking `events` the caller already holds means one journal scan
     /// per operation (`resume`/`cancel` get them from the writer they open).
-    fn verify_and_fold(&self, run_id: &str, events: Vec<Event>) -> Result<(Graph, State)> {
+    fn verify_and_fold(&self, run_id: &str, events: &[Event]) -> Result<(Graph, State)> {
         let run_dir = self.run_dir(run_id)?;
         let source = std::fs::read_to_string(run_dir.join("graph.yaml"))
             .map_err(|_| HexError::new(format!("run `{run_id}` not found")))?;
@@ -228,7 +248,7 @@ impl Runtime {
         }
         // The run's creation record carries the hash, prompt, and defaults to
         // verify + recompile against (one pass, not three).
-        let (recorded_hash, inputs, defaults) = run_created(&events)
+        let (recorded_hash, inputs, defaults) = run_created(events)
             .ok_or_else(|| HexError::new("journal has no run_created record to verify against"))?;
         if recorded_hash != computed {
             return Err(HexError::new(
@@ -236,10 +256,11 @@ impl Runtime {
             ));
         }
 
-        // Recompile against the prompt + defaults recorded at creation
-        // (integrity-bound with the verified hash), not live config.
+        // Recompile against the defaults recorded at creation (integrity-bound
+        // with the verified hash), not live config. The prompt is verified
+        // present and re-substituted at attempt-start.
         let prompt = inputs.get("prompt").map(String::as_str);
-        let graph = self.compile_with(&source, prompt, &defaults)?;
+        let graph = self.compile_with(&source, &defaults)?;
         if prompt.is_none() && loader::uses_prompt(&graph) {
             return Err(HexError::new(
                 "run_created is missing the prompt required by graph.yaml",
@@ -247,11 +268,11 @@ impl Runtime {
         }
 
         // Fail closed on a malformed lifecycle before folding it into state.
-        hex_kernel::check_journal(&graph, &events)
+        hex_kernel::check_journal(&graph, events)
             .map_err(|i| HexError::new(format!("journal is invalid: {i}")))?;
 
         let mut state = State::default();
-        for event in &events {
+        for event in events {
             state = reduce(&graph, state, event);
         }
         Ok((graph, state))
@@ -262,11 +283,16 @@ impl Runtime {
     ///
     /// # Errors
     /// Fails on resolution/validation, missing workers, or IO errors.
-    pub fn start(&self, reference: &str, prompt: Option<&str>) -> Result<RunReport> {
+    pub fn start(
+        &self,
+        reference: &str,
+        prompt: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<RunReport> {
         // Resolve the source exactly once, then compile that same text — no
         // second resolution that could observe a changed file (TOCTOU).
         let resolved = preset::resolve(reference, &self.root)?;
-        let graph = self.compile(&resolved.source, prompt)?;
+        let graph = self.compile(&resolved.source)?;
         // A graph that references {{prompt}} in a node prompt needs one at run
         // time (validate and graph stay lenient).
         if prompt.is_none() && loader::uses_prompt(&graph) {
@@ -276,7 +302,7 @@ impl Runtime {
         }
         check_workers(&graph, &self.workers)?;
 
-        let (run_id, run_dir) = self.new_run()?;
+        let (run_id, run_dir) = self.new_run(&graph.name, name)?;
         std::fs::create_dir_all(run_dir.join("attempts"))?;
         let _lock = RunLock::acquire(&run_dir)?;
 
@@ -296,6 +322,7 @@ impl Runtime {
             self.root.clone(),
             journal,
             State::default(),
+            prompt.map(ToOwned::to_owned),
             self.sink.as_deref(),
         );
 
@@ -339,7 +366,9 @@ impl Runtime {
         // One scan: the writer hands back the events it read (torn tail already
         // repaired), which we verify + fold rather than reading the journal again.
         let (journal, events) = Journal::open_append(run_dir.join("events.jsonl"))?;
-        let (graph, state) = self.verify_and_fold(run_id, events)?;
+        // The operator prompt recorded at creation, re-applied at attempt-start.
+        let prompt = run_created(&events).and_then(|(_, inputs, _)| inputs.get("prompt").cloned());
+        let (graph, state) = self.verify_and_fold(run_id, &events)?;
         check_workers(&graph, &self.workers)?;
 
         let mut session = Session::new(
@@ -350,6 +379,7 @@ impl Runtime {
             self.root.clone(),
             journal,
             state,
+            prompt,
             self.sink.as_deref(),
         );
 
@@ -395,7 +425,7 @@ impl Runtime {
     pub fn status(&self, run_id: &str) -> Result<StatusReport> {
         let events = journal::read_all(&self.run_dir(run_id)?.join("events.jsonl"))
             .map_err(|_| HexError::new(format!("run `{run_id}` not found")))?;
-        let (_, state) = self.verify_and_fold(run_id, events)?;
+        let (_, state) = self.verify_and_fold(run_id, &events)?;
         Ok(StatusReport {
             run_id: run_id.to_owned(),
             status: state.status.clone(),
@@ -426,8 +456,21 @@ impl Runtime {
         let run_dir = self.run_dir(run_id)?;
         let attempts = run_dir.join("attempts");
         let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+        let events = self.events(run_id)?;
+        // Verify the journal's lifecycle (snapshot + `check_journal`) before
+        // trusting it — so a forged/misplaced `NodeResult` can't surface here.
+        self.verify_and_fold(run_id, &events)?;
+        // Captured final messages, by attempt.
+        let mut results: BTreeMap<String, String> = BTreeMap::new();
+        for event in &events {
+            if let EventBody::NodeResult { text } = &event.body
+                && let Some(attempt_id) = &event.attempt_id
+            {
+                results.insert(attempt_id.clone(), text.clone());
+            }
+        }
         let mut logs = Vec::new();
-        for event in self.events(run_id)? {
+        for event in &events {
             if let EventBody::AttemptStarted { worker, .. } = &event.body
                 && let Some(attempt_id) = &event.attempt_id
             {
@@ -436,6 +479,7 @@ impl Runtime {
                     attempt_id: attempt_id.clone(),
                     node_id: event.node_id.clone(),
                     worker: worker.clone(),
+                    result: results.get(attempt_id).cloned(),
                     stdout: read(dir.join("stdout.log")),
                     stderr: read(dir.join("stderr.log")),
                 });
@@ -464,7 +508,7 @@ impl Runtime {
         // One scan: open the writer (repairs a torn tail, returns events), then
         // verify + fold those same events.
         let (mut journal, events) = Journal::open_append(run_dir.join("events.jsonl"))?;
-        let (_, state) = self.verify_and_fold(run_id, events)?;
+        let (_, state) = self.verify_and_fold(run_id, &events)?;
         if state.is_finished() {
             return Ok(());
         }
@@ -520,15 +564,14 @@ fn defaults_from_map(map: &BTreeMap<String, String>) -> config::DefaultsSpec {
     }
 }
 
-/// Validate an operator-supplied run id: `run_` followed by ASCII alphanumerics
-/// and underscores only. Rejects path separators, `..`, and anything that could
-/// escape `.hex/runs`.
+/// Validate an operator-supplied run id: ASCII alphanumerics, `-`, and `_` only.
+/// Because `.` and `/` are disallowed, no `..` or path separator can appear, so
+/// nothing can escape `.hex/runs`.
 fn validate_run_id(run_id: &str) -> Result<()> {
-    let ok = run_id.len() > 4
-        && run_id.starts_with("run_")
+    let ok = !run_id.is_empty()
         && run_id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
     if ok {
         Ok(())
     } else {
@@ -540,6 +583,47 @@ fn validate_run_id(run_id: &str) -> Result<()> {
 /// `[0-9a-f]` only, satisfying [`validate_run_id`]'s path-safe grammar.
 fn random_suffix() -> String {
     uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// A short (8-hex) uniqueness suffix appended after a workflow name.
+fn short_uuid() -> String {
+    random_suffix()[..8].to_owned()
+}
+
+/// Slugify a name for a run id: lowercase, non-alphanumeric runs collapse to a
+/// single `-`, trimmed. `"Plan → Build"` → `"plan-build"`.
+fn slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_owned()
+}
+
+/// Today's UTC date as `yyyy-MM-dd`, for the run-id prefix (dependency-free).
+fn today_utc() -> String {
+    let days = i64::try_from(journal::now_ms() / 1000 / 86_400).unwrap_or(0);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Convert days-since-Unix-epoch to a `(year, month, day)` civil date
+/// (Howard Hinnant's algorithm — valid for the proleptic Gregorian calendar).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (y + i64::from(m <= 2), m, d)
 }
 
 /// An exclusive per-run lock enforcing the single-writer invariant: only one
@@ -582,11 +666,13 @@ impl RunLock {
 pub trait RuntimeClient {
     /// List every runnable graph.
     fn list_graphs(&self) -> Vec<GraphEntry>;
-    /// Start a new run with an optional operator prompt.
+    /// Start a new run with an optional operator prompt and an optional session
+    /// name (used in the run id).
     ///
     /// # Errors
     /// Propagates resolution, validation, and IO failures.
-    fn start(&self, reference: &str, prompt: Option<&str>) -> Result<RunReport>;
+    fn start(&self, reference: &str, prompt: Option<&str>, name: Option<&str>)
+    -> Result<RunReport>;
     /// Resume an existing run.
     ///
     /// # Errors
@@ -618,8 +704,13 @@ impl RuntimeClient for Runtime {
     fn list_graphs(&self) -> Vec<GraphEntry> {
         Runtime::list_graphs(self)
     }
-    fn start(&self, reference: &str, prompt: Option<&str>) -> Result<RunReport> {
-        Runtime::start(self, reference, prompt)
+    fn start(
+        &self,
+        reference: &str,
+        prompt: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<RunReport> {
+        Runtime::start(self, reference, prompt, name)
     }
     fn resume(&self, run_id: &str) -> Result<RunReport> {
         Runtime::resume(self, run_id)
@@ -657,6 +748,32 @@ pub fn open(root: &Path) -> Result<Runtime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slug_is_lowercase_kebab() {
+        assert_eq!(slug("critique-loop"), "critique-loop");
+        assert_eq!(slug("Plan → Build Review"), "plan-build-review");
+        assert_eq!(slug("  weird__name!! "), "weird-name");
+        assert_eq!(slug("---"), "");
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1)); // Unix epoch
+        assert_eq!(civil_from_days(31), (1970, 2, 1));
+        assert_eq!(civil_from_days(59), (1970, 3, 1)); // 1970 not a leap year
+        assert_eq!(civil_from_days(20_454), (2026, 1, 1));
+    }
+
+    #[test]
+    fn run_id_grammar_allows_readable_ids_and_rejects_traversal() {
+        assert!(validate_run_id("2026-07-21-critique-loop").is_ok());
+        assert!(validate_run_id("2026-07-21-tdd-2").is_ok());
+        assert!(validate_run_id("../../etc/passwd").is_err());
+        assert!(validate_run_id("a/b").is_err());
+        assert!(validate_run_id("a.b").is_err());
+        assert!(validate_run_id("").is_err());
+    }
 
     /// The advisory lock is real (a no-op would let the second acquire succeed)
     /// and is released when the holder drops — the same fd-close path the OS

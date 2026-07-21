@@ -171,6 +171,41 @@ sign-off, confirmation.
 5. The worker↔runtime channel is `hex emit <event>`: the runtime injects
    `HEX_EMIT_FILE`/`HEX_MAY_PROPOSE` etc.; the agent's argv must be able to
    reach the `hex` binary. `may_propose` is enforced both at emit and at ingest.
+5b. **Result capture & implicit completion.** The runtime also injects
+   `HEX_RESULT_FILE` and a `{result}` argv token; a worker's `result:`
+   (`file`|`json_result`) says how to capture its final message (codex
+   `--output-last-message {result}`, claude `--output-format json` → `.result`).
+   The capture is recorded as `EventBody::NodeResult` and folded into
+   `RunState.results`; a downstream prompt references it as `{{node.result}}`,
+   interpolated **at attempt-start** in the driver (not compile-time) and wrapped
+   as untrusted. An agent that exits cleanly *without* emitting gets a
+   runtime-synthesized reserved `done` signal (implicit completion), so a
+   single-outcome node needs no `hex emit`; it must have an `on: { done: … }`
+   edge (the validator allows `done` without a `may_propose` entry). Nodes with
+   >1 outcome still emit. `read_signal` returning `Ok(None)` is *not* an error.
+5c. **Workers are typed adapters behind one trait.** Each agent CLI has its own
+   `Worker` impl in `hex-worker` (`CodexWorker`/`ClaudeWorker`/`OpencodeWorker`)
+   owning its argv and result-capture mode; `CommandWorker` is the generic argv
+   escape hatch (+ `MockWorker`). Config selects one via `kind:`
+   (`codex`/`claude`/`opencode`/`command`, default `command`); the runtime/CLI
+   only ever see `dyn Worker`. A node's `read_only: bool` flows to
+   `WorkRequest.read_only`, but is **advisory** today (prompt-enforced): a true
+   read-only sandbox (codex `--sandbox read-only`) would also block the agent
+   from writing `HEX_EMIT_FILE`/`HEX_RESULT_FILE` under the workspace and break
+   routing — enforced read-only needs a non-workspace control transport (TODO).
+   Adding an agent = a new `Worker` impl + `WorkerKind`, not scattered flags.
+5c-perm. **Headless permissioning is per-agent, never a blanket bypass.** codex
+   runs under its OS sandbox (`--sandbox workspace-write`); claude uses an *auto
+   classifier* (`--permission-mode acceptEdits` + `--allowedTools` incl. `Bash`
+   for the `hex emit` channel + `--disallowedTools` denying destructive/exfil/
+   publish commands) — **never `--dangerously-skip-permissions`**; opencode is
+   still `--auto` (blanket approve — TODO to generate an `opencode.json`
+   `permission` block). The claude deny-list is defense-in-depth, not an OS
+   boundary (shell chaining bypasses prefix matching) — real containment awaits
+   worktree/OS isolation (Phase 2). Lists live in `ClaudeWorker` (`agent.rs`).
+5d. **Run ids** are `yyyy-MM-dd-<workflow>-<short-uuid>`, or `yyyy-MM-dd-<name>`
+   when the operator passes `hex run --name`; slugged + path-safe, a same-day
+   clash gets a `-2` suffix. `validate_run_id` allows `[a-z0-9-_]` only.
 6. `hex run`'s workspace is the project cwd (shared isolation); run it from the
    repo root. Redo = new `run`; `resume` continues the same run and marks an
    orphaned attempt `interrupted` before re-attempting (never a silent rerun).

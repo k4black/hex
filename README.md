@@ -160,23 +160,59 @@ cycle must declare a bound — an unbounded cycle is a validation *error*.
 ## Config & presets
 
 Layered config, project wins: `~/.config/hex/config.yaml` (user) ←
-`.hex/config.yaml` (project). It holds the **worker registry** — how to invoke
-each external agent (argv template, headless flags, model, declared
-capabilities) — plus default budgets/context/isolation.
+`.hex/config.yaml` (project). It holds the **worker registry** plus default
+budgets/context. Each worker has a `kind`: a typed built-in adapter
+(`codex`/`claude`/`opencode`) that encapsulates that agent's argv, output
+parsing, and read-only flag — you only override its `model` — or the generic
+`command` kind (an explicit argv template + a `result:` capture mode) for any
+other CLI. The CLI/runtime only ever see a uniform `Worker`:
+
+```yaml
+workers:
+  codex:    { kind: codex, model: gpt-5 }        # typed — argv/parsing built in
+  claude:   { kind: claude }
+  my-agent: { kind: command, command: [my-cli, "{prompt}"], result: file }
+```
+
+A node can set `read_only: true` (a reviewer) — advisory today (the prompt keeps
+it read-only; a true read-only sandbox would also block the `hex emit` control
+channel, so enforced read-only awaits a non-workspace transport).
 
 A **preset** is a named graph resolved through three layers: `.hex/graphs/`
-(project) > `~/.config/hex/graphs/` (user) > built-in. hex ships `critique-loop`
-(codex implements → claude critiques → gate) as the flagship built-in.
+(project) > `~/.config/hex/graphs/` (user) > built-in. The built-in library
+(claude implements/plans, codex reviews — a different model reviews than wrote
+the code):
+
+| Preset | Loop |
+|---|---|
+| `critique-loop` | implement → review → test (the flagship) |
+| `implement-until-green` | implement → test (the Ralph loop; tests are the only backpressure) |
+| `tdd` | write-failing-test → implement → test |
+| `plan-build-review` | plan → implement → test → review |
+| `review` | reviewer over the current `git diff`, no implementer |
+
+Their gates run `cargo test`; a preset is a starting point — copy it to
+`.hex/graphs/` and change the gate command for your stack.
 
 The operator supplies exactly one thing — the **prompt** — inline or from a
-file; it fills `{{prompt}}` wherever the graph's node prompts reference it
-(richer per-node typed inputs/outputs are internal graph dataflow, not an
-operator flag):
+file; it fills `{{prompt}}` wherever the graph's node prompts reference it:
 
 ```bash
-hex run critique-loop -p "fix the flaky auth test"
-hex run critique-loop -f prompts/task.md
+hex run implement-until-green -p "fix the flaky auth test"
+hex run plan-build-review -f prompts/task.md
+hex run tdd -p "add a --json flag" --name json-flag   # names the run
 ```
+
+Run ids read `yyyy-MM-dd-<workflow>-<short-uuid>`, or `yyyy-MM-dd-<name>` when
+you pass `--name`.
+
+**Node-to-node handoff.** An agent's final message is captured as its result and
+a downstream node can reference it as `{{node.result}}` (e.g. the planner's plan
+reaches the implementer), interpolated at runtime and wrapped as untrusted data.
+Heavy artifacts (code, diffs) stay in the workspace — the reviewer runs
+`git diff`. An agent with a single outcome may simply **finish** (no `hex emit`);
+the runtime routes a synthesized `done`. Nodes with more than one outcome still
+`hex emit <signal>`. (Full typed per-node inputs/outputs are a later phase.)
 
 An authoring skill (SKILL.md shipped in-repo) teaches coding agents to draft
 graph YAML from a task description and iterate against `hex validate`.
@@ -196,7 +232,7 @@ hex resume <run>         continue the SAME run (after pause or crash)
 hex pause|cancel <run>   operator control
 hex status <run>         projected run status
 hex watch <run>          stream events (NDJSON with --json)
-hex logs <run> [--node <id>]   per-attempt agent stdout/stderr
+hex logs <run> [--node <id>] [--full]   per-attempt final message (--full: stdout/stderr)
 hex emit <event>         worker→runtime, scoped-token control
 hex respond <req>        human answer (interactive Q&A; later: approve/reject)
 ```

@@ -1,0 +1,71 @@
+version: 1
+name: tdd
+
+# Test-first loop with a proven-red step: an agent writes a failing test, a gate
+# proves it actually fails, another agent makes it pass, and a gate proves it
+# green. The spec agent's result is handed to the implementer as {{spec.result}}.
+# Both work agents finish without emitting (implicit `done`).
+# Run it with:  hex run tdd -p "…"
+#
+# The gates run `cargo test`; copy to .hex/graphs/ and edit them for your stack.
+
+defaults:
+  worker: claude
+  context: fresh
+  budget:
+    attempts: 14
+    elapsed: 30m
+
+entry: spec
+
+nodes:
+  spec:
+    agent:
+      prompt: |
+        Write a failing test that captures this task, before any implementation.
+
+        Task: {{prompt}}
+
+        Add a focused, well-named test that fails for the right reason. Do NOT
+        implement the feature. In your final message, name the test file/name you
+        added and what it asserts. Finish when the test is written.
+    on:
+      done: red
+
+  # Prove the test is actually red before implementing. A failing suite is the
+  # expected outcome here (→ implement); an already-green suite means the test
+  # doesn't fail, so go back and write a real failing test.
+  red:
+    gate:
+      run: [cargo, test]
+    on:
+      failed: implement
+      passed: spec
+
+  implement:
+    agent:
+      prompt: |
+        Make the failing test pass with the smallest change.
+
+        Task: {{prompt}}
+
+        The test to satisfy was just written:
+        {{spec.result}}
+
+        Implement only what makes that test (and the rest of the suite) pass.
+        Run `cargo test` yourself to check. Finish when you believe it is green.
+    on:
+      done: green
+
+  green:
+    gate:
+      run: [cargo, test]
+    on:
+      passed: done
+      failed: implement
+
+  done:
+    terminal: succeeded
+
+accept:
+  require: [green.passed]

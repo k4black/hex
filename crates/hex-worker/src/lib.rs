@@ -17,7 +17,10 @@ use hex_proto::Capability;
 pub mod agent;
 pub mod mock;
 
-pub use agent::{AgentWorker, logged_command, wait_bounded};
+pub use agent::{
+    ClaudeWorker, CodexWorker, CommandWorker, OpencodeWorker, ResultCapture, logged_command,
+    wait_bounded,
+};
 pub use mock::MockWorker;
 
 /// What the runtime hands a worker to run one attempt.
@@ -40,15 +43,25 @@ pub struct WorkRequest {
     /// Wall-clock deadline for this attempt in milliseconds; the child is
     /// killed if it runs longer. `None` means no per-attempt time bound.
     pub deadline_ms: Option<u64>,
+    /// Whether this node should not modify the workspace (e.g. a reviewer).
+    /// Advisory only: a hard read-only sandbox would also block the agent from
+    /// writing `HEX_EMIT_FILE`/`HEX_RESULT_FILE`, so workers do not enforce it —
+    /// read-only intent is conveyed through the node's prompt. See `agent.rs`.
+    pub read_only: bool,
 }
 
-/// What a worker reports after one attempt. Exactly one of `signal`/`error`
-/// should be set: a routing signal on success, a reason on execution failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a worker reports after one attempt. On success `signal` is the routing
+/// event (or `None` for implicit completion — a clean finish with no emit); on
+/// failure `error` is set. `result` is the captured final message (independent
+/// of routing), fed to a downstream node as `{{node.result}}`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkOutcome {
-    /// The routing event the agent emitted (guaranteed ∈ `may_propose`).
+    /// The routing event the agent emitted (∈ `may_propose`), or `None` when the
+    /// agent finished cleanly without emitting (the runtime synthesizes `done`).
     pub signal: Option<String>,
-    /// Execution failure reason (the agent crashed or emitted nothing valid).
+    /// The captured final message text, if the worker declares result capture.
+    pub result: Option<String>,
+    /// Execution failure reason (the agent crashed or emitted something invalid).
     pub error: Option<String>,
     /// Whether the failure was specifically a per-attempt timeout, so the
     /// runtime can record the `TimedOut` disposition rather than plain `Failed`.
@@ -61,8 +74,7 @@ impl WorkOutcome {
     pub fn signal(name: impl Into<String>) -> Self {
         Self {
             signal: Some(name.into()),
-            error: None,
-            timed_out: false,
+            ..Self::default()
         }
     }
 
@@ -70,9 +82,8 @@ impl WorkOutcome {
     #[must_use]
     pub fn error(reason: impl Into<String>) -> Self {
         Self {
-            signal: None,
             error: Some(reason.into()),
-            timed_out: false,
+            ..Self::default()
         }
     }
 
@@ -80,10 +91,17 @@ impl WorkOutcome {
     #[must_use]
     pub fn timed_out(reason: impl Into<String>) -> Self {
         Self {
-            signal: None,
             error: Some(reason.into()),
             timed_out: true,
+            ..Self::default()
         }
+    }
+
+    /// Attach a captured result to this outcome.
+    #[must_use]
+    pub fn with_result(mut self, result: Option<String>) -> Self {
+        self.result = result;
+        self
     }
 }
 

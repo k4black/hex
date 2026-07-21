@@ -1,0 +1,47 @@
+version: 1
+name: implement-until-green
+
+# The Ralph loop: one agent implements, the test gate is the only backpressure,
+# and the loop repeats until the tests pass. No reviewer. The implement node
+# finishes without emitting — a clean exit routes the synthesized `done`.
+# Run it with:  hex run implement-until-green -p "…"
+#
+# The gate runs `cargo test`; copy this to .hex/graphs/ and change the gate
+# command for your stack (npm test, pytest, make test, …).
+
+defaults:
+  worker: claude
+  context: fresh
+  budget:
+    attempts: 10
+    elapsed: 30m
+
+entry: implement
+
+nodes:
+  implement:
+    agent:
+      prompt: |
+        You are making a focused change in this repository until the tests pass.
+
+        Task: {{prompt}}
+
+        Implement the smallest change that satisfies the task. Run the test
+        suite yourself (`cargo test`) to find and fix failures — if you were
+        sent back here, a gate found the tests still failing. Just finish when
+        you believe the tests pass; no command is needed.
+    on:
+      done: test
+
+  test:
+    gate:
+      run: [cargo, test]
+    on:
+      passed: done
+      failed: implement
+
+  done:
+    terminal: succeeded
+
+accept:
+  require: [test.passed]

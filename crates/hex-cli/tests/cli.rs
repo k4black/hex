@@ -165,7 +165,10 @@ fn run_json_is_machine_readable_on_stdout() {
     let line = stdout(&out);
     let v: serde_json::Value = serde_json::from_str(line.trim()).expect("stdout is json");
     assert_eq!(v["disposition"], "succeeded");
-    assert!(v["run_id"].as_str().unwrap().starts_with("run_"));
+    // Run ids read `yyyy-MM-dd-<graph-name>`.
+    let run_id = v["run_id"].as_str().unwrap();
+    assert!(run_id.contains("-demo"), "readable run id: {run_id}");
+    assert!(run_id.starts_with("20"), "date-prefixed run id: {run_id}");
 }
 
 #[test]
@@ -211,27 +214,42 @@ fn unsafe_run_id_is_rejected() {
 }
 
 #[test]
-fn logs_show_per_attempt_output() {
+fn logs_show_final_message_by_default_and_full_output_with_flag() {
     let dir = project();
-    // A worker that prints something before emitting, so there's stdout to show.
+    // A worker that prints to stdout, captures a final message, then emits.
     std::fs::write(
         dir.path().join(".hex").join("config.yaml"),
-        "workers:\n  builder:\n    command: [sh, -c, 'echo HELLO-FROM-AGENT; printf ready > \"$HEX_EMIT_FILE\"']\n",
+        "workers:\n  builder:\n    command: [sh, -c, 'echo HELLO-FROM-AGENT; printf FINAL-SUMMARY > \"$HEX_RESULT_FILE\"; printf ready > \"$HEX_EMIT_FILE\"']\n    result: file\n",
     )
     .expect("config");
     let run = hex(dir.path(), &["run", "demo", "--json"]);
     let v: serde_json::Value = serde_json::from_str(stdout(&run).trim()).unwrap();
     let run_id = v["run_id"].as_str().unwrap();
 
+    // Default: the attempt's final message, not the full stdout.
     let out = hex(dir.path(), &["logs", run_id]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let s = stdout(&out);
-    assert!(s.contains("HELLO-FROM-AGENT"), "agent stdout shown: {s}");
+    assert!(
+        s.contains("FINAL-SUMMARY"),
+        "final message shown by default: {s}"
+    );
     assert!(s.contains("[build]"), "attempt header shows the node: {s}");
+    assert!(
+        !s.contains("HELLO-FROM-AGENT"),
+        "full stdout hidden by default: {s}"
+    );
+
+    // --full: the full captured stdout.
+    let full = hex(dir.path(), &["logs", run_id, "--full"]);
+    assert!(
+        stdout(&full).contains("HELLO-FROM-AGENT"),
+        "full stdout shown with --full"
+    );
 
     // --node filters to a single node's attempts.
     let only = hex(dir.path(), &["logs", run_id, "--node", "build"]);
-    assert!(stdout(&only).contains("HELLO-FROM-AGENT"));
+    assert!(stdout(&only).contains("FINAL-SUMMARY"));
     assert!(!stdout(&only).contains("[test]"), "filtered to build only");
 }
 
