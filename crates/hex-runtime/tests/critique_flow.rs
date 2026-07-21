@@ -58,6 +58,229 @@ fn recorded_prompt() -> BTreeMap<String, String> {
     m
 }
 
+/// A `ProgressSink` that records the driver's calls so a test can assert the
+/// lifecycle (event → attempt_started → … → attempt_finished) and the contents
+/// of each `AttemptView`.
+#[derive(Clone, Default)]
+struct Recorder {
+    log: std::sync::Arc<std::sync::Mutex<Vec<Entry>>>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Entry {
+    /// An `AttemptStarted` event was journaled for this node.
+    EvStarted(String),
+    /// `attempt_started` fired with this view.
+    Start {
+        node: String,
+        number: u32,
+        budget: Option<u32>,
+        worker: Option<String>,
+        stdout_log: PathBuf,
+        attempt_id: String,
+    },
+    /// `attempt_finished` fired.
+    Finish,
+}
+
+impl hex_runtime::ProgressSink for Recorder {
+    fn event(&self, e: &hex_runtime::Event) {
+        if matches!(e.body, EventBody::AttemptStarted { .. }) {
+            let node = e.node_id.clone().unwrap_or_default();
+            self.log.lock().unwrap().push(Entry::EvStarted(node));
+        }
+    }
+    fn attempt_started(&self, v: &hex_runtime::AttemptView) {
+        self.log.lock().unwrap().push(Entry::Start {
+            node: v.node_id.clone(),
+            number: v.attempt_number,
+            budget: v.attempts_budget,
+            worker: v.worker.clone(),
+            stdout_log: v.stdout_log.clone(),
+            attempt_id: v.attempt_id.clone(),
+        });
+    }
+    fn attempt_finished(&self) {
+        self.log.lock().unwrap().push(Entry::Finish);
+    }
+}
+
+#[test]
+fn progress_sink_brackets_every_attempt_with_a_correct_view() {
+    let root = temp_root("progress");
+    write_graph(&root);
+
+    // implement → review(approved) → test(gate) → done: three attempts.
+    let mock = MockWorker::new()
+        .on("implement", &["ready"])
+        .on("review", &["approved"]);
+    let mut workers = Workers::new();
+    workers.insert("mock", Box::new(mock));
+
+    let rec = Recorder::default();
+    let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers)
+        .with_progress(Box::new(rec.clone()));
+    let report = runtime
+        .start("test-critique", Some("the thing"))
+        .expect("run");
+    assert_eq!(report.disposition, Disposition::Succeeded);
+
+    let log = rec.log.lock().unwrap();
+
+    // Starts and finishes are perfectly bracketed: the START/FINISH subsequence
+    // alternates and is balanced (a synchronous attempt never overlaps another).
+    let brackets: Vec<&Entry> = log
+        .iter()
+        .filter(|e| matches!(e, Entry::Start { .. } | Entry::Finish))
+        .collect();
+    assert_eq!(brackets.len(), 6, "3 attempts × (start, finish)");
+    for (i, e) in brackets.iter().enumerate() {
+        if i % 2 == 0 {
+            assert!(
+                matches!(e, Entry::Start { .. }),
+                "position {i} must be a Start"
+            );
+        } else {
+            assert_eq!(**e, Entry::Finish, "position {i} must be a Finish");
+        }
+    }
+
+    // Each attempt's AttemptStarted event is journaled immediately before its
+    // attempt_started hook — the sink sees the fact before the side effect.
+    for (i, e) in log.iter().enumerate() {
+        if let Entry::Start { node, .. } = e {
+            assert_eq!(
+                log[i - 1],
+                Entry::EvStarted(node.clone()),
+                "attempt_started for {node} must follow its AttemptStarted event",
+            );
+        }
+    }
+
+    // The three views carry the right node, 1-based ordinal, shared budget,
+    // worker (None for the gate), and a log path under this attempt's dir.
+    let starts: Vec<&Entry> = log
+        .iter()
+        .filter(|e| matches!(e, Entry::Start { .. }))
+        .collect();
+    let expected = [
+        ("implement", 1u32, Some("mock")),
+        ("review", 2, Some("mock")),
+        ("test", 3, None), // gate: no worker
+    ];
+    for (start, (exp_node, exp_num, exp_worker)) in starts.iter().zip(expected) {
+        let Entry::Start {
+            node,
+            number,
+            budget,
+            worker,
+            stdout_log,
+            attempt_id,
+        } = start
+        else {
+            unreachable!()
+        };
+        assert_eq!(node, exp_node);
+        assert_eq!(*number, exp_num);
+        assert_eq!(*budget, Some(8), "the graph's attempts budget");
+        assert_eq!(worker.as_deref(), exp_worker);
+        assert!(
+            stdout_log.ends_with("stdout.log"),
+            "log path: {stdout_log:?}"
+        );
+        assert_eq!(
+            stdout_log
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some(attempt_id.as_str()),
+            "the log lives under attempts/<attempt_id>/",
+        );
+    }
+}
+
+#[test]
+fn progress_sink_pairs_start_and_finish_even_when_an_attempt_fails() {
+    let root = temp_root("progress-fail");
+    write_graph(&root);
+
+    // implement emits a signal outside its may_propose → the attempt fails and
+    // the run ends. The start hook must still be closed by a finish hook.
+    let mock = MockWorker::new().on("implement", &["nope"]);
+    let mut workers = Workers::new();
+    workers.insert("mock", Box::new(mock));
+
+    let rec = Recorder::default();
+    let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers)
+        .with_progress(Box::new(rec.clone()));
+    let report = runtime.start("test-critique", Some("x")).expect("run");
+    assert_eq!(report.disposition, Disposition::Failed);
+
+    let log = rec.log.lock().unwrap();
+    let brackets: Vec<&Entry> = log
+        .iter()
+        .filter(|e| matches!(e, Entry::Start { .. } | Entry::Finish))
+        .collect();
+    assert_eq!(
+        brackets.len(),
+        2,
+        "one failed attempt still brackets start+finish"
+    );
+    assert!(matches!(brackets[0], Entry::Start { .. }), "start first");
+    assert_eq!(*brackets[1], Entry::Finish, "then finish");
+}
+
+/// A worker that panics inside `run`, to prove the finish hook still fires while
+/// the run unwinds (a real coding-agent adapter is opaque and could panic).
+struct PanicWorker;
+
+impl hex_worker::Worker for PanicWorker {
+    fn capabilities(&self) -> hex_worker::CapabilityManifest {
+        hex_worker::CapabilityManifest::from(&[hex_proto::Capability::FreshSessions][..])
+    }
+    fn run(&self, _request: &hex_worker::WorkRequest) -> hex_worker::WorkOutcome {
+        panic!("worker exploded");
+    }
+}
+
+#[test]
+fn progress_sink_finishes_even_when_the_worker_panics() {
+    let root = temp_root("progress-panic");
+    write_graph(&root);
+
+    let mut workers = Workers::new();
+    workers.insert("mock", Box::new(PanicWorker));
+
+    let rec = Recorder::default();
+    let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers)
+        .with_progress(Box::new(rec.clone()));
+
+    // The worker panics inside adapter.run; the driver's RAII finish guard must
+    // still fire attempt_finished while the run unwinds. (The panic prints a
+    // backtrace to the test log; we deliberately don't touch the process-global
+    // panic hook, which would race with other tests running in parallel.)
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.start("test-critique", Some("x"))
+    }));
+    assert!(
+        outcome.is_err(),
+        "the worker panic propagates out of start()"
+    );
+
+    let log = rec.log.lock().unwrap();
+    let brackets: Vec<&Entry> = log
+        .iter()
+        .filter(|e| matches!(e, Entry::Start { .. } | Entry::Finish))
+        .collect();
+    assert_eq!(
+        brackets.len(),
+        2,
+        "the panicking attempt still brackets start+finish"
+    );
+    assert!(matches!(brackets[0], Entry::Start { .. }), "start first");
+    assert_eq!(*brackets[1], Entry::Finish, "then finish");
+}
+
 #[test]
 fn critique_loop_runs_to_success() {
     let root = temp_root("success");
@@ -71,7 +294,9 @@ fn critique_loop_runs_to_success() {
     workers.insert("mock", Box::new(mock));
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers);
 
-    let report = runtime.start("test-critique", Some("the thing")).expect("run");
+    let report = runtime
+        .start("test-critique", Some("the thing"))
+        .expect("run");
     assert_eq!(report.disposition, Disposition::Succeeded);
 
     // The acceptance evidence is really in the journal.
@@ -82,7 +307,9 @@ fn critique_loop_runs_to_success() {
     )));
     assert!(events.iter().any(|e| matches!(
         &e.body,
-        EventBody::RunFinished { disposition: Disposition::Succeeded }
+        EventBody::RunFinished {
+            disposition: Disposition::Succeeded
+        }
     )));
 
     let status = runtime.status(&report.run_id).expect("status");
@@ -102,7 +329,9 @@ fn budget_exhaustion_fails_closed() {
     workers.insert("mock", Box::new(mock));
     let runtime = Runtime::with_workers(root, Config::builtin(), workers);
 
-    let report = runtime.start("test-critique", Some("the thing")).expect("run");
+    let report = runtime
+        .start("test-critique", Some("the thing"))
+        .expect("run");
     assert_eq!(report.disposition, Disposition::BudgetExhausted);
 }
 
@@ -173,7 +402,7 @@ fn write_crashed_run_with_inputs(
         EventBody::RunCreated {
             graph_hash: hash,
             inputs,
-                defaults: Default::default(),
+            defaults: Default::default(),
         },
     )
     .unwrap();
@@ -315,7 +544,9 @@ fn stale_lock_file_does_not_block_resume() {
     std::fs::write(run_dir.join("run.lock"), "999999\n").expect("leftover lock");
 
     let runtime = finishing_runtime(root);
-    let report = runtime.resume(run_id).expect("resume despite stale lock file");
+    let report = runtime
+        .resume(run_id)
+        .expect("resume despite stale lock file");
     assert_eq!(report.disposition, Disposition::Succeeded);
 }
 
@@ -402,6 +633,9 @@ accept:
     let events = runtime.events(&report.run_id).expect("events");
     assert!(events.iter().any(|e| matches!(
         &e.body,
-        EventBody::AttemptFailed { disposition: Disposition::TimedOut, .. }
+        EventBody::AttemptFailed {
+            disposition: Disposition::TimedOut,
+            ..
+        }
     )));
 }

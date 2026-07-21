@@ -8,10 +8,13 @@
 //! `watch` · `cancel`, plus the worker-side `emit`. Redoing work is a new
 //! `run`; there is no `retry`/`replay`.
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use hex_runtime::{Disposition, Runtime};
+
+mod preview;
 
 /// Worked examples, shown under `hex --help`.
 const EXAMPLES: &str = "\
@@ -45,6 +48,10 @@ struct Cli {
     /// Emit machine-readable JSON on stdout instead of human-readable text
     #[arg(long, global = true)]
     json: bool,
+
+    /// Disable the live in-flight preview pane (plain line streaming instead)
+    #[arg(long, global = true)]
+    no_preview: bool,
 }
 
 /// The operator/worker verbs. Names are stable public surface.
@@ -129,6 +136,7 @@ fn main() -> ExitCode {
 /// failure (exit 2).
 fn dispatch(cli: Cli) -> Result<ExitCode, String> {
     let json = cli.json;
+    let no_preview = cli.no_preview;
     let Some(command) = cli.command else {
         // Bare `hex` is a usage error, so render clap's own help — byte-for-byte
         // the same text `hex --help` prints — to stderr and exit 2. (clap's
@@ -141,8 +149,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Command::List => cmd_list(json),
         Command::Validate { graph } => cmd_validate(&graph, json),
         Command::Graph { graph } => cmd_graph(&graph, json),
-        Command::Run { graph, prompt, file } => cmd_run(graph.as_deref(), &prompt, &file, json),
-        Command::Resume { run_id } => cmd_resume(&run_id, json),
+        Command::Run {
+            graph,
+            prompt,
+            file,
+        } => cmd_run(graph.as_deref(), &prompt, &file, json, no_preview),
+        Command::Resume { run_id } => cmd_resume(&run_id, json, no_preview),
         Command::Status { run_id } => cmd_status(&run_id, json),
         Command::Watch { run_id } => cmd_watch(&run_id, json),
         Command::Logs { run_id, node } => cmd_logs(&run_id, node.as_deref(), json),
@@ -160,18 +172,20 @@ fn open_runtime() -> Result<Runtime, String> {
 /// A runtime that streams each event to stderr as it happens, so a foreground
 /// `run`/`resume` shows live progress instead of blocking silently. stdout is
 /// left clean for the final summary / `--json`.
-fn open_runtime_streaming() -> Result<Runtime, String> {
-    // Best-effort progress: a broken/closed stderr (e.g. `hex run | head`) must
-    // never panic and abort the run — the observer is non-authoritative.
-    Ok(open_runtime()?.on_event(Box::new(|e| {
-        use std::io::Write;
-        let _ = writeln!(std::io::stderr(), "  {}", event_line(e));
-    })))
+fn open_runtime_streaming(json: bool, no_preview: bool) -> Result<Runtime, String> {
+    // The live pane owns stderr, so it only turns on for an interactive TTY run.
+    // `--json` (machine output), `--no-preview`, or a piped stderr fall back to
+    // plain line streaming — same behavior as before this feature.
+    let preview = !json && !no_preview && std::io::stderr().is_terminal();
+    Ok(open_runtime()?.with_progress(Box::new(preview::LivePreview::new(preview))))
 }
 
 /// A one-line rendering of an event for progress/watch output.
-fn event_line(e: &hex_runtime::Event) -> String {
-    let node = e.node_id.as_deref().map_or(String::new(), |n| format!(" {n}"));
+pub(crate) fn event_line(e: &hex_runtime::Event) -> String {
+    let node = e
+        .node_id
+        .as_deref()
+        .map_or(String::new(), |n| format!(" {n}"));
     format!("#{}{} {}", e.seq, node, event_summary(&e.body))
 }
 
@@ -208,10 +222,15 @@ fn cmd_validate(reference: &str, json: bool) -> Result<ExitCode, String> {
     match runtime.validate(reference) {
         Ok(graph) => {
             if json {
-                let v = serde_json::json!({"ok": true, "name": graph.name, "nodes": graph.nodes.len()});
+                let v =
+                    serde_json::json!({"ok": true, "name": graph.name, "nodes": graph.nodes.len()});
                 println!("{v}");
             } else {
-                println!("ok: `{}` is valid ({} nodes)", graph.name, graph.nodes.len());
+                println!(
+                    "ok: `{}` is valid ({} nodes)",
+                    graph.name,
+                    graph.nodes.len()
+                );
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -262,8 +281,9 @@ fn cmd_run(
     prompt: &Option<String>,
     file: &Option<String>,
     json: bool,
+    no_preview: bool,
 ) -> Result<ExitCode, String> {
-    let runtime = open_runtime_streaming()?;
+    let runtime = open_runtime_streaming(json, no_preview)?;
     // `hex run` with no graph lists what you can run instead of erroring.
     let Some(reference) = reference else {
         print_graph_list(&runtime, json);
@@ -287,8 +307,8 @@ fn cmd_run(
     Ok(exit_for(report.disposition))
 }
 
-fn cmd_resume(run_id: &str, json: bool) -> Result<ExitCode, String> {
-    let runtime = open_runtime_streaming()?;
+fn cmd_resume(run_id: &str, json: bool, no_preview: bool) -> Result<ExitCode, String> {
+    let runtime = open_runtime_streaming(json, no_preview)?;
     let report = runtime.resume(run_id).map_err(|e| e.to_string())?;
     if json {
         let v = serde_json::json!({
@@ -332,7 +352,10 @@ fn cmd_watch(run_id: &str, json: bool) -> Result<ExitCode, String> {
     let events = runtime.events(run_id).map_err(|e| e.to_string())?;
     for event in &events {
         if json {
-            println!("{}", serde_json::to_string(event).map_err(|e| e.to_string())?);
+            println!(
+                "{}",
+                serde_json::to_string(event).map_err(|e| e.to_string())?
+            );
         } else {
             println!("{}", event_line(event));
         }
@@ -367,7 +390,10 @@ fn cmd_logs(run_id: &str, node: Option<&str>, json: bool) -> Result<ExitCode, St
 
     for l in &logs {
         let node = l.node_id.as_deref().unwrap_or("?");
-        let via = l.worker.as_deref().map_or(String::new(), |w| format!(" via {w}"));
+        let via = l
+            .worker
+            .as_deref()
+            .map_or(String::new(), |w| format!(" via {w}"));
         println!("── {} [{node}]{via} ──", l.attempt_id);
         if !l.stdout.trim().is_empty() {
             print!("{}", l.stdout);
@@ -400,7 +426,11 @@ fn cmd_emit(event: &str) -> Result<ExitCode, String> {
     let file = std::env::var("HEX_EMIT_FILE")
         .map_err(|_| "hex emit must be run inside a hex attempt (HEX_EMIT_FILE unset)")?;
     let allowed = std::env::var("HEX_MAY_PROPOSE").unwrap_or_default();
-    let permitted: Vec<&str> = allowed.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let permitted: Vec<&str> = allowed
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if !permitted.contains(&event) {
         return Err(format!(
             "event `{event}` is not in this node's may_propose ({allowed})"
@@ -418,7 +448,10 @@ fn cmd_emit(event: &str) -> Result<ExitCode, String> {
 
 /// Resolve the operator prompt from `-p` (inline) or `-f` (file). At most one
 /// may be given (enforced at parse time; the both-arm is a defensive fallback).
-fn resolve_prompt(prompt: &Option<String>, file: &Option<String>) -> Result<Option<String>, String> {
+fn resolve_prompt(
+    prompt: &Option<String>,
+    file: &Option<String>,
+) -> Result<Option<String>, String> {
     match (prompt, file) {
         (Some(_), Some(_)) => Err("pass only one of -p/--prompt or -f/--file".to_owned()),
         (Some(text), None) => Ok(Some(text.clone())),
@@ -439,14 +472,24 @@ fn exit_for(d: Disposition) -> ExitCode {
 fn event_summary(body: &hex_runtime::EventBody) -> String {
     use hex_runtime::EventBody as B;
     match body {
-        B::RunCreated { graph_hash, .. } => format!("run_created ({})", &graph_hash[..graph_hash.len().min(12)]),
+        B::RunCreated { graph_hash, .. } => {
+            format!("run_created ({})", &graph_hash[..graph_hash.len().min(12)])
+        }
         B::RunStarted => "run_started".to_owned(),
         B::AttemptStarted { worker, .. } => {
-            format!("attempt_started{}", worker.as_deref().map_or(String::new(), |w| format!(" via {w}")))
+            format!(
+                "attempt_started{}",
+                worker
+                    .as_deref()
+                    .map_or(String::new(), |w| format!(" via {w}"))
+            )
         }
         B::AttemptInterrupted => "attempt_interrupted".to_owned(),
         B::Signal { name } => format!("signal {name}"),
-        B::AttemptFailed { reason, disposition } => format!("attempt_failed [{disposition}]: {reason}"),
+        B::AttemptFailed {
+            reason,
+            disposition,
+        } => format!("attempt_failed [{disposition}]: {reason}"),
         B::BudgetExhausted { detail } => format!("budget_exhausted: {detail}"),
         B::RunFinished { disposition } => format!("run_finished: {disposition}"),
         B::Note { text } => format!("note: {text}"),
@@ -468,11 +511,19 @@ mod tests {
         // `--json` is global, so it parses after the subcommand.
         let cli = parse(&["run", "critique-loop", "--json", "-p", "fix the bug"]).unwrap();
         assert!(cli.json);
-        let Some(Command::Run { graph, prompt, file }) = cli.command else {
+        let Some(Command::Run {
+            graph,
+            prompt,
+            file,
+        }) = cli.command
+        else {
             panic!("expected run command");
         };
         assert_eq!(graph.as_deref(), Some("critique-loop"));
-        assert_eq!(resolve_prompt(&prompt, &file).unwrap().as_deref(), Some("fix the bug"));
+        assert_eq!(
+            resolve_prompt(&prompt, &file).unwrap().as_deref(),
+            Some("fix the bug")
+        );
     }
 
     #[test]
@@ -488,7 +539,10 @@ mod tests {
         let Some(Command::Run { prompt, file, .. }) = cli.command else {
             panic!("expected run command");
         };
-        assert_eq!(resolve_prompt(&prompt, &file).unwrap().as_deref(), Some("do the thing"));
+        assert_eq!(
+            resolve_prompt(&prompt, &file).unwrap().as_deref(),
+            Some("do the thing")
+        );
     }
 
     #[test]
@@ -521,7 +575,10 @@ mod tests {
         let Some(Command::Run { prompt, file, .. }) = cli.command else {
             panic!("expected run command");
         };
-        assert_eq!(resolve_prompt(&prompt, &file).unwrap().as_deref(), Some("prompt from file"));
+        assert_eq!(
+            resolve_prompt(&prompt, &file).unwrap().as_deref(),
+            Some("prompt from file")
+        );
     }
 
     #[test]
@@ -537,7 +594,10 @@ mod tests {
 
     #[test]
     fn list_has_an_ls_alias() {
-        assert!(matches!(parse(&["ls"]).unwrap().command, Some(Command::List)));
+        assert!(matches!(
+            parse(&["ls"]).unwrap().command,
+            Some(Command::List)
+        ));
     }
 
     #[test]

@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"        # floor set by ratatui 0.30 (the live-preview TUI)
 license = "MIT"
 repository = "https://github.com/k4black/hex"
 
@@ -27,6 +27,9 @@ fs4 = { version = "1", features = ["sync"] }   # OS advisory file locks (maintai
 uuid = { version = "1", features = ["v4"] }    # collision-resistant run-id suffixes
 humantime = "2"              # parse `30m`/`2h`/`500ms` budget durations
 thiserror = "2"              # derive Display/Error on the runtime error type
+# inline-viewport TUI for the live run preview; unstable-rendered-line-info
+# provides Paragraph::line_count for wrapping inserted lines.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 criterion = "0.7"
 # Dev-only: test the `hex` binary end-to-end.
 assert_cmd = "2"

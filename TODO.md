@@ -167,10 +167,16 @@ Phase-2 kernel; none change kernel semantics.
 - [ ] Proper ASCII graph rendering for `hex graph`: a real laid-out diagram
       (boxes + arrows, cycles visible), not today's flat node/edge list; keep
       `--format ascii|mermaid|dot` so the same IR renders to each.
-- [ ] Live agent-output preview during a run: under the streamed event lines,
-      show the last ~8–12 lines of the *currently in-flight attempt's* stdout,
-      refreshing in place as the agent prints (tail `attempts/<id>/stdout.log`;
-      TTY-only, collapses to the final event line when the attempt ends).
+- [x] Live agent-output preview during a run (shipped 2026-07-21): a sticky
+      footer (ratatui inline viewport) tails the in-flight attempt's stdout and
+      stderr (interleaved best-effort — per-stream order exact, cross-stream is
+      poll order not chronological, stderr dimmed) while the driver blocks, with a
+      status line (node · worker · attempt N/budget · spinner elapsed · deadline
+      countdown), including the current not-yet-newline partial line.
+      Runtime exposes a `ProgressSink` (`event`/`attempt_started`/
+      `attempt_finished` + `AttemptView`); the CLI renders on a background
+      thread — the worker/kernel are untouched. TTY-only; `--no-preview`/
+      `--json`/non-TTY fall back to plain line streaming.
 - [ ] Dynamic shell completions (bash/zsh/fish): Tab-complete graph names from
       `hex list`, run-ids, verbs, and flags. _Candidate crate:_ `clap_complete`
       (now trivial — the CLI is on clap derive) + `clap_complete` dynamic

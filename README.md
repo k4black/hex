@@ -191,6 +191,7 @@ hex list                 list runnable graphs (project > user > built-in)
 hex validate <graph>     schema, references, bounded cycles, capability match
 hex graph <graph>        render (ascii/mermaid/dot)
 hex run [<graph>]        start a NEW run (no graph → list what's runnable)
+                         [--no-preview] disables the live in-flight pane
 hex resume <run>         continue the SAME run (after pause or crash)
 hex pause|cancel <run>   operator control
 hex status <run>         projected run status
@@ -202,6 +203,11 @@ hex respond <req>        human answer (interactive Q&A; later: approve/reject)
 
 Deliberately absent: `retry`, `replay`, `skip`. Redoing work is always a new
 `run` — the journal keeps the old one inspectable and resumable.
+
+On an interactive terminal, `hex run`/`hex resume` show a **live preview**: a
+sticky footer that tails the in-flight attempt's output with a status line
+(node · worker · attempt N/budget · elapsed · deadline). It auto-disables for a
+non-TTY, `--json`, or `--no-preview`, falling back to plain event-line streaming.
 
 ## Workspace isolation
 

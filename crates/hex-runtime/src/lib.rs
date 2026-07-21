@@ -17,11 +17,12 @@ pub mod loader;
 pub mod preset;
 pub mod workers;
 
+pub use driver::{AttemptView, ProgressSink};
 pub use error::{HexError, Result};
 pub use hex_kernel::graph::NodeKind;
 pub use hex_kernel::{Graph, RunState, Status};
-pub use preset::Entry as GraphEntry;
 pub use hex_proto::{Actor, Command, Disposition, Event, EventBody, PROTOCOL_VERSION};
+pub use preset::Entry as GraphEntry;
 pub use workers::Workers;
 
 use std::collections::BTreeMap;
@@ -77,14 +78,11 @@ pub struct AttemptLog {
 
 /// The in-process runtime: owns config + the worker registry and executes runs
 /// under a project root (the directory containing `.hex/`).
-/// A callback invoked with each event as it is journaled during a run.
-pub type EventObserver = Box<dyn Fn(&Event)>;
-
 pub struct Runtime {
     root: PathBuf,
     config: Config,
     workers: Workers,
-    observer: Option<EventObserver>,
+    sink: Option<Box<dyn ProgressSink>>,
 }
 
 impl Runtime {
@@ -100,7 +98,7 @@ impl Runtime {
             root,
             config,
             workers,
-            observer: None,
+            sink: None,
         })
     }
 
@@ -112,15 +110,16 @@ impl Runtime {
             root,
             config,
             workers,
-            observer: None,
+            sink: None,
         }
     }
 
-    /// Install a callback invoked with every event as it is journaled during a
-    /// `run`/`resume`, so a foreground caller can stream live progress.
+    /// Install a [`ProgressSink`] that observes each journaled event and the
+    /// start/finish of every attempt during a `run`/`resume`, so a foreground
+    /// caller can stream live progress and preview in-flight agent output.
     #[must_use]
-    pub fn on_event(mut self, observer: EventObserver) -> Self {
-        self.observer = Some(observer);
+    pub fn with_progress(mut self, sink: Box<dyn ProgressSink>) -> Self {
+        self.sink = Some(sink);
         self
     }
 
@@ -212,7 +211,9 @@ impl Runtime {
         if let Some(first) = events.first()
             && first.run_id != run_id
         {
-            return Err(HexError::new("journal run id does not match the run directory"));
+            return Err(HexError::new(
+                "journal run id does not match the run directory",
+            ));
         }
 
         // Snapshot integrity: file hash == recorded sha256 == creation hash.
@@ -295,7 +296,7 @@ impl Runtime {
             self.root.clone(),
             journal,
             State::default(),
-            self.observer.as_deref(),
+            self.sink.as_deref(),
         );
 
         session.record(
@@ -349,7 +350,7 @@ impl Runtime {
             self.root.clone(),
             journal,
             state,
-            self.observer.as_deref(),
+            self.sink.as_deref(),
         );
 
         if session.state().is_finished() {
@@ -478,18 +479,23 @@ impl Runtime {
         )?;
         Ok(())
     }
-
 }
 
 /// The run's creation record — hash, inputs, and effective defaults — read in a
 /// single pass over the journal.
-fn run_created(events: &[Event]) -> Option<(String, BTreeMap<String, String>, config::DefaultsSpec)> {
+fn run_created(
+    events: &[Event],
+) -> Option<(String, BTreeMap<String, String>, config::DefaultsSpec)> {
     events.iter().find_map(|e| match &e.body {
         EventBody::RunCreated {
             graph_hash,
             inputs,
             defaults,
-        } => Some((graph_hash.clone(), inputs.clone(), defaults_from_map(defaults))),
+        } => Some((
+            graph_hash.clone(),
+            inputs.clone(),
+            defaults_from_map(defaults),
+        )),
         _ => None,
     })
 }
@@ -520,7 +526,9 @@ fn defaults_from_map(map: &BTreeMap<String, String>) -> config::DefaultsSpec {
 fn validate_run_id(run_id: &str) -> Result<()> {
     let ok = run_id.len() > 4
         && run_id.starts_with("run_")
-        && run_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        && run_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
     if ok {
         Ok(())
     } else {
@@ -554,7 +562,7 @@ impl RunLock {
             .open(run_dir.join("run.lock"))?;
         // Call the fs4 trait method by path: on a Rust >= 1.89 toolchain the
         // inherent `File::try_lock` (stabilized then) would otherwise shadow it,
-        // and this crate targets rust 1.85 where only fs4 provides locking.
+        // and our MSRV (1.88) predates it, so only fs4 provides locking.
         match fs4::FileExt::try_lock(&file) {
             Ok(()) => {
                 let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());

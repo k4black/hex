@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use hex_kernel::graph::NodeSpec;
+use hex_kernel::graph::{NodeKind, NodeSpec};
 use hex_kernel::{Effect, Graph, RunState, reduce, schedule};
 use hex_proto::{Actor, Disposition, EventBody};
 use hex_worker::WorkRequest;
@@ -17,8 +17,58 @@ use crate::error::{HexError, Result};
 use crate::journal::{Journal, now_ms};
 use crate::workers::Workers;
 
-/// A callback invoked with each event as it is journaled, for live progress.
-pub type Observer<'a> = &'a dyn Fn(&hex_proto::Event);
+/// A snapshot of an attempt about to run, handed to a [`ProgressSink`] so a
+/// client can render a live preview while the (blocking) attempt executes. All
+/// fields are facts the runtime already knows; the sink only renders them.
+pub struct AttemptView {
+    /// The node being attempted.
+    pub node_id: String,
+    /// The node's kind (so a `command` isn't rendered as a `gate`).
+    pub kind: NodeKind,
+    /// This attempt's unique id (its output lives under `attempts/<id>/`).
+    pub attempt_id: String,
+    /// The worker driving an `agent` node; `None` for a `gate`/`command`.
+    pub worker: Option<String>,
+    /// This attempt's ordinal within the run (1-based, all nodes counted).
+    pub attempt_number: u32,
+    /// The run's attempts budget, if one is declared.
+    pub attempts_budget: Option<u32>,
+    /// Remaining time budget at the start of this attempt, if any.
+    pub deadline_ms: Option<u64>,
+    /// Wall-clock start (Unix epoch ms), for a live elapsed timer.
+    pub started_at_ms: u64,
+    /// The file the attempt's stdout streams to, live.
+    pub stdout_log: PathBuf,
+    /// The file the attempt's stderr streams to, live.
+    pub stderr_log: PathBuf,
+}
+
+/// A live-progress consumer. The runtime calls these around each attempt; the
+/// client (CLI) renders. This is the one presentation seam — the runtime never
+/// renders. Default no-ops let a sink implement only what it needs.
+pub trait ProgressSink {
+    /// A newly journaled event (streamed as it happens).
+    fn event(&self, _event: &hex_proto::Event) {}
+    /// An attempt is about to run; its output streams to the view's log files
+    /// for the duration. Followed by exactly one [`Self::attempt_finished`].
+    fn attempt_started(&self, _view: &AttemptView) {}
+    /// The in-flight attempt finished (or failed); tear any live preview down.
+    fn attempt_finished(&self) {}
+}
+
+/// Fires [`ProgressSink::attempt_finished`] on scope exit — including a panic
+/// unwind from the opaque worker — so every `attempt_started` is paired even if
+/// `Worker::run` panics. The sink ref is a shared borrow of the runtime's sink,
+/// independent of the `&mut self` record calls it lives across.
+struct FinishGuard<'s>(Option<&'s dyn ProgressSink>);
+
+impl Drop for FinishGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(sink) = self.0 {
+            sink.attempt_finished();
+        }
+    }
+}
 
 /// One run's mutable execution context: the graph, its workers, the journal,
 /// and the projected state folded from it.
@@ -30,7 +80,7 @@ pub struct Session<'a> {
     workdir: PathBuf,
     journal: Journal,
     state: RunState,
-    observer: Option<Observer<'a>>,
+    sink: Option<&'a dyn ProgressSink>,
 }
 
 impl<'a> Session<'a> {
@@ -46,7 +96,7 @@ impl<'a> Session<'a> {
         workdir: PathBuf,
         journal: Journal,
         state: RunState,
-        observer: Option<Observer<'a>>,
+        sink: Option<&'a dyn ProgressSink>,
     ) -> Self {
         Self {
             graph,
@@ -56,7 +106,7 @@ impl<'a> Session<'a> {
             workdir,
             journal,
             state,
-            observer,
+            sink,
         }
     }
 
@@ -77,8 +127,8 @@ impl<'a> Session<'a> {
         let event = self
             .journal
             .append(&self.run_id, node_id, attempt_id, actor, body)?;
-        if let Some(observe) = self.observer {
-            observe(&event);
+        if let Some(sink) = self.sink {
+            sink.event(&event);
         }
         self.state = reduce(self.graph, std::mem::take(&mut self.state), &event);
         Ok(())
@@ -142,9 +192,12 @@ impl<'a> Session<'a> {
                 attempt_id,
                 idempotency_key,
             } => self.run_gate(&node_id, &attempt_id, &idempotency_key),
-            Effect::RecordTerminal { disposition } => {
-                self.record(None, None, Actor::runtime(), EventBody::RunFinished { disposition })
-            }
+            Effect::RecordTerminal { disposition } => self.record(
+                None,
+                None,
+                Actor::runtime(),
+                EventBody::RunFinished { disposition },
+            ),
             Effect::RequestHuman { node_id } => {
                 // The slim MVP has no human transport; fail closed, legibly.
                 self.record(
@@ -178,9 +231,16 @@ impl<'a> Session<'a> {
             ..
         } = &node.spec
         else {
-            return self.fail_attempt(node_id, attempt_id, "not an agent node", Disposition::Failed);
+            return self.fail_attempt(
+                node_id,
+                attempt_id,
+                "not an agent node",
+                Disposition::Failed,
+            );
         };
         let worker_name = worker.clone();
+        // Capture before `record` (its `&mut self`) ends the `node` borrow.
+        let kind = node.spec.kind();
 
         // intent-before-effect: the attempt is on the record before it runs.
         self.record(
@@ -203,6 +263,23 @@ impl<'a> Session<'a> {
         };
 
         let attempt_dir = self.attempt_dir(attempt_id)?;
+        let deadline_ms = self.attempt_deadline();
+        // The sink is a shared ref (Copy), so we can hold it across the `&mut
+        // self` record calls below without borrowing `self`.
+        let sink = self.sink;
+        if let Some(s) = sink {
+            let view = self.attempt_view(
+                node_id,
+                kind,
+                attempt_id,
+                Some(worker_name.clone()),
+                &attempt_dir,
+                deadline_ms,
+            );
+            s.attempt_started(&view);
+        }
+        // Pairs attempt_finished on scope exit, even if adapter.run panics.
+        let _finish = FinishGuard(sink);
         let request = WorkRequest {
             run_id: self.run_id.clone(),
             node_id: node_id.to_owned(),
@@ -211,7 +288,7 @@ impl<'a> Session<'a> {
             may_propose: may_propose.clone(),
             workdir: self.workdir.clone(),
             attempt_dir,
-            deadline_ms: self.attempt_deadline(),
+            deadline_ms,
         };
         let outcome = adapter.run(&request);
 
@@ -255,6 +332,8 @@ impl<'a> Session<'a> {
                 );
             }
         };
+        // Capture before `record` (its `&mut self`) ends the `node` borrow.
+        let kind = node.spec.kind();
 
         self.record(
             Some(node_id),
@@ -267,10 +346,19 @@ impl<'a> Session<'a> {
         )?;
 
         let attempt_dir = self.attempt_dir(attempt_id)?;
+        let deadline_ms = self.attempt_deadline();
+        let sink = self.sink;
+        if let Some(s) = sink {
+            // A gate/command has no worker; its command's output still streams.
+            let view =
+                self.attempt_view(node_id, kind, attempt_id, None, &attempt_dir, deadline_ms);
+            s.attempt_started(&view);
+        }
+        let _finish = FinishGuard(sink);
         // An infrastructure failure (spawn/log/timeout) is NOT a `failed`
         // verdict — routing it as `failed` would feed a token-spending loop on
         // false evidence. Only a real exit status yields passed/failed.
-        match run_process(&command, &self.workdir, &attempt_dir, self.attempt_deadline()) {
+        match run_process(&command, &self.workdir, &attempt_dir, deadline_ms) {
             Ok(passed) => {
                 let signal = if passed { "passed" } else { "failed" };
                 self.record(
@@ -319,6 +407,31 @@ impl<'a> Session<'a> {
         let dir = self.run_dir.join("attempts").join(attempt_id);
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+
+    /// Assemble the [`AttemptView`] for the attempt now starting. Call after the
+    /// `AttemptStarted` event is folded, so `attempts_total` counts this one.
+    fn attempt_view(
+        &self,
+        node_id: &str,
+        kind: NodeKind,
+        attempt_id: &str,
+        worker: Option<String>,
+        attempt_dir: &Path,
+        deadline_ms: Option<u64>,
+    ) -> AttemptView {
+        AttemptView {
+            node_id: node_id.to_owned(),
+            kind,
+            attempt_id: attempt_id.to_owned(),
+            worker,
+            attempt_number: self.state.attempts_total,
+            attempts_budget: self.graph.budget.attempts,
+            deadline_ms,
+            started_at_ms: now_ms(),
+            stdout_log: attempt_dir.join("stdout.log"),
+            stderr_log: attempt_dir.join("stderr.log"),
+        }
     }
 }
 
