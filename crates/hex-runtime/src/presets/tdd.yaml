@@ -1,5 +1,7 @@
 version: 1
 name: tdd
+description: "Test-first: write a proven-failing test, then make it pass (proven green)"
+example: "add input validation to the signup form"
 
 # Test-first loop with a proven-red step: an agent writes a failing test, a gate
 # proves it actually fails, another agent makes it pass, and a gate proves it

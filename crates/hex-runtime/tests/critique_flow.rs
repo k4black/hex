@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use hex_proto::{Actor, Disposition, EventBody};
 use hex_runtime::config::Config;
 use hex_runtime::journal::Journal;
-use hex_runtime::{Runtime, Status, Workers};
+use hex_runtime::{Isolation, Runtime, Status, Workers};
 use hex_worker::{CommandWorker, MockWorker, ResultCapture};
 
 /// A critique loop whose agents are the `mock` worker and whose gate is `true`.
@@ -106,7 +106,9 @@ fn node_result_is_captured_and_handed_to_the_downstream_prompt() {
         )),
     );
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers);
-    let report = runtime.start("handoff", None, None).expect("run");
+    let report = runtime
+        .start("handoff", None, None, &Isolation::Shared)
+        .expect("run");
     assert_eq!(
         report.disposition,
         Disposition::Succeeded,
@@ -200,7 +202,7 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers)
         .with_progress(Box::new(rec.clone()));
     let report = runtime
-        .start("test-critique", Some("the thing"), None)
+        .start("test-critique", Some("the thing"), None, &Isolation::Shared)
         .expect("run");
     assert_eq!(report.disposition, Disposition::Succeeded);
 
@@ -293,7 +295,7 @@ fn progress_sink_pairs_start_and_finish_even_when_an_attempt_fails() {
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers)
         .with_progress(Box::new(rec.clone()));
     let report = runtime
-        .start("test-critique", Some("x"), None)
+        .start("test-critique", Some("x"), None, &Isolation::Shared)
         .expect("run");
     assert_eq!(report.disposition, Disposition::Failed);
 
@@ -341,7 +343,7 @@ fn progress_sink_finishes_even_when_the_worker_panics() {
     // backtrace to the test log; we deliberately don't touch the process-global
     // panic hook, which would race with other tests running in parallel.)
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.start("test-critique", Some("x"), None)
+        runtime.start("test-critique", Some("x"), None, &Isolation::Shared)
     }));
     assert!(
         outcome.is_err(),
@@ -376,7 +378,7 @@ fn critique_loop_runs_to_success() {
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers);
 
     let report = runtime
-        .start("test-critique", Some("the thing"), None)
+        .start("test-critique", Some("the thing"), None, &Isolation::Shared)
         .expect("run");
     assert_eq!(report.disposition, Disposition::Succeeded);
 
@@ -411,7 +413,7 @@ fn budget_exhaustion_fails_closed() {
     let runtime = Runtime::with_workers(root, Config::builtin(), workers);
 
     let report = runtime
-        .start("test-critique", Some("the thing"), None)
+        .start("test-critique", Some("the thing"), None, &Isolation::Shared)
         .expect("run");
     assert_eq!(report.disposition, Disposition::BudgetExhausted);
 }
@@ -707,7 +709,9 @@ accept:
     workers.insert("mock", Box::new(mock));
     let runtime = Runtime::with_workers(root, Config::builtin(), workers);
 
-    let report = runtime.start("timeout", None, None).expect("run");
+    let report = runtime
+        .start("timeout", None, None, &Isolation::Shared)
+        .expect("run");
     assert_eq!(report.disposition, Disposition::TimedOut);
     // The disposition is backed by a single durable terminal event: a
     // disposition-bearing AttemptFailed (no separate RunFinished / crash window).

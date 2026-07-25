@@ -145,8 +145,28 @@ adding surface. (Split out from the old mega "Phase 2"; UX/authoring is Phase 3.
       snapshot written by an older hex still resumes. Moot pre-release (no
       persisted runs, `.hex/runs` gitignored); required before 1.0. Pairs with
       the canonical compiled-snapshot item above.
-- [ ] Isolation: per-run `worktree` opt-in (branch left for manual
-      integration; no auto-merge).
+- [x] Isolation: per-run `worktree` opt-in (shipped 2026-07-21, thin slice):
+      `hex run --worktree [<base>]` / `--no-worktree` leases a **pooled**,
+      reusable git-worktree slot (`.hex/worktrees/<n>/`, gitignored) on branch
+      `hex/<run-id>` from HEAD/`<base>`; deps stay warm across reuse, dirty slots
+      are reclaimed-and-logged, parallel runs grow the pool (fs4-locked). Journal
+      + control channel stay in the main `.hex/runs`; codex gets `--add-dir` so
+      its sandbox can still write them. `--worktree-init "<argv>"` warms a fresh/
+      reclaimed slot. hex never commits — an injected banner asks the agent to.
+      No auto-merge; branch left for manual integration. Design:
+      `docs/design/2026-07-21-worktree-isolation.md`.
+- [ ] Isolation follow-ups: `hex worktree` list/cleanup/prune (respecting
+      `git worktree lock`, never removing unmerged work); integration verbs
+      (`diff`/`merge`/`apply`); a concurrency cap; dep/build-cache ergonomics
+      (`CARGO_TARGET_DIR`, pnpm store, `.worktreeinclude`); a graph-YAML
+      `isolation:` default field; enforced (OS-sandbox) read-only as a second
+      isolation axis; a bounded warmup (`--worktree-init`) with a deadline.
+- [ ] **Typed isolation journal record.** Worktree metadata currently rides in
+      `RunCreated.inputs` as stringly-typed `worktree.*` keys (see `WT_*` consts
+      in `hex-runtime/src/lib.rs`); promote to a typed, fold-validated record on
+      the versioned proto (like `graph_hash`) so it's integrity-bound, not an
+      unvalidated map in the stable surface. Retires `WorkRequest.extra_writable_dir`
+      too once a non-workspace control transport lands.
 
 ## Phase 3 — operator experience, authoring & presets
 
@@ -259,6 +279,13 @@ Phase-2 kernel; none change kernel semantics.
       `session_resume`.
 - [ ] `hex respond` / steering flow from any client; sessions resumable via
       `hex resume` after interruption.
+- [ ] **Interactive run UX**: combine the live preview (sticky footer, last-N
+      lines + timer) with inbound steering — while a run executes (esp. in a
+      worktree), the operator watches the agent's output *and* can type messages
+      to the running agent (journaled `human.message`, delivered over the
+      worker's `live_steering` channel). Needs the live-preview loop to accept
+      stdin without tearing the viewport, and a worker transport that can inject
+      a mid-attempt turn.
 - [ ] Worker channel, transport 2: MCP tool hooks (`propose(event)`,
       `finish_session(status)`) lowering to the same `Command`. _Candidate
       crate:_ `rmcp` (the official Rust MCP SDK) — shared with the Phase 7

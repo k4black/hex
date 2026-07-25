@@ -73,6 +73,16 @@ impl Drop for FinishGuard<'_> {
     }
 }
 
+/// The active worktree for an isolated run: what the agent commit banner names
+/// and the signal that the control channel lives outside the workspace.
+#[derive(Clone)]
+pub struct WorktreeCtx {
+    /// The run's branch, `hex/<run-id>`.
+    pub branch: String,
+    /// The base ref the worktree was cut from (`HEAD` or a branch name).
+    pub base_ref: String,
+}
+
 /// One run's mutable execution context: the graph, its workers, the journal,
 /// and the projected state folded from it.
 pub struct Session<'a> {
@@ -86,6 +96,8 @@ pub struct Session<'a> {
     /// The operator prompt, substituted into `{{prompt}}` at attempt-start (last,
     /// as opaque data). `None` only when the graph doesn't reference it.
     prompt: Option<String>,
+    /// Present when the run is isolated in a git worktree.
+    worktree: Option<WorktreeCtx>,
     sink: Option<&'a dyn ProgressSink>,
 }
 
@@ -103,6 +115,7 @@ impl<'a> Session<'a> {
         journal: Journal,
         state: RunState,
         prompt: Option<String>,
+        worktree: Option<WorktreeCtx>,
         sink: Option<&'a dyn ProgressSink>,
     ) -> Self {
         Self {
@@ -114,6 +127,7 @@ impl<'a> Session<'a> {
             journal,
             state,
             prompt,
+            worktree,
             sink,
         }
     }
@@ -255,7 +269,16 @@ impl<'a> Session<'a> {
         // value) and `{{node.result}}` (upstream results, untrusted-wrapped).
         // Inserted values are never re-scanned, so operator/result text
         // containing braces can't be reinterpreted as template tokens.
-        let resolved_prompt = interpolate(prompt, self.prompt.as_deref(), &self.state.results);
+        let mut resolved_prompt = interpolate(prompt, self.prompt.as_deref(), &self.state.results);
+        // Under worktree isolation, tell the agent it's on a throwaway branch and
+        // ask it to commit its own work (hex never commits) — committing both
+        // preserves the work and frees the slot for warm reuse. A read_only
+        // reviewer shouldn't commit, so it gets no banner.
+        if let Some(wt) = &self.worktree
+            && !read_only
+        {
+            resolved_prompt.push_str(&worktree_banner(&wt.branch, &wt.base_ref));
+        }
 
         // intent-before-effect: the attempt is on the record before it runs.
         self.record(
@@ -305,6 +328,9 @@ impl<'a> Session<'a> {
             attempt_dir,
             deadline_ms,
             read_only,
+            // The control channel lives under run_dir (main `.hex`), outside the
+            // worktree workspace — a path-sandboxed worker must keep it writable.
+            extra_writable_dir: self.worktree.as_ref().map(|_| self.run_dir.clone()),
         };
         let WorkOutcome {
             signal,
@@ -528,6 +554,17 @@ fn run_process(
         }),
         Err(e) => Err(ProcFail::infra(format!("gate wait failed: {e}"))),
     }
+}
+
+/// The instruction appended to an agent's prompt when the run is isolated in a
+/// git worktree — hex makes no commits itself, so the agent is asked to.
+fn worktree_banner(branch: &str, base_ref: &str) -> String {
+    format!(
+        "\n\n[hex] You are working in an isolated git worktree on branch `{branch}` \
+         (cut from `{base_ref}`). Your changes will NOT be merged automatically. When \
+         your task is complete, commit your work in this worktree with a clear message, \
+         and summarize what you changed in your final message."
+    )
 }
 
 /// Render an author template over the shared kernel grammar

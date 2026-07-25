@@ -12,7 +12,7 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use hex_runtime::{Disposition, Runtime};
+use hex_runtime::{Disposition, Isolation, Runtime};
 
 mod preview;
 
@@ -86,6 +86,21 @@ enum Command {
         /// Name this run (used in the run id; else <workflow>-<short-uuid>)
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// Run in an isolated git worktree, branched from BASE (default HEAD)
+        #[arg(
+            long,
+            value_name = "BASE",
+            num_args = 0..=1,
+            default_missing_value = "",
+            conflicts_with = "no_worktree"
+        )]
+        worktree: Option<String>,
+        /// Force the shared workspace (project root), overriding any default
+        #[arg(long)]
+        no_worktree: bool,
+        /// Warmup argv run once in a fresh/reclaimed worktree (no shell)
+        #[arg(long, value_name = "CMD", requires = "worktree")]
+        worktree_init: Option<String>,
     },
     /// Resume the SAME run from its journal (after a pause or crash)
     Resume {
@@ -160,11 +175,15 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             prompt,
             file,
             name,
+            worktree,
+            no_worktree,
+            worktree_init,
         } => cmd_run(
             graph.as_deref(),
             &prompt,
             &file,
             name.as_deref(),
+            isolation_from(worktree.as_deref(), no_worktree, worktree_init.as_deref()),
             json,
             no_preview,
         ),
@@ -208,13 +227,22 @@ fn cmd_list(json: bool) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Print the runnable graphs (shared by `hex list` and bare `hex run`).
+/// Print the runnable graphs (shared by `hex list` and bare `hex run`). Each
+/// entry shows its name + origin, a one-line description, and a ready-to-run
+/// example invocation.
 fn print_graph_list(runtime: &Runtime, json: bool) {
     let graphs = runtime.list_graphs();
     if json {
         let items: Vec<_> = graphs
             .iter()
-            .map(|g| serde_json::json!({"name": g.name, "origin": g.origin}))
+            .map(|g| {
+                serde_json::json!({
+                    "name": g.name,
+                    "origin": g.origin,
+                    "description": g.description,
+                    "example": g.example,
+                })
+            })
             .collect();
         println!("{}", serde_json::json!({ "graphs": items }));
         return;
@@ -223,12 +251,15 @@ fn print_graph_list(runtime: &Runtime, json: bool) {
         println!("no graphs found (add one to .hex/graphs/ or ~/.config/hex/graphs/)");
         return;
     }
-    println!("available graphs:");
-    let width = graphs.iter().map(|g| g.name.len()).max().unwrap_or(0);
+    println!("available graphs:\n");
     for g in &graphs {
-        println!("  {:<width$}  {}", g.name, g.origin, width = width);
+        println!("  {}  ({})", g.name, g.origin);
+        if let Some(desc) = &g.description {
+            println!("      {desc}");
+        }
+        let example = g.example.as_deref().unwrap_or("<prompt>");
+        println!("      hex run {} -p \"{example}\"\n", g.name);
     }
-    println!("\nrun one with:  hex run <name> -p \"<prompt>\"");
 }
 
 fn cmd_validate(reference: &str, json: bool) -> Result<ExitCode, String> {
@@ -290,11 +321,30 @@ fn cmd_graph(reference: &str, json: bool) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Build the isolation policy from the CLI flags. `--no-worktree` (or neither
+/// flag) → shared; `--worktree` → worktree from HEAD; `--worktree <base>` → from
+/// that base. `--worktree-init "<argv>"` is whitespace-split (no shell).
+fn isolation_from(worktree: Option<&str>, no_worktree: bool, init: Option<&str>) -> Isolation {
+    if no_worktree {
+        return Isolation::Shared;
+    }
+    match worktree {
+        None => Isolation::Shared,
+        Some(base) => Isolation::Worktree {
+            base: (!base.is_empty()).then(|| base.to_owned()),
+            init: init
+                .map(|s| s.split_whitespace().map(str::to_owned).collect())
+                .unwrap_or_default(),
+        },
+    }
+}
+
 fn cmd_run(
     reference: Option<&str>,
     prompt: &Option<String>,
     file: &Option<String>,
     name: Option<&str>,
+    isolation: Isolation,
     json: bool,
     no_preview: bool,
 ) -> Result<ExitCode, String> {
@@ -306,7 +356,7 @@ fn cmd_run(
     };
     let prompt = resolve_prompt(prompt, file)?;
     let report = runtime
-        .start(reference, prompt.as_deref(), name)
+        .start(reference, prompt.as_deref(), name, &isolation)
         .map_err(|e| e.to_string())?;
     if json {
         let v = serde_json::json!({

@@ -21,12 +21,43 @@ struct RawGraph {
     #[serde(default = "one")]
     version: u32,
     name: String,
+    /// One-line summary shown by `hex list`.
+    #[serde(default)]
+    description: Option<String>,
+    /// A short example operator prompt shown by `hex list`.
+    #[serde(default)]
+    example: Option<String>,
     entry: String,
     #[serde(default)]
     defaults: RawDefaults,
     nodes: BTreeMap<String, RawNode>,
     #[serde(default)]
     accept: RawAccept,
+}
+
+/// A graph's presentation metadata for `hex list` — parsed without building or
+/// validating the full IR, so a graph with a downstream error still lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphMeta {
+    /// The graph's declared name.
+    pub name: String,
+    /// One-line summary, if declared.
+    pub description: Option<String>,
+    /// Example operator prompt, if declared.
+    pub example: Option<String>,
+}
+
+/// Parse just a graph's `name`/`description`/`example` from its YAML source.
+///
+/// # Errors
+/// Fails if the source is not a parseable graph surface.
+pub fn metadata(source: &str) -> Result<GraphMeta> {
+    let raw: RawGraph = yaml_serde::from_str(source)?;
+    Ok(GraphMeta {
+        name: raw.name,
+        description: raw.description,
+        example: raw.example,
+    })
 }
 
 fn one() -> u32 {

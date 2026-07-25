@@ -1,5 +1,7 @@
 version: 1
 name: plan-build-review
+description: "Full pipeline — plan, implement, test, cross-model review; passes only when green & approved"
+example: "refactor the auth module to use middleware"
 
 # The full pipeline: plan → implement → test → review. The planner's result is
 # handed to the implementer and reviewer as {{plan.result}}; a different model

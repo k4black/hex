@@ -1,5 +1,7 @@
 version: 1
 name: critique-loop
+description: "Cross-model loop — claude implements, codex reviews, gated by tests, until approved & green"
+example: "add retry with exponential backoff to the HTTP client"
 
 # The flagship built-in: claude implements, codex critiques (a different model
 # reviews than wrote the code), a gate proves it, and the loop repeats until the

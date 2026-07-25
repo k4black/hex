@@ -211,7 +211,18 @@ sign-off, confirmation.
    orphaned attempt `interrupted` before re-attempting (never a silent rerun).
 7. `hex-mcp`/`hex-dashboard` are deliberate stubs; they become thin
    `RuntimeClient` clients — a transport/projection, never orchestration.
-8. Worktree isolation is per-run and opt-in (`isolation: worktree`, Phase 2),
-   default `shared`; **no auto-merge** — the branch is left for explicit
-   integration.
+8. Worktree isolation is per-run and opt-in (`hex run --worktree [<base>]` /
+   `--no-worktree`), default `shared`; **no auto-merge** — the branch
+   `hex/<run-id>` is left for explicit integration. Implemented as a thin slice
+   (`hex-runtime/src/worktree.rs`): a **pooled** reusable slot under
+   `.hex/worktrees/<n>/` (gitignored, fs4-locked like a run) — clean slots are
+   reused (warm deps), dirty ones reclaimed-and-logged, parallel runs grow the
+   pool. `workdir` = the slot; the journal + `emit`/`result` control files stay
+   in the main `.hex/runs/<id>` (so the worktree diff stays clean and survives a
+   discarded slot), and codex gets `--add-dir <run_dir>` so its `workspace-write`
+   sandbox can still write them. hex never commits — the driver appends a banner
+   asking the agent to. `--worktree-init "<argv>"` warms a fresh/reclaimed slot.
+   Follow-ups (cleanup/prune verbs, `git worktree lock`, integration verbs,
+   OS-sandbox read-only, graph-YAML field) are unbuilt. Design doc:
+   `docs/design/2026-07-21-worktree-isolation.md`.
 9. _add new gotchas here as they are discovered_

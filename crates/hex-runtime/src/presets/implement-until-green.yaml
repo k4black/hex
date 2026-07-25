@@ -1,5 +1,7 @@
 version: 1
 name: implement-until-green
+description: "One agent implements; the test gate is the only backpressure, looping until green"
+example: "make the failing parser tests pass"
 
 # The Ralph loop: one agent implements, the test gate is the only backpressure,
 # and the loop repeats until the tests pass. No reviewer. The implement node

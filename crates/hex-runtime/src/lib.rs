@@ -16,6 +16,7 @@ pub mod journal;
 pub mod loader;
 pub mod preset;
 pub mod workers;
+pub mod worktree;
 
 pub use driver::{AttemptView, ProgressSink};
 pub use error::{HexError, Result};
@@ -24,6 +25,7 @@ pub use hex_kernel::{Graph, RunState, Status};
 pub use hex_proto::{Actor, Command, Disposition, Event, EventBody, PROTOCOL_VERSION};
 pub use preset::Entry as GraphEntry;
 pub use workers::Workers;
+pub use worktree::Isolation;
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -34,6 +36,13 @@ use config::Config;
 use driver::{Session, check_workers, graph_hash};
 use hex_kernel::{RunState as State, reduce};
 use journal::Journal;
+
+// Keys under which a run's worktree lease is recorded in `RunCreated.inputs`
+// (written by `start`, read back by `resume`). Stringly-typed for now — a typed,
+// validated journal record is a tracked follow-up (see TODO.md).
+const WT_SLOT: &str = "worktree.slot";
+const WT_BRANCH: &str = "worktree.branch";
+const WT_BASE_REF: &str = "worktree.base_ref";
 
 /// The outcome of starting or resuming a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +297,7 @@ impl Runtime {
         reference: &str,
         prompt: Option<&str>,
         name: Option<&str>,
+        isolation: &Isolation,
     ) -> Result<RunReport> {
         // Resolve the source exactly once, then compile that same text — no
         // second resolution that could observe a changed file (TOCTOU).
@@ -306,6 +316,30 @@ impl Runtime {
         std::fs::create_dir_all(run_dir.join("attempts"))?;
         let _lock = RunLock::acquire(&run_dir)?;
 
+        // Isolation: lease a git worktree (held for the run) if requested. Its
+        // metadata rides in the RunCreated inputs so `resume` reattaches to it.
+        let mut inputs: BTreeMap<String, String> = prompt
+            .map(|p| BTreeMap::from([("prompt".to_owned(), p.to_owned())]))
+            .unwrap_or_default();
+        let mut workdir = self.root.clone();
+        let mut worktree_ctx = None;
+        let mut slot = None;
+        if let Isolation::Worktree { base, init } = isolation {
+            let leased = self.setup_worktree(&run_id, base.as_deref(), init, &run_dir)?;
+            workdir = leased.dir.clone();
+            inputs.insert(
+                WT_SLOT.to_owned(),
+                leased.dir.to_string_lossy().into_owned(),
+            );
+            inputs.insert(WT_BRANCH.to_owned(), leased.branch.clone());
+            inputs.insert(WT_BASE_REF.to_owned(), leased.base_ref.clone());
+            worktree_ctx = Some(driver::WorktreeCtx {
+                branch: leased.branch.clone(),
+                base_ref: leased.base_ref.clone(),
+            });
+            slot = Some(leased);
+        }
+
         // Persist the exact graph snapshot + its hash. The effective defaults
         // are recorded in the RunCreated event (below), not a separate unbound
         // file, so resume is bound to them and independent of later config edits.
@@ -319,10 +353,11 @@ impl Runtime {
             &self.workers,
             run_id.clone(),
             run_dir,
-            self.root.clone(),
+            workdir,
             journal,
             State::default(),
             prompt.map(ToOwned::to_owned),
+            worktree_ctx,
             self.sink.as_deref(),
         );
 
@@ -332,20 +367,58 @@ impl Runtime {
             Actor::runtime(),
             EventBody::RunCreated {
                 graph_hash: hash,
-                inputs: prompt
-                    .map(|p| BTreeMap::from([("prompt".to_owned(), p.to_owned())]))
-                    .unwrap_or_default(),
+                inputs,
                 defaults: defaults_to_map(&self.config.defaults),
             },
         )?;
+        // A reclaimed slot discarded a prior run's uncommitted work — record
+        // exactly what, in this run's authoritative journal.
+        if let Some(report) = slot.as_ref().and_then(|s| s.reclaimed.as_deref())
+            && !report.is_empty()
+        {
+            session.record(
+                None,
+                None,
+                Actor::runtime(),
+                EventBody::Note {
+                    text: format!(
+                        "worktree slot reclaimed; discarded a prior run's uncommitted changes:\n{report}"
+                    ),
+                },
+            )?;
+        }
         session.record(None, None, Actor::runtime(), EventBody::RunStarted)?;
 
         let disposition = session.drive()?;
+        drop(slot); // release the worktree lock only after the run finishes
         Ok(RunReport {
             run_id,
             origin: resolved.origin,
             disposition,
         })
+    }
+
+    /// Lease and prime a worktree slot for a run. Fails closed outside a git repo.
+    fn setup_worktree(
+        &self,
+        run_id: &str,
+        base: Option<&str>,
+        init: &[String],
+        run_dir: &Path,
+    ) -> Result<worktree::Slot> {
+        if !worktree::is_git_repo(&self.root) {
+            return Err(HexError::new(
+                "`--worktree` requires the project to be a git repository",
+            ));
+        }
+        worktree::ensure_gitignored(&self.root, ".hex/worktrees/")?;
+        let (base_ref, base_sha) = worktree::resolve_base(&self.root, base)?;
+        let branch = format!("hex/{run_id}");
+        let slot = worktree::lease(&self.root, &branch, &base_ref, &base_sha)?;
+        if slot.warmup_needed && !init.is_empty() {
+            worktree::run_warmup(&slot.dir, init, run_dir)?;
+        }
+        Ok(slot)
     }
 
     /// Resume an existing run from its journal — after a pause or a crash.
@@ -367,7 +440,37 @@ impl Runtime {
         // repaired), which we verify + fold rather than reading the journal again.
         let (journal, events) = Journal::open_append(run_dir.join("events.jsonl"))?;
         // The operator prompt recorded at creation, re-applied at attempt-start.
-        let prompt = run_created(&events).and_then(|(_, inputs, _)| inputs.get("prompt").cloned());
+        // Read the creation record once: the operator prompt plus any recorded
+        // worktree lease to reattach.
+        let created = run_created(&events);
+        let inputs = created.as_ref().map(|(_, inputs, _)| inputs);
+        let prompt = inputs.and_then(|i| i.get("prompt").cloned());
+        let mut workdir = self.root.clone();
+        let mut worktree_ctx = None;
+        // Held for the run's duration (released on drop / crash); never read.
+        let mut _slot_lock = None;
+        if let Some(slot_dir) = inputs.and_then(|i| i.get(WT_SLOT)) {
+            // A recorded worktree with no branch means a corrupt journal — fail
+            // closed rather than handing an empty ref to `git`.
+            let branch = inputs
+                .and_then(|i| i.get(WT_BRANCH))
+                .filter(|b| !b.is_empty())
+                .ok_or_else(|| {
+                    HexError::new("run recorded a worktree but no branch — journal is corrupt")
+                })?
+                .clone();
+            let base_ref = inputs
+                .and_then(|i| i.get(WT_BASE_REF))
+                .cloned()
+                .unwrap_or_default();
+            _slot_lock = Some(worktree::reattach(
+                &self.root,
+                Path::new(slot_dir),
+                &branch,
+            )?);
+            worktree_ctx = Some(driver::WorktreeCtx { branch, base_ref });
+            workdir = PathBuf::from(slot_dir);
+        }
         let (graph, state) = self.verify_and_fold(run_id, &events)?;
         check_workers(&graph, &self.workers)?;
 
@@ -376,10 +479,11 @@ impl Runtime {
             &self.workers,
             run_id.to_owned(),
             run_dir,
-            self.root.clone(),
+            workdir,
             journal,
             state,
             prompt,
+            worktree_ctx,
             self.sink.as_deref(),
         );
 
@@ -639,24 +743,35 @@ struct RunLock {
 
 impl RunLock {
     fn acquire(run_dir: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(run_dir.join("run.lock"))?;
-        // Call the fs4 trait method by path: on a Rust >= 1.89 toolchain the
-        // inherent `File::try_lock` (stabilized then) would otherwise shadow it,
-        // and our MSRV (1.88) predates it, so only fs4 provides locking.
-        match fs4::FileExt::try_lock(&file) {
-            Ok(()) => {
+        match try_lock_file(&run_dir.join("run.lock"))? {
+            Some(file) => {
                 let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
                 Ok(Self { _file: file })
             }
-            Err(fs4::TryLockError::WouldBlock) => Err(HexError::new(
+            None => Err(HexError::new(
                 "run is already active (locked by a live process); refusing a concurrent writer",
             )),
-            Err(fs4::TryLockError::Error(e)) => Err(e.into()),
         }
+    }
+}
+
+/// Take the `fs4` advisory lock on `path`, creating it. `Ok(Some)` = held (keep
+/// the handle alive for the duration of ownership; the OS releases it on
+/// drop/crash), `Ok(None)` = another live process holds it. Shared by `RunLock`
+/// and worktree-slot leasing.
+pub(crate) fn try_lock_file(path: &Path) -> Result<Option<std::fs::File>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    // Call the fs4 trait method by path: on a Rust >= 1.89 toolchain the inherent
+    // `File::try_lock` (stabilized then) would otherwise shadow it, and our MSRV
+    // (1.88) predates it, so only fs4 provides locking.
+    match fs4::FileExt::try_lock(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(fs4::TryLockError::WouldBlock) => Ok(None),
+        Err(fs4::TryLockError::Error(e)) => Err(e.into()),
     }
 }
 
@@ -671,8 +786,13 @@ pub trait RuntimeClient {
     ///
     /// # Errors
     /// Propagates resolution, validation, and IO failures.
-    fn start(&self, reference: &str, prompt: Option<&str>, name: Option<&str>)
-    -> Result<RunReport>;
+    fn start(
+        &self,
+        reference: &str,
+        prompt: Option<&str>,
+        name: Option<&str>,
+        isolation: &Isolation,
+    ) -> Result<RunReport>;
     /// Resume an existing run.
     ///
     /// # Errors
@@ -709,8 +829,9 @@ impl RuntimeClient for Runtime {
         reference: &str,
         prompt: Option<&str>,
         name: Option<&str>,
+        isolation: &Isolation,
     ) -> Result<RunReport> {
-        Runtime::start(self, reference, prompt, name)
+        Runtime::start(self, reference, prompt, name, isolation)
     }
     fn resume(&self, run_id: &str) -> Result<RunReport> {
         Runtime::resume(self, run_id)

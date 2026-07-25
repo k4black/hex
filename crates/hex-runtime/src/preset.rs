@@ -43,6 +43,10 @@ pub struct Entry {
     pub name: String,
     /// Where it resolves from (a path, or `built-in`).
     pub origin: String,
+    /// One-line summary from the graph's `description:`, if any.
+    pub description: Option<String>,
+    /// Example operator prompt from the graph's `example:`, if any.
+    pub example: Option<String>,
 }
 
 /// Resolve `reference` (a path or a preset name) to graph YAML.
@@ -126,7 +130,22 @@ pub fn list(project_root: &Path) -> Vec<Entry> {
     collect_yaml(&project_root.join(".hex").join("graphs"), &mut found);
     found
         .into_iter()
-        .map(|(name, origin)| Entry { name, origin })
+        .map(|(name, origin)| {
+            // Read the winning layer's source to pull its listing metadata; a
+            // graph that fails to parse still lists (just without a description).
+            let source = if origin == "built-in" {
+                builtin(&name).map(ToOwned::to_owned)
+            } else {
+                std::fs::read_to_string(&origin).ok()
+            };
+            let meta = source.and_then(|s| crate::loader::metadata(&s).ok());
+            Entry {
+                name,
+                origin,
+                description: meta.as_ref().and_then(|m| m.description.clone()),
+                example: meta.and_then(|m| m.example),
+            }
+        })
         .collect()
 }
 

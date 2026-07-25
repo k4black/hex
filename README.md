@@ -192,7 +192,10 @@ the code):
 | `review` | reviewer over the current `git diff`, no implementer |
 
 Their gates run `cargo test`; a preset is a starting point — copy it to
-`.hex/graphs/` and change the gate command for your stack.
+`.hex/graphs/` and change the gate command for your stack. `hex list` shows each
+graph with its origin, description, and an example invocation; a custom graph can
+set optional top-level `description:` and `example:` fields to appear the same
+way.
 
 The operator supplies exactly one thing — the **prompt** — inline or from a
 file; it fills `{{prompt}}` wherever the graph's node prompts reference it:
@@ -247,11 +250,16 @@ non-TTY, `--json`, or `--no-preview`, falling back to plain event-line streaming
 
 ## Workspace isolation
 
-Owned by the runtime, declared per graph: `isolation: shared` (default) or
-`worktree` — one field flips the whole run into a fresh git worktree + branch
-so codex/claude can work freely without touching your main working copy. No
-auto-merge: the branch is left for you to inspect and integrate. Per-node
-worktrees + a serialized integration queue arrive with parallelism.
+Owned by the runtime, opt-in per run: `hex run <graph> --worktree [<base>]`
+runs the whole run in a fresh git worktree on branch `hex/<run-id>` (from HEAD,
+or `<base>`) so codex/claude can work freely without touching your main working
+copy; `--no-worktree` (the default) runs in the project root. Worktrees are a
+**reusable pool** under `.hex/worktrees/` (gitignored) so built deps stay warm
+across runs; parallel runs each get their own slot. `--worktree-init "<argv>"`
+primes a fresh slot (`npm ci`, `cargo fetch`, …). **No auto-merge:** the branch
+is left for you to inspect and integrate — hex asks the agent to commit its work
+but never commits or merges itself. Cleanup/integration verbs, per-node
+worktrees, and a serialized integration queue arrive later.
 
 ## Status
 

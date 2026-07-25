@@ -82,7 +82,7 @@ impl CodexWorker {
     /// node's prompt to keep a reviewer from editing. Enforced read-only awaits a
     /// non-workspace control transport (see TODO).
     #[must_use]
-    pub fn command(&self, _read_only: bool) -> Vec<String> {
+    pub fn command(&self, extra_writable: Option<&Path>) -> Vec<String> {
         let mut argv = strs(&[
             "codex",
             "exec",
@@ -92,6 +92,13 @@ impl CodexWorker {
             "--output-last-message",
             "{result}",
         ]);
+        // Under worktree isolation the control files live outside the workspace,
+        // so the sandbox must be told that directory is writable, or `hex emit`/
+        // result capture would be blocked.
+        if let Some(dir) = extra_writable {
+            argv.push("--add-dir".to_owned());
+            argv.push(dir.to_string_lossy().into_owned());
+        }
         if let Some(model) = &self.model {
             argv.push("--model".to_owned());
             argv.push(model.clone());
@@ -108,7 +115,7 @@ impl Worker for CodexWorker {
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         run_agent(
             "codex",
-            &self.command(request.read_only),
+            &self.command(request.extra_writable_dir.as_deref()),
             Some(ResultCapture::File),
             request,
         )
@@ -675,6 +682,7 @@ mod tests {
             attempt_dir: dir.to_path_buf(),
             deadline_ms: None,
             read_only: false,
+            extra_writable_dir: None,
         }
     }
 
@@ -768,24 +776,19 @@ mod tests {
     #[test]
     fn codex_argv_shape() {
         let w = CodexWorker::new(Some("gpt-5".to_owned()));
-        let argv = w.command(false).join(" ");
+        let argv = w.command(None).join(" ");
         assert!(argv.contains("--output-last-message {result}"), "{argv}");
         assert!(
             argv.contains("--model gpt-5") && argv.ends_with("{prompt}"),
             "{argv}"
         );
-        // read_only is advisory: it must NOT switch to a sandbox that would block
-        // writing the emit/result files — workspace-write in both cases.
-        assert!(
-            w.command(false)
-                .join(" ")
-                .contains("--sandbox workspace-write")
-        );
-        assert!(
-            w.command(true)
-                .join(" ")
-                .contains("--sandbox workspace-write")
-        );
+        // Always workspace-write (read_only is advisory and must not block the
+        // emit/result files); no extra writable dir in shared mode.
+        assert!(argv.contains("--sandbox workspace-write"));
+        assert!(!argv.contains("--add-dir"));
+        // Under isolation the control dir outside the workspace is added writable.
+        let iso = w.command(Some(std::path::Path::new("/tmp/run"))).join(" ");
+        assert!(iso.contains("--add-dir /tmp/run"), "{iso}");
     }
 
     #[test]

@@ -48,6 +48,12 @@ pub struct WorkRequest {
     /// writing `HEX_EMIT_FILE`/`HEX_RESULT_FILE`, so workers do not enforce it —
     /// read-only intent is conveyed through the node's prompt. See `agent.rs`.
     pub read_only: bool,
+    /// An extra directory *outside* the workspace the worker must keep writable —
+    /// where the control files (`HEX_EMIT_FILE`/`HEX_RESULT_FILE`) live when they
+    /// sit outside the run's cwd. `None` when they're already under the workspace.
+    /// Only path-sandboxed workers (codex) act on it. This is a stopgap for the
+    /// absent non-workspace control transport (a socket/MCP hook would retire it).
+    pub extra_writable_dir: Option<PathBuf>,
 }
 
 /// What a worker reports after one attempt. On success `signal` is the routing

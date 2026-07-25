@@ -75,6 +75,7 @@ mod tests {
             attempt_dir: PathBuf::from("."),
             deadline_ms: None,
             read_only: false,
+            extra_writable_dir: None,
         }
     }
 
