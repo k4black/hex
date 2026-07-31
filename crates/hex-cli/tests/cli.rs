@@ -17,9 +17,12 @@ fn project() -> TempDir {
     let root = TempDir::new().expect("tempdir");
     let p = root.path();
     std::fs::create_dir_all(p.join(".hex").join("graphs")).expect("mkdir");
+    // `slowbuilder` takes long enough that a detached run is provably still
+    // working after its launcher has exited.
     std::fs::write(
         p.join(".hex").join("config.yaml"),
-        "workers:\n  builder:\n    command: [sh, -c, 'printf ready > \"$HEX_EMIT_FILE\"']\n",
+        "workers:\n  builder:\n    command: [sh, -c, 'printf ready > \"$HEX_EMIT_FILE\"']\n  \
+         slowbuilder:\n    command: [sh, -c, 'sleep 1; printf ready > \"$HEX_EMIT_FILE\"']\n",
     )
     .expect("config");
     std::fs::write(
@@ -32,7 +35,7 @@ entry: build
 defaults: { budget: { attempts: 6 } }
 nodes:
   build: { agent: { worker: builder, prompt: "x", may_propose: [ready] }, on: { ready: test } }
-  test:  { gate: { run: [sh, -c, "exit 0"] }, on: { passed: done, failed: build } }
+  test:  { command: { run: [sh, -c, "exit 0"] }, on: { passed: done, failed: build } }
   done:  { terminal: succeeded }
 accept: { require: [test.passed] }
 "#,
@@ -53,7 +56,48 @@ accept: { require: [] }
 "#,
     )
     .expect("prompt graph");
+    // A graph slow enough to still be running when `--detach` returns.
+    std::fs::write(
+        p.join(".hex").join("graphs").join("slowdemo.yaml"),
+        r#"
+version: 1
+name: slowdemo
+entry: build
+defaults: { budget: { attempts: 4, attempt: 30s } }
+nodes:
+  build: { agent: { worker: slowbuilder, prompt: "x", may_propose: [ready] }, on: { ready: test } }
+  test:  { command: { run: [sh, -c, "exit 0"] }, on: { passed: done, failed: build } }
+  done:  { terminal: succeeded }
+accept: { require: [test.passed] }
+"#,
+    )
+    .expect("slow graph");
     root
+}
+
+/// Poll `hex status --json` until the run finishes, returning its disposition.
+/// Detached runs are the only asynchronous surface in the CLI, so every test that
+/// touches one needs a bounded wait rather than a sleep.
+fn await_disposition(dir: &Path, run_id: &str) -> String {
+    for _ in 0..200 {
+        let out = hex(dir, &["status", run_id, "--json"]);
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout(&out).trim())
+            && let Some(d) = v["disposition"].as_str()
+        {
+            return d.to_owned();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("run {run_id} never finished");
+}
+
+fn run_id_of(out: &Output) -> String {
+    let v: serde_json::Value =
+        serde_json::from_str(stdout(out).trim()).expect("json run report on stdout");
+    v["run_id"]
+        .as_str()
+        .expect("run_id in the report")
+        .to_owned()
 }
 
 /// Run the built `hex` binary in `dir` with an isolated HOME.
@@ -251,6 +295,115 @@ fn logs_show_final_message_by_default_and_full_output_with_flag() {
     let only = hex(dir.path(), &["logs", run_id, "--node", "build"]);
     assert!(stdout(&only).contains("FINAL-SUMMARY"));
     assert!(!stdout(&only).contains("[test]"), "filtered to build only");
+}
+
+/// The point of `--detach`: the launcher prints an id and exits, and the run
+/// keeps going in a process of its own. Both halves are asserted — the run is
+/// still unfinished when the launcher returns, and it finishes anyway.
+#[test]
+fn a_detached_run_outlives_its_launcher() {
+    let dir = project();
+    let out = hex(dir.path(), &["run", "slowdemo", "--detach", "--json"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let run_id = run_id_of(&out);
+
+    // The launcher is gone (we hold its Output) while the run is still working.
+    let listed = hex(dir.path(), &["runs", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(stdout(&listed).trim()).expect("runs json");
+    let row = v["runs"]
+        .as_array()
+        .expect("runs array")
+        .iter()
+        .find(|r| r["run_id"] == run_id.as_str())
+        .expect("the detached run is listed");
+    assert!(
+        row["disposition"].is_null(),
+        "the run must still be unfinished when the launcher exits: {row}"
+    );
+
+    // And it completes without anyone driving it from this process.
+    assert_eq!(await_disposition(dir.path(), &run_id), "succeeded");
+    // Its stdio went to files under the run dir, so the child had somewhere to
+    // stream progress once it was no longer attached to a terminal.
+    let run_dir = dir.path().join(".hex").join("runs").join(&run_id);
+    let child_err = std::fs::read_to_string(run_dir.join("detached.err")).expect("detached.err");
+    assert!(
+        child_err.contains("run_started"),
+        "the detached child streamed its own progress: {child_err}"
+    );
+}
+
+/// `hex wait` blocks on a detached run and exits with its disposition code.
+#[test]
+fn wait_blocks_until_a_detached_run_finishes_and_exits_with_its_code() {
+    let dir = project();
+    let run_id = run_id_of(&hex(dir.path(), &["run", "slowdemo", "--detach", "--json"]));
+    let out = hex(dir.path(), &["wait", &run_id]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("succeeded"), "{}", stdout(&out));
+}
+
+/// `hex steer` on a live detached run reaches that run's journal — the whole
+/// control path through a real process boundary, which is what the inbox is for.
+#[test]
+fn steer_reaches_a_live_detached_run() {
+    let dir = project();
+    let run_id = run_id_of(&hex(dir.path(), &["run", "slowdemo", "--detach", "--json"]));
+    let steer = hex(dir.path(), &["steer", &run_id, "USE-THE-V2-API"]);
+    assert!(steer.status.success(), "stderr: {}", stderr(&steer));
+    assert!(
+        stdout(&steer).contains("queued steer"),
+        "{}",
+        stdout(&steer)
+    );
+
+    assert_eq!(await_disposition(dir.path(), &run_id), "succeeded");
+    let watch = hex(dir.path(), &["watch", &run_id]);
+    assert!(
+        stdout(&watch).contains("steer: USE-THE-V2-API"),
+        "the guidance is on the record: {}",
+        stdout(&watch)
+    );
+}
+
+/// A finished run takes no more commands: queueing one nobody will read would
+/// look like it worked.
+#[test]
+fn control_verbs_refuse_a_finished_run() {
+    let dir = project();
+    let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
+    for args in [
+        vec!["pause", run_id.as_str()],
+        vec!["steer", run_id.as_str(), "late guidance"],
+        vec!["respond", run_id.as_str(), "yes"],
+    ] {
+        let out = hex(dir.path(), &args);
+        assert_eq!(out.status.code(), Some(2), "expected refusal for {args:?}");
+        assert!(
+            stderr(&out).contains("already finished"),
+            "stderr: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn runs_lists_a_finished_run_with_its_state() {
+    let dir = project();
+    let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
+    let out = hex(dir.path(), &["runs"]);
+    assert!(out.status.success());
+    let s = stdout(&out);
+    assert!(s.contains(&run_id), "the run id is findable: {s}");
+    assert!(s.contains("finished:succeeded"), "{s}");
+}
+
+#[test]
+fn runs_on_a_project_with_no_runs_says_so() {
+    let dir = project();
+    let out = hex(dir.path(), &["runs"]);
+    assert!(out.status.success());
+    assert!(stdout(&out).contains("no runs yet"), "{}", stdout(&out));
 }
 
 #[test]

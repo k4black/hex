@@ -4,11 +4,14 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use common::temp_root;
 use hex_proto::{Actor, Disposition, EventBody};
 use hex_runtime::config::Config;
 use hex_runtime::journal::Journal;
 use hex_runtime::{Isolation, Runtime, Status, Workers};
 use hex_worker::{CommandWorker, MockWorker, ResultCapture};
+
+mod common;
 
 /// A critique loop whose agents are the `mock` worker and whose gate is `true`.
 const GRAPH: &str = r#"
@@ -26,23 +29,13 @@ nodes:
     agent: { worker: mock, prompt: "review", may_propose: [approved, changes_requested] }
     on: { approved: test, changes_requested: implement }
   test:
-    gate: { run: [true] }
+    command: { run: ["true"] }
     on: { passed: done, failed: implement }
   done:
     terminal: succeeded
 accept:
   require: [test.passed]
 "#;
-
-fn temp_root(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "hex-e2e-{tag}-{}-{}",
-        std::process::id(),
-        hex_runtime::journal::now_ms()
-    ));
-    std::fs::create_dir_all(&root).expect("mkdir root");
-    root
-}
 
 fn write_graph(root: &std::path::Path) -> PathBuf {
     let dir = root.join(".hex").join("graphs");
@@ -111,7 +104,7 @@ fn node_result_is_captured_and_handed_to_the_downstream_prompt() {
         .expect("run");
     assert_eq!(
         report.disposition,
-        Disposition::Succeeded,
+        Some(Disposition::Succeeded),
         "run reaches done"
     );
 
@@ -137,6 +130,82 @@ fn node_result_is_captured_and_handed_to_the_downstream_prompt() {
 
 fn sh(script: &str) -> Vec<String> {
     vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()]
+}
+
+/// A graph whose acceptance can only be met on the *second* pass: `implement`
+/// routes to the success terminal either way, and `accept.on_unmet` sends the run
+/// back when the required evidence is missing. Edge-acyclic on purpose — the loop
+/// exists only through the reroute.
+const REROUTE_GRAPH: &str = r#"
+version: 1
+name: reroute
+entry: implement
+defaults: { budget: { attempts: 4, attempt: 20s } }
+nodes:
+  implement:
+    agent: { worker: builder, prompt: "implement it", may_propose: [ready, blocked] }
+    on: { ready: done, blocked: done }
+  done:
+    terminal: succeeded
+accept:
+  require: [implement.ready]
+  on_unmet: implement
+"#;
+
+/// The read path is the regression: `accept.on_unmet` worked, and then `status`,
+/// `logs` and `resume` all rejected the run's journal — permanently, since a
+/// journal is append-only — because the lifecycle audit did not advance its
+/// current node across the reroute the way `reduce` did. Driving the run was
+/// never enough to catch it; *reading it afterwards* is.
+#[test]
+fn a_rerouted_run_stays_readable_by_status_logs_and_resume() {
+    let root = temp_root("reroute");
+    let dir = root.join(".hex").join("graphs");
+    std::fs::create_dir_all(&dir).expect("mkdir graphs");
+    std::fs::write(dir.join("reroute.yaml"), REROUTE_GRAPH).expect("write graph");
+
+    // First attempt: `blocked` (acceptance unmet → reroute). Second: `ready`.
+    let mut workers = Workers::new();
+    workers.insert(
+        "builder",
+        Box::new(CommandWorker::new(
+            "builder",
+            sh(
+                "if [ -f been-here ]; then printf ready > \"$HEX_EMIT_FILE\"; \
+                else : > been-here; printf blocked > \"$HEX_EMIT_FILE\"; fi",
+            ),
+        )),
+    );
+    let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers);
+
+    let report = runtime
+        .start("reroute", None, None, &Isolation::Shared)
+        .expect("run");
+    assert_eq!(report.disposition, Some(Disposition::Succeeded));
+
+    // The reroute really happened (otherwise this test proves nothing).
+    let events = runtime.events(&report.run_id).expect("events");
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.body,
+            EventBody::AcceptanceUnmet { to, missing }
+                if to == "implement" && missing == &vec!["implement.ready".to_owned()]
+        )),
+        "{events:#?}"
+    );
+
+    // And every verified read path works on the finished run.
+    let status = runtime
+        .status(&report.run_id)
+        .expect("status must not reject");
+    assert_eq!(status.status, Status::Finished(Disposition::Succeeded));
+    assert_eq!(status.attempts, 2, "the reroute earned a second attempt");
+    let logs = runtime.logs(&report.run_id).expect("logs must not reject");
+    assert_eq!(logs.len(), 2);
+    let resumed = runtime
+        .resume(&report.run_id)
+        .expect("resume must not reject");
+    assert_eq!(resumed.disposition, Some(Disposition::Succeeded));
 }
 
 /// A `ProgressSink` that records the driver's calls so a test can assert the
@@ -204,7 +273,7 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
     let report = runtime
         .start("test-critique", Some("the thing"), None, &Isolation::Shared)
         .expect("run");
-    assert_eq!(report.disposition, Disposition::Succeeded);
+    assert_eq!(report.disposition, Some(Disposition::Succeeded));
 
     let log = rec.log.lock().unwrap();
 
@@ -247,7 +316,7 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
     let expected = [
         ("implement", 1u32, Some("mock")),
         ("review", 2, Some("mock")),
-        ("test", 3, None), // gate: no worker
+        ("test", 3, None), // command: no worker
     ];
     for (start, (exp_node, exp_num, exp_worker)) in starts.iter().zip(expected) {
         let Entry::Start {
@@ -297,7 +366,7 @@ fn progress_sink_pairs_start_and_finish_even_when_an_attempt_fails() {
     let report = runtime
         .start("test-critique", Some("x"), None, &Isolation::Shared)
         .expect("run");
-    assert_eq!(report.disposition, Disposition::Failed);
+    assert_eq!(report.disposition, Some(Disposition::Failed));
 
     let log = rec.log.lock().unwrap();
     let brackets: Vec<&Entry> = log
@@ -380,7 +449,7 @@ fn critique_loop_runs_to_success() {
     let report = runtime
         .start("test-critique", Some("the thing"), None, &Isolation::Shared)
         .expect("run");
-    assert_eq!(report.disposition, Disposition::Succeeded);
+    assert_eq!(report.disposition, Some(Disposition::Succeeded));
 
     // The acceptance evidence is really in the journal.
     let events = runtime.events(&report.run_id).expect("events");
@@ -415,7 +484,7 @@ fn budget_exhaustion_fails_closed() {
     let report = runtime
         .start("test-critique", Some("the thing"), None, &Isolation::Shared)
         .expect("run");
-    assert_eq!(report.disposition, Disposition::BudgetExhausted);
+    assert_eq!(report.disposition, Some(Disposition::BudgetExhausted));
 }
 
 #[test]
@@ -449,6 +518,7 @@ fn tampered_snapshot_is_rejected_on_resume() {
                 graph_hash: "not_the_real_hash".to_owned(),
                 inputs: recorded_prompt(),
                 defaults: Default::default(),
+                checks: Default::default(),
             },
         )
         .unwrap();
@@ -486,6 +556,7 @@ fn write_crashed_run_with_inputs(
             graph_hash: hash,
             inputs,
             defaults: Default::default(),
+            checks: Default::default(),
         },
     )
     .unwrap();
@@ -532,7 +603,7 @@ fn interrupted_run_resumes_from_journal() {
 
     let runtime = finishing_runtime(root);
     let report = runtime.resume(run_id).expect("resume");
-    assert_eq!(report.disposition, Disposition::Succeeded);
+    assert_eq!(report.disposition, Some(Disposition::Succeeded));
 
     let events = runtime.events(run_id).expect("events");
     // The orphaned attempt was explicitly marked, not silently rerun.
@@ -574,6 +645,7 @@ fn crash_right_after_attempt_failed_does_not_rerun() {
                 graph_hash: hash,
                 inputs: recorded_prompt(),
                 defaults: Default::default(),
+                checks: Default::default(),
             },
         )
         .unwrap();
@@ -606,7 +678,7 @@ fn crash_right_after_attempt_failed_does_not_rerun() {
     // A runtime whose mock *would* emit if the node were re-run.
     let root_for_read = root.clone();
     let report = finishing_runtime(root).resume(run_id).expect("resume");
-    assert_eq!(report.disposition, Disposition::Failed);
+    assert_eq!(report.disposition, Some(Disposition::Failed));
     let all = Runtime::with_workers(root_for_read, Config::builtin(), Workers::new())
         .events(run_id)
         .expect("events");
@@ -630,7 +702,7 @@ fn stale_lock_file_does_not_block_resume() {
     let report = runtime
         .resume(run_id)
         .expect("resume despite stale lock file");
-    assert_eq!(report.disposition, Disposition::Succeeded);
+    assert_eq!(report.disposition, Some(Disposition::Succeeded));
 }
 
 #[test]
@@ -655,6 +727,7 @@ fn lifecycle_invalid_journal_is_rejected() {
                 graph_hash: hash,
                 inputs: recorded_prompt(),
                 defaults: Default::default(),
+                checks: Default::default(),
             },
         )
         .unwrap();
@@ -686,13 +759,14 @@ entry: implement
 defaults:
   budget:
     attempts: 4
-    elapsed: 200ms
+    elapsed: 10s
+    attempt: 200ms
 nodes:
   implement:
     agent: { worker: mock, prompt: "x", may_propose: [ready] }
     on: { ready: slow }
   slow:
-    gate: { run: [sleep, "30"] }
+    command: { run: [sleep, "30"] }
     on: { passed: done, failed: done }
   done:
     terminal: succeeded
@@ -712,7 +786,7 @@ accept:
     let report = runtime
         .start("timeout", None, None, &Isolation::Shared)
         .expect("run");
-    assert_eq!(report.disposition, Disposition::TimedOut);
+    assert_eq!(report.disposition, Some(Disposition::TimedOut));
     // The disposition is backed by a single durable terminal event: a
     // disposition-bearing AttemptFailed (no separate RunFinished / crash window).
     let events = runtime.events(&report.run_id).expect("events");
@@ -723,4 +797,172 @@ accept:
             ..
         }
     )));
+}
+
+// ---------------------------------------------------------------------------
+// Project-defined checks: "by default, no checks".
+// ---------------------------------------------------------------------------
+
+/// A loop whose gate is a *project check* rather than a literal argv.
+const CHECK_GRAPH: &str = r#"
+version: 1
+name: check-graph
+entry: implement
+defaults:
+  budget:
+    attempts: 6
+nodes:
+  implement:
+    agent: { worker: mock, prompt: "implement", may_propose: [ready] }
+    on: { ready: test }
+  test:
+    command: { check: test }
+    on: { passed: done, failed: implement }
+  done:
+    terminal: succeeded
+accept:
+  require: [test.passed]
+"#;
+
+fn check_runtime(tag: &str, check: Option<Vec<String>>) -> (Runtime, PathBuf) {
+    let root = temp_root(tag);
+    let dir = root.join(".hex").join("graphs");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("cg.yaml"), CHECK_GRAPH).expect("write");
+    let mut config = Config::builtin();
+    if let Some(argv) = check {
+        config.checks.insert("test".to_owned(), argv);
+    }
+    let mut workers = Workers::new();
+    // Enough scripted turns for the loop to spend its whole attempt budget: the
+    // mock pops one signal per attempt and errors when its queue runs dry.
+    workers.insert(
+        "mock",
+        Box::new(MockWorker::new().on("implement", &["ready"; 6])),
+    );
+    (Runtime::with_workers(root.clone(), config, workers), root)
+}
+
+/// A graph naming a check the project has not declared is refused before the run
+/// is created, with the fix named — never passed silently. A silent pass would
+/// let a run reach `succeeded` having verified nothing.
+#[test]
+fn an_unconfigured_check_is_refused_before_the_run_starts() {
+    let (runtime, root) = check_runtime("nocheck", None);
+    let err = runtime
+        .start("cg", None, None, &Isolation::Shared)
+        .expect_err("must refuse");
+    let msg = err.to_string();
+    assert!(msg.contains("does not declare"), "got: {msg}");
+    assert!(msg.contains("checks.test"), "names the key to add: {msg}");
+    let runs = root.join(".hex").join("runs");
+    assert!(
+        !runs.exists() || std::fs::read_dir(&runs).into_iter().flatten().count() == 0,
+        "nothing should be created for a refused run"
+    );
+}
+
+/// The same graph in a project that *does* configure the check runs it for real.
+#[test]
+fn a_configured_check_is_executed_and_can_fail_the_loop() {
+    let (runtime, _root) = check_runtime(
+        "failcheck",
+        Some(vec!["sh".to_owned(), "-c".to_owned(), "exit 1".to_owned()]),
+    );
+    let report = runtime
+        .start("cg", None, None, &Isolation::Shared)
+        .expect("run");
+    // The check genuinely fails, so the loop re-implements until the budget ends.
+    assert_eq!(report.disposition, Some(Disposition::BudgetExhausted));
+
+    let events = runtime.events(&report.run_id).expect("events");
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.body,
+            EventBody::Signal { name } if name == "failed"
+        )),
+        "a real check failure routes `failed`"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.body,
+            EventBody::Note { text } if text.contains("not configured")
+        )),
+        "a configured check must not report itself as skipped"
+    );
+    // And the operator is told which budget ran out.
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.body,
+            EventBody::Note { text } if text.contains("attempt budget spent")
+        )),
+        "budget exhaustion must explain itself: {events:#?}"
+    );
+}
+
+/// A check whose binary does not exist is an *infrastructure* failure, never a
+/// `failed` verdict — routing it as `failed` would spend agent tokens fixing
+/// code on the strength of evidence that was never gathered.
+#[test]
+fn a_check_that_cannot_start_is_not_a_failed_verdict() {
+    let (runtime, _root) = check_runtime(
+        "brokencheck",
+        Some(vec!["definitely-not-a-real-binary-xyz".to_owned()]),
+    );
+    let report = runtime
+        .start("cg", None, None, &Isolation::Shared)
+        .expect("run");
+    assert_eq!(report.disposition, Some(Disposition::Failed));
+
+    let events = runtime.events(&report.run_id).expect("events");
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.body,
+            EventBody::Signal { name } if name == "failed"
+        )),
+        "a spawn failure must not be routed as a test failure: {events:#?}"
+    );
+    assert!(events.iter().any(|e| matches!(
+        &e.body,
+        EventBody::AttemptFailed { reason, .. } if reason.contains("spawn command failed")
+    )));
+}
+
+/// A run whose graph needs an agent CLI that is not installed must be refused
+/// before anything is created — not discovered as a failed first attempt.
+#[test]
+fn preflight_refuses_a_missing_agent_cli_before_creating_a_run() {
+    let root = temp_root("preflight");
+    let dir = root.join(".hex").join("graphs");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("cg.yaml"), CHECK_GRAPH).expect("write");
+
+    let mut workers = Workers::new();
+    workers.insert(
+        "mock",
+        Box::new(CommandWorker::new(
+            "mock",
+            vec!["definitely-not-a-real-agent-xyz".to_owned()],
+        )),
+    );
+    // Declare the check, so compilation succeeds and the run reaches the *worker*
+    // preflight this test is about.
+    let mut config = Config::builtin();
+    config
+        .checks
+        .insert("test".to_owned(), vec!["true".to_owned()]);
+    let runtime = Runtime::with_workers(root.clone(), config, workers);
+
+    let err = runtime
+        .start("cg", None, None, &Isolation::Shared)
+        .expect_err("must refuse");
+    let msg = err.to_string();
+    assert!(msg.contains("not on PATH"), "got: {msg}");
+    assert!(msg.contains("hex doctor"), "points at the fix: {msg}");
+    // Nothing was created, so no half-started run is left behind.
+    let runs = root.join(".hex").join("runs");
+    assert!(
+        !runs.exists() || std::fs::read_dir(&runs).into_iter().flatten().count() == 0,
+        "preflight must not leave a run directory behind"
+    );
 }

@@ -1,0 +1,107 @@
+version: 1
+name: autoresearch
+description: "Research loop — gather, a critic judges sufficiency, revise until enough, then report"
+example: "how do other agent CLIs handle mid-run steering?"
+
+# Research has no `cargo test` equivalent: nothing deterministic can tell you a
+# question is answered. So this loop uses the two mechanisms every surveyed deep
+# research system settles on, and nothing more:
+#
+#   1. an explicit sufficiency *signal* from a critic that is not the researcher
+#      (open_deep_research's `ResearchComplete`, gpt-researcher's Reviewer,
+#      Anthropic's lead researcher judging its subagents), and
+#   2. a hard cap as the backstop, because a model asked "is this enough?" will
+#      eventually say yes for the wrong reason — `budget.visits` on the critic.
+#
+# Continuity is on **disk, not in context**: every attempt is a fresh agent
+# session, so findings accumulate in `.hex/research-notes.md` rather than in a
+# conversation. That is Ralph's trick, and it is what makes a bounded loop of
+# stateless attempts able to do long-horizon work at all.
+#
+# Run it with:  hex run autoresearch -p "…"   (or -f question.md)
+
+defaults:
+  role: researcher
+  context: fresh
+  budget:
+    attempts: 14
+    elapsed: 45m
+
+entry: research
+
+nodes:
+  research:
+    agent:
+      prompt: |
+        Research question: {{prompt}}
+
+        Your notes from previous rounds are in `.hex/research-notes.md` (it may
+        not exist yet on the first round). Read it first, then extend it — never
+        rewrite what is already there.
+
+        If a critic sent you back, address this specifically (empty on the first
+        round):
+        {{critique.result}}
+
+        Gather evidence and append to `.hex/research-notes.md`:
+          - findings, each with the source you got it from (URL, file:line, or
+            command you ran)
+          - what you verified yourself vs what you are inferring
+          - open questions you could not settle
+
+        Prefer primary sources. Do not pad: a short set of load-bearing findings
+        beats a long summary. Finish when you have added this round's findings.
+    on:
+      done: critique
+
+  critique:
+    agent:
+      role: reviewer
+      prompt: |
+        Judge whether the research so far actually answers the question.
+
+        Question: {{prompt}}
+
+        Read `.hex/research-notes.md`. You are not researching — do not add
+        findings, and do not edit the notes.
+
+        Be adversarial about sufficiency: are the central claims sourced, or
+        asserted? Is a load-bearing question still open? Is a conclusion drawn
+        from one source that needed three? Would a careful reader be misled?
+
+        If the notes genuinely answer the question, run:
+          hex emit enough
+        Otherwise name — concretely, in your final message, so the researcher can
+        act on it — what is missing and where to look. Then run:
+          hex emit more_needed
+      may_propose: [enough, more_needed]
+    # The backstop. Without it, "is this enough?" is a question a model can keep
+    # answering `more_needed` to until the run's whole budget is gone.
+    budget:
+      visits: 4
+    on:
+      enough: report
+      more_needed: research
+
+  report:
+    agent:
+      prompt: |
+        Write the final answer to: {{prompt}}
+
+        Base it only on `.hex/research-notes.md` — do not research further, and
+        do not introduce claims the notes do not support.
+
+        Structure it for someone who has to act on it: lead with the answer, then
+        the evidence, then what remains uncertain. Keep every source attribution.
+        Put the report in your final message (it is what `hex logs` will show).
+    on:
+      done: done
+
+  done:
+    terminal: succeeded
+
+accept:
+  require: [critique.enough]
+  # If `done` is reached without the critic ever signing off, go gather more
+  # rather than failing a run that may already be most of the way there.
+  on_unmet: research

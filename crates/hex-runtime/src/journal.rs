@@ -100,7 +100,6 @@ pub fn read_all(path: &Path) -> Result<Vec<Event>> {
 #[derive(Debug)]
 pub struct Journal {
     file: File,
-    path: PathBuf,
     next_seq: u64,
 }
 
@@ -115,11 +114,7 @@ impl Journal {
             .write(true)
             .truncate(true)
             .open(&path)?;
-        Ok(Self {
-            file,
-            path,
-            next_seq: 0,
-        })
+        Ok(Self { file, next_seq: 0 })
     }
 
     /// Open an existing journal for appending, continuing its sequence, and
@@ -140,20 +135,7 @@ impl Journal {
         }
         let next_seq = scanned.events.last().map_or(0, |e| e.seq + 1);
         let file = OpenOptions::new().append(true).open(&path)?;
-        Ok((
-            Self {
-                file,
-                path,
-                next_seq,
-            },
-            scanned.events,
-        ))
-    }
-
-    /// Path of the underlying file.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
+        Ok((Self { file, next_seq }, scanned.events))
     }
 
     /// Append one event, assigning its sequence number and timestamp. Returns
@@ -190,11 +172,17 @@ impl Journal {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::test_support::unique;
     use hex_proto::Disposition;
 
     fn temp_path(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hex-journal-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hex-journal-{tag}-{}-{}",
+            std::process::id(),
+            unique()
+        ));
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir.join("events.jsonl")
     }

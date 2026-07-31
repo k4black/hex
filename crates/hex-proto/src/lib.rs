@@ -44,6 +44,23 @@ impl Actor {
             id: id.into(),
         }
     }
+
+    /// A human operator, identified by a handle (a login name, say). Every
+    /// control command carries its issuer, so authority is scoped per actor
+    /// rather than per surface and the journal records *who* paused or steered.
+    #[must_use]
+    pub fn human(id: impl Into<String>) -> Self {
+        Self {
+            kind: ActorKind::Human,
+            id: id.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Actor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.kind.as_str(), self.id)
+    }
 }
 
 /// The class of an [`Actor`].
@@ -56,6 +73,18 @@ pub enum ActorKind {
     Agent,
     /// A human operator.
     Human,
+}
+
+impl ActorKind {
+    /// The canonical snake_case name — the same spelling serde uses on the wire.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ActorKind::Runtime => "runtime",
+            ActorKind::Agent => "agent",
+            ActorKind::Human => "human",
+        }
+    }
 }
 
 /// How one run ended — a single enum shared by scheduler, CLI, exit-code
@@ -145,9 +174,59 @@ pub enum EventBody {
         /// mutable config or a separate unbound file.
         #[serde(default)]
         defaults: BTreeMap<String, String>,
+        /// The project `checks:` this run resolved at creation (name → argv),
+        /// for the same reason as `defaults`: editing `.hex/config.yaml` must
+        /// never change what a resumed run executes as its gate.
+        #[serde(default)]
+        checks: BTreeMap<String, Vec<String>>,
+    },
+    /// A success terminal was reached but the acceptance contract was unmet, so
+    /// the run rerouted to `to` (the graph's `accept.on_unmet`) instead of
+    /// failing. Its own event rather than a synthesized `Signal`, because
+    /// `reduce` deliberately drops routing signals that no in-flight attempt
+    /// produced — a fail-closed guard against forged routing that must not be
+    /// relaxed just to express this.
+    AcceptanceUnmet {
+        /// The `node.signal` evidence that was missing.
+        missing: Vec<String>,
+        /// The node the run rerouted to, to go and produce it.
+        to: String,
     },
     /// Scheduling has begun; the entry node is active.
     RunStarted,
+    /// An operator paused the run at an attempt boundary (a `pause` command from
+    /// the control inbox). Deliberately *not* a terminal disposition: a paused
+    /// run has no outcome yet and continues with `hex resume`.
+    RunPaused,
+    /// A paused run was un-paused and is scheduling again.
+    RunResumed,
+    /// An operator injected guidance for the *next* agent attempt (a `steer`
+    /// command). Journaled so a replay reproduces the prompt the attempt
+    /// actually ran with — steering that lived only in memory would make the
+    /// journal an incomplete account of the run.
+    Steered {
+        /// The operator's guidance text, fenced into the next prompt as
+        /// operator input (trusted instructions, unlike agent output).
+        text: String,
+    },
+    /// A `human` node suspended the run and asked its question. The runtime then
+    /// blocks on a `respond` command; a crash while blocked leaves this event
+    /// unanswered, and resume asks again.
+    HumanRequested {
+        /// The node's prompt, with `{{prompt}}`/`{{node.result}}` resolved.
+        prompt: String,
+    },
+    /// An operator answered a `human` node. Carries both the answer (stored as
+    /// the node's result, so downstream `{{node.result}}` works exactly as for
+    /// an agent) and the routing signal it activates — its own event rather than
+    /// a synthesized `Signal`, because `reduce` deliberately drops routing
+    /// signals no in-flight attempt produced.
+    HumanResponded {
+        /// The operator's answer.
+        text: String,
+        /// The signal the response routes on (the node's single outgoing edge).
+        signal: String,
+    },
     /// An attempt was scheduled and is about to execute. Written
     /// intent-before-effect with an idempotency key, so a crash between here
     /// and the terminal event marks the attempt interrupted, never a silent
@@ -187,11 +266,6 @@ pub enum EventBody {
         /// failed attempt can never fail *open* into success.
         disposition: Disposition,
     },
-    /// A budget was exhausted; the run fails closed.
-    BudgetExhausted {
-        /// Which budget and its limit.
-        detail: String,
-    },
     /// The run reached a terminal disposition.
     RunFinished {
         /// The final outcome.
@@ -210,6 +284,9 @@ pub enum EventBody {
 ///
 /// `run`/`resume` are the only execution verbs (there is no retry/replay/skip;
 /// redoing work is a new run); these are the mid-run control commands.
+///
+/// A command is delivered by writing one of these (with its issuing [`Actor`])
+/// into a run's control inbox, which the driver drains at attempt boundaries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
@@ -221,6 +298,31 @@ pub enum Command {
     Resume,
     /// Cancel the run.
     Cancel,
+    /// Inject operator guidance into the next attempt's prompt.
+    Steer {
+        /// The guidance text.
+        text: String,
+    },
+    /// Answer a `human` node that is blocking the run.
+    Respond {
+        /// The operator's answer.
+        text: String,
+    },
+}
+
+impl Command {
+    /// The canonical verb name, for diagnostics and journal notes.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Command::Status => "status",
+            Command::Pause => "pause",
+            Command::Resume => "resume",
+            Command::Cancel => "cancel",
+            Command::Steer { .. } => "steer",
+            Command::Respond { .. } => "respond",
+        }
+    }
 }
 
 /// A capability a worker adapter advertises in its manifest so the graph
@@ -288,6 +390,45 @@ mod tests {
         });
         let json = serde_json::to_string(&ev).expect("serializes");
         assert!(json.contains("\"disposition\":\"succeeded\""));
+    }
+
+    /// The control inbox persists commands as files, so their wire shape is a
+    /// compatibility surface: a queued command must survive a hex upgrade.
+    #[test]
+    fn control_commands_roundtrip_including_their_payloads() {
+        for cmd in [
+            Command::Pause,
+            Command::Resume,
+            Command::Cancel,
+            Command::Steer {
+                text: "prefer the smaller diff".to_owned(),
+            },
+            Command::Respond {
+                text: "approved".to_owned(),
+            },
+        ] {
+            let json = serde_json::to_string(&cmd).expect("serializes");
+            let back: Command = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back, cmd, "{json}");
+        }
+    }
+
+    #[test]
+    fn human_events_carry_actor_and_routing_signal() {
+        let mut ev = event(EventBody::HumanResponded {
+            text: "ship it".to_owned(),
+            signal: "done".to_owned(),
+        });
+        ev.actor = Actor::human("kc");
+        let json = serde_json::to_string(&ev).expect("serializes");
+        assert!(json.contains("\"kind\":\"human_responded\""), "{json}");
+        assert!(json.contains("\"signal\":\"done\""), "{json}");
+        assert!(
+            json.contains("\"kind\":\"human\""),
+            "actor recorded: {json}"
+        );
+        let back: Event = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, ev);
     }
 
     #[test]

@@ -9,15 +9,19 @@ use std::collections::BTreeMap;
 
 use hex_proto::Disposition;
 
-/// The kind of a schedulable node (five, intentionally tiny).
+/// The kind of a schedulable node (four, intentionally tiny).
+///
+/// There is deliberately no `Gate` kind: a gate is a *role*, not a kind — any
+/// [`NodeKind::Command`] whose signal appears in the graph's `accept` contract
+/// is acting as a gate. The two used to be separate variants with identical
+/// fields, one validation arm and one executor; collapsing them removed the
+/// duplication without losing any expressiveness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     /// Invoke one opaque external agent (a coding-agent CLI) via a worker.
     Agent,
-    /// Run a deterministic executable/script.
+    /// Run a deterministic executable/script producing `passed`/`failed`.
     Command,
-    /// Run a deterministic validator producing pass/fail/escalate.
-    Gate,
     /// Suspend durably for a human decision or input.
     Human,
     /// Explicit terminal outcome.
@@ -31,7 +35,6 @@ impl NodeKind {
         match self {
             NodeKind::Agent => "agent",
             NodeKind::Command => "command",
-            NodeKind::Gate => "gate",
             NodeKind::Human => "human",
             NodeKind::Terminal => "terminal",
         }
@@ -74,15 +77,13 @@ pub enum NodeSpec {
         /// conveyed via the node's prompt, not an OS boundary (see the worker).
         read_only: bool,
     },
-    /// Run a deterministic validator; produces `passed`/`failed`.
-    Gate {
-        /// Argv, executed directly (never a shell string).
-        command: Vec<String>,
-    },
-    /// Run a deterministic command; produces `passed`/`failed`.
+    /// Run one or more deterministic commands; produces `passed`/`failed`. Acts
+    /// as a *gate* when its signal is named in the graph's `accept` contract.
     Command {
-        /// Argv, executed directly (never a shell string).
-        command: Vec<String>,
+        /// The steps to run, in declared order (never empty).
+        steps: Vec<CommandStep>,
+        /// Whether the steps run in sequence or concurrently.
+        mode: CommandMode,
     },
     /// Explicit terminal outcome.
     Terminal {
@@ -96,13 +97,60 @@ pub enum NodeSpec {
     },
 }
 
+/// One command a [`NodeSpec::Command`] node runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandStep {
+    /// Argv, executed directly (never a shell string). Always resolved: a graph
+    /// naming a project check the project has not configured is refused at
+    /// compile time rather than silently passing.
+    pub argv: Vec<String>,
+    /// The `checks:` entry this resolved from, for diagnostics and log naming.
+    /// `None` for a literal argv written in the graph.
+    pub check: Option<String>,
+}
+
+impl CommandStep {
+    /// A short label for logs and notes: the check name, else the program.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        self.check
+            .as_deref()
+            .or_else(|| self.argv.first().map(String::as_str))
+            .unwrap_or("command")
+    }
+}
+
+/// How a command node's steps execute. The two modes differ in *failure*
+/// semantics as much as in concurrency, which is the whole point of having both:
+/// `ordered` is for a pipeline where a later step is pointless once an earlier
+/// one fails; `parallel` is for independent checks where you want every failure
+/// in one round, so the agent can fix them all in one attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommandMode {
+    /// Run in sequence and **stop at the first failure**.
+    #[default]
+    Ordered,
+    /// Run concurrently and **run every step**, failing if any failed.
+    Parallel,
+}
+
+impl CommandMode {
+    /// The canonical lowercase name.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CommandMode::Ordered => "ordered",
+            CommandMode::Parallel => "parallel",
+        }
+    }
+}
+
 impl NodeSpec {
     /// The [`NodeKind`] of this spec.
     #[must_use]
     pub fn kind(&self) -> NodeKind {
         match self {
             NodeSpec::Agent { .. } => NodeKind::Agent,
-            NodeSpec::Gate { .. } => NodeKind::Gate,
             NodeSpec::Command { .. } => NodeKind::Command,
             NodeSpec::Terminal { .. } => NodeKind::Terminal,
             NodeSpec::Human { .. } => NodeKind::Human,
@@ -117,6 +165,32 @@ pub struct Node {
     pub id: String,
     /// What this node does.
     pub spec: NodeSpec,
+    /// How many times this node may be entered (`budget: { visits: N }`).
+    ///
+    /// Bounds *one* loop rather than every loop: a graph with a cheap lint cycle
+    /// and an expensive review cycle can cap the review at 3 without also
+    /// capping the lint. The run-level [`Budget::cycle_visits`] still applies as
+    /// a blanket backstop; whichever is tighter bites first.
+    pub max_visits: Option<u32>,
+}
+
+impl Node {
+    /// A node with no per-node visit bound.
+    #[must_use]
+    pub fn new(id: impl Into<String>, spec: NodeSpec) -> Self {
+        Self {
+            id: id.into(),
+            spec,
+            max_visits: None,
+        }
+    }
+
+    /// Set this node's visit bound (builder style).
+    #[must_use]
+    pub fn with_max_visits(mut self, visits: Option<u32>) -> Self {
+        self.max_visits = visits;
+        self
+    }
 }
 
 /// A legal transition, activated by a named routing event. Never model-chosen
@@ -137,11 +211,24 @@ pub struct Edge {
 pub struct Budget {
     /// Maximum attempts across the whole run.
     pub attempts: Option<u32>,
-    /// Maximum wall-clock time (milliseconds).
+    /// Maximum wall-clock time for the whole run (milliseconds).
     pub elapsed_ms: Option<u64>,
+    /// Maximum wall-clock time for a *single* attempt (milliseconds).
+    ///
+    /// Always set by the loader (which applies
+    /// [`DEFAULT_ATTEMPT_ELAPSED_MS`] when a graph declares neither bound), so
+    /// no attempt can ever wait on a hung agent forever. Without it, one stuck
+    /// process consumed the entire run budget — or blocked indefinitely when the
+    /// graph declared no `elapsed` at all.
+    pub attempt_elapsed_ms: Option<u64>,
     /// Maximum visits to any single node (per-cycle bound).
     pub cycle_visits: Option<u32>,
 }
+
+/// Per-attempt wall-clock bound applied when a graph declares no attempt bound
+/// (30 minutes). A backstop against an agent that hangs forever, not a tuning
+/// knob — declare `budget.attempt` to override.
+pub const DEFAULT_ATTEMPT_ELAPSED_MS: u64 = 30 * 60 * 1000;
 
 impl Budget {
     /// Whether the budget bounds cycles at all (attempts or visit cap set).
@@ -149,6 +236,18 @@ impl Budget {
     pub fn bounds_cycles(&self) -> bool {
         self.attempts.is_some() || self.cycle_visits.is_some()
     }
+}
+
+/// The run's acceptance contract: the evidence a success terminal requires, and
+/// optionally where to go when it is missing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Accept {
+    /// Evidence that must hold for a success terminal to actually succeed.
+    pub require: Vec<Requirement>,
+    /// Node to route to when acceptance is unmet, instead of failing the run.
+    /// Without it, reaching a success terminal with missing evidence ends the
+    /// run `failed` — a dead end that spends the whole run and fixes nothing.
+    pub on_unmet: Option<String>,
 }
 
 /// One clause of the acceptance contract: `node` must have last emitted
@@ -175,7 +274,7 @@ pub struct Graph {
     /// Durable limits.
     pub budget: Budget,
     /// Acceptance contract.
-    pub accept: Vec<Requirement>,
+    pub accept: Accept,
 }
 
 impl Graph {
@@ -202,6 +301,50 @@ impl Graph {
             .filter(|e| e.from == from)
             .map(|e| e.on.as_str())
             .collect()
+    }
+
+    /// The transitions the kernel can take that no [`Edge`] describes: a
+    /// **success** terminal back to `accept.on_unmet`, taken when the acceptance
+    /// contract is unmet there.
+    ///
+    /// The one definition of that implicit edge, because two consumers must agree
+    /// on it or core rule 5 goes blind: `schedule` *takes* it (emitting
+    /// `RerouteUnmet`), and cycle validation has to *see* it — `a → done` with
+    /// `on_unmet: a` is edge-acyclic yet loops for real. An empty `require` list is
+    /// always satisfied, so it yields nothing. Whether `to` exists is not asked
+    /// here: that is validation's `E-accept-unmet-node` and the reroute's own
+    /// lifecycle guard, and a nonexistent target has no outgoing edges so it can
+    /// close no cycle either.
+    #[must_use]
+    pub fn implicit_reroutes(&self) -> Vec<(&str, &str)> {
+        let Some(to) = self.accept.on_unmet.as_deref() else {
+            return Vec::new();
+        };
+        if self.accept.require.is_empty() {
+            return Vec::new();
+        }
+        self.nodes
+            .values()
+            .filter(|n| {
+                matches!(
+                    n.spec,
+                    NodeSpec::Terminal {
+                        disposition: Disposition::Succeeded
+                    }
+                )
+            })
+            .map(|n| (n.id.as_str(), to))
+            .collect()
+    }
+
+    /// Where an unmet acceptance contract reroutes from `from`, if anywhere — the
+    /// single-node view of [`Graph::implicit_reroutes`].
+    #[must_use]
+    pub fn implicit_reroute_from(&self, from: &str) -> Option<&str> {
+        self.implicit_reroutes()
+            .into_iter()
+            .find(|(f, _)| *f == from)
+            .map(|(_, to)| to)
     }
 
     /// Start building a graph with a name and entry node.
@@ -240,15 +383,29 @@ impl Builder {
         self
     }
 
-    /// Add a gate node.
+    /// Add a command node running a literal argv (a *gate* once its signal is
+    /// named in `accept`).
     #[must_use]
-    pub fn gate(mut self, id: &str, command: &[&str]) -> Self {
+    pub fn command(mut self, id: &str, command: &[&str]) -> Self {
         self.insert(
             id,
-            NodeSpec::Gate {
-                command: command.iter().map(|s| (*s).to_owned()).collect(),
+            NodeSpec::Command {
+                steps: vec![CommandStep {
+                    argv: command.iter().map(|s| (*s).to_owned()).collect(),
+                    check: None,
+                }],
+                mode: CommandMode::Ordered,
             },
         );
+        self
+    }
+
+    /// Cap how many times an already-added node may be entered.
+    #[must_use]
+    pub fn max_visits(mut self, id: &str, visits: u32) -> Self {
+        if let Some(node) = self.graph.nodes.get_mut(id) {
+            node.max_visits = Some(visits);
+        }
         self
     }
 
@@ -280,10 +437,17 @@ impl Builder {
     /// Add an acceptance requirement `node.signal`.
     #[must_use]
     pub fn require(mut self, node: &str, signal: &str) -> Self {
-        self.graph.accept.push(Requirement {
+        self.graph.accept.require.push(Requirement {
             node: node.to_owned(),
             signal: signal.to_owned(),
         });
+        self
+    }
+
+    /// Route to `node` when acceptance is unmet, instead of failing the run.
+    #[must_use]
+    pub fn on_unmet(mut self, node: &str) -> Self {
+        self.graph.accept.on_unmet = Some(node.to_owned());
         self
     }
 
@@ -294,12 +458,6 @@ impl Builder {
     }
 
     fn insert(&mut self, id: &str, spec: NodeSpec) {
-        self.graph.nodes.insert(
-            id.to_owned(),
-            Node {
-                id: id.to_owned(),
-                spec,
-            },
-        );
+        self.graph.nodes.insert(id.to_owned(), Node::new(id, spec));
     }
 }

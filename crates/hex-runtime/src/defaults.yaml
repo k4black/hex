@@ -1,0 +1,79 @@
+# hex built-in defaults.
+#
+# This file IS the built-in configuration — it is embedded in the binary and
+# parsed by exactly the same loader and merge path as `~/.config/hex/config.yaml`
+# and `.hex/config.yaml`. There is no second, hardcoded definition to drift from
+# it: what you read here is what a fresh machine runs.
+#
+# To change any of it, set only the keys you want to differ in your user or
+# project config; layers deep-merge per key, so a project overriding
+# `roles.reviewer.model` keeps this file's worker, effort, read_only and prompt.
+# The effective value of a key is this file's, overridden by
+# `~/.config/hex/config.yaml`, overridden by `.hex/config.yaml`.
+
+# Workers are the *CLI adapters* — how to invoke an agent. Internal plumbing;
+# graphs never name a worker directly.
+workers:
+  codex:
+    kind: codex
+  claude:
+    kind: claude
+  opencode:
+    kind: opencode
+
+# Roles are the user-facing concept a graph names (`worker: reviewer`). A role
+# binds a worker to a model, a reasoning effort, a read-only policy, and a prompt
+# preamble prepended to the node's own prompt.
+#
+# Cross-model by default: the reviewer runs a different agent from the
+# implementer, so the model that judges the change is not the one that wrote it.
+roles:
+  implementer:
+    worker: codex
+    prompt: |
+      You are making a focused change in this repository. Prefer the smallest
+      diff that fully does the job, and follow the conventions already present
+      in the files you touch.
+
+  reviewer:
+    worker: claude
+    read_only: true
+    prompt: |
+      You are reviewing, not implementing. Do not edit files. Judge correctness,
+      scope, and whether the change matches its stated intent. Be specific:
+      every objection names a file and line and says what to do instead.
+
+  planner:
+    worker: codex
+    read_only: true
+    prompt: |
+      You are planning, not implementing. Do not edit files. Produce a short,
+      concrete, ordered plan naming the exact files and functions to change and
+      how the result will be verified. No scope creep.
+
+  researcher:
+    worker: claude
+    read_only: true
+    prompt: |
+      You are researching. Gather evidence before concluding, prefer primary
+      sources, and cite them. Separate what you verified from what you inferred,
+      and say plainly when something could not be established.
+
+# Fallback compile defaults a graph inherits when it declares none.
+defaults:
+  role: implementer
+  context: fresh
+
+# Project checks: name → argv. **Deliberately empty.**
+#
+# What "green" means is a per-project decision, so hex ships no commands and no
+# built-in preset gates on one. Declare a check here and reference it from a
+# graph as `command: { check: test }`:
+#
+#   checks:
+#     test: [pytest, -q]
+#     lint: [ruff, check, .]
+#
+# A graph naming a check that is not declared here is refused before the run
+# starts, rather than passing silently.
+checks: {}

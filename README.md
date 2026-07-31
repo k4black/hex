@@ -50,8 +50,10 @@ The kernel is three pure functions:
 
 - `reduce(state, event, graph) -> state` — all state-transition logic.
 - `schedule(graph, state) -> Decision` — ready nodes, route evaluation, bound
-  enforcement; returns **effect intents** (`StartAttempt`, `RunGate`,
-  `RequestHuman`, `CancelAttempt`, `RecordTerminal`), never performs them.
+  enforcement; returns **effect intents** (`StartAttempt`, `RunCommand`,
+  `RequestHuman`, `RecordTerminal`), never performs them. `RecordTerminal`
+  carries *why* the run ended, so `budget_exhausted` and an unmet
+  `accept.require` explain themselves instead of arriving bare.
 - `accept(graph, state)` — the provisional-completion / acceptance contract.
 
 The runtime replays the journal into a projection, asks `schedule` what to do,
@@ -92,25 +94,30 @@ adapter, or a derived view:
 **Graph** (Nodes + Edges) · **Run** (Attempts) · **Event** · **Budget** ·
 **Artifact**
 
-Five node kinds — roles ("planner", "reviewer") are metadata, never kinds:
+Four node kinds — roles ("planner", "reviewer") are metadata, never kinds:
 
-`agent` · `command` · `gate` · `human` · `terminal`
+`agent` · `command` · `human` · `terminal`
+
+A **gate is a role, not a kind**: any `command` node whose signal is named in
+`accept.require` is acting as one. (`gate` and `command` had identical fields and
+one shared executor, so they collapsed into `command`.)
 
 - Interactivity is a **policy flag** on `agent` (`interactive: true` = a live,
   resumable session the human converses with — grill-me/Q&A style; requires
   the worker to declare `live_steering` + `session_resume`). Not a new kind.
-- Approval (blocking human decision on a finished proposal) is a separate
-  `human` boundary node — designed now, implemented in a later phase; it
-  shares the same `human.requested` / `human.responded` event family.
-- `command` and `gate` are distinct kinds (a gate yields pass/fail/escalate
-  and feeds acceptance) sharing one executor in the runtime.
+- Approval is a `human` boundary node: it journals `human.requested`, blocks on
+  the control inbox, and records `human.responded` with the actor and text.
+- A `command` node runs one or more argv steps (`mode: ordered|parallel`) and
+  yields `passed`/`failed`; naming that signal in `accept.require` is what makes
+  it a gate.
 
 ## Graph surface — single YAML file
 
 Standard YAML only (no custom grammar — easy for humans *and* agents to
-write). Edges co-located on the node via an `on:` map; prompts inline as block
-scalars; `defaults:` + `templates:`/`extends:` kill repetition; reusable
-run-level `gates:` feed `accept.require`.
+write). Edges co-located on the node via an `on:` map, prompts inline as block
+scalars, `defaults:` for repetition. The loader uses `deny_unknown_fields`, so a
+typo is an error rather than a silent no-op. (`templates:`/`extends:` and
+reusable run-level `gates:` are *not* implemented.)
 
 ```yaml
 version: 1
@@ -118,12 +125,9 @@ name: implement-until-green
 
 defaults:
   worker: codex
-  context: fresh
-  budget: { attempts: 8, elapsed: 30m }
+  budget: { attempts: 8, elapsed: 30m, attempt: 10m }
 
-gates:
-  repo_tests:
-    run: [npm, test]
+entry: implement
 
 nodes:
   implement:
@@ -137,12 +141,13 @@ nodes:
       needs_human: clarify
 
   test:
-    gate: { use: repo_tests }
+    # Runs this project's `checks.test` (see Config below). If the project
+    # declares none, the run is refused with the key to add.
+    command: { check: test }
     on: { passed: done, failed: implement }
 
   clarify:
-    agent:
-      interactive: true
+    human:
       prompt: "Discuss the blocker with the operator; agree on a decision."
     on: { resolved: implement }
 
@@ -150,12 +155,28 @@ nodes:
     terminal: succeeded
 
 accept:
-  require: [repo_tests.passed]
+  require: [test.passed]
 ```
+
+> This example validates and runs as-is. Reaching `clarify` blocks the run until
+> you answer it with `hex respond <run> "…"`, from any terminal or from a driving
+> agent; the answer becomes that node's result, so a downstream prompt can
+> reference `{{clarify.result}}` exactly like an agent's.
+
 
 The kernel compiles any surface form to a flat, immutable Graph IR
 (nodes + typed edges + bounds); a run records the exact snapshot + hash. Every
-cycle must declare a bound — an unbounded cycle is a validation *error*.
+cycle must declare a bound — an unbounded cycle is a validation *error* — and so
+is a graph with no reachable `terminal: succeeded`, which could only ever fail.
+
+**Bounds** are layered: `budget.attempts` and `budget.elapsed` bound the run,
+`budget.attempt` bounds a single attempt (always set, so a hung agent can never
+block forever), and a per-node `budget: { visits: N }` bounds *one* loop — cap a
+review cycle at 3 rounds without also capping a cheap lint cycle.
+
+**Acceptance** can route rather than dead-end. `accept.on_unmet: <node>` sends a
+run that reached a success terminal without the required evidence back to earn it;
+without it the run fails, but the reason names the remedy.
 
 ## Config & presets
 
@@ -168,34 +189,96 @@ parsing, and read-only flag — you only override its `model` — or the generic
 other CLI. The CLI/runtime only ever see a uniform `Worker`:
 
 ```yaml
+# Workers are the CLI adapters — internal plumbing. A graph never names one.
 workers:
-  codex:    { kind: codex, model: gpt-5 }        # typed — argv/parsing built in
-  claude:   { kind: claude }
-  my-agent: { kind: command, command: [my-cli, "{prompt}"], result: file }
+  codex:  { kind: codex }
+  claude: { kind: claude }
+
+# Roles are what a graph names. Each binds a worker to a model, reasoning
+# effort, a read-only policy and a prompt preamble.
+roles:
+  implementer: { worker: codex, effort: high }
+  reviewer:
+    worker: claude          # cross-model: a different model reviews than wrote
+    read_only: true
+    prompt_append: "Only flag correctness and security issues."
+
+# What "green" means in THIS project. Empty by default.
+checks:
+  test: [pytest, -q]
+  lint: [ruff, check, .]
 ```
 
-A node can set `read_only: true` (a reviewer) — advisory today (the prompt keeps
-it read-only; a true read-only sandbox would also block the `hex emit` control
-channel, so enforced read-only awaits a non-workspace transport).
+Layers are **built-in → `~/.config/hex/config.yaml` → `.hex/config.yaml`**, and
+they **deep-merge per key**: overriding `roles.reviewer.model` inherits that
+role's worker, effort, policy and prompt. `prompt:` replaces an inherited
+preamble; `prompt_append:` extends it. The built-in layer is a real YAML file
+([`defaults.yaml`](crates/hex-runtime/src/defaults.yaml)) embedded in the binary
+and parsed by the *same* loader — there is no hardcoded copy to drift from it.
+
+Four roles ship: `implementer`, `reviewer`, `planner`, `researcher`. There is
+deliberately **no orchestrator role** — routing is structural (the graph's edges),
+never a token-spending agent.
+
+### Checks: the gate is yours, and there is none by default
+
+A graph names a check (`command: { check: test }`); your project supplies the
+argv. A check you have **not** declared is a hard error naming the key to add —
+never a silent pass, because a run reporting `succeeded` having verified nothing
+is the failure mode worth designing against.
+
+So the built-in presets ship **gate-free** and run in any repo with no setup. The
+two exceptions are `tdd` and `implement-until-green`, whose gate *is* the preset;
+they refuse to start until you declare `checks.test`.
+
+A command node runs one step or several, and the modes differ in *failure*
+semantics rather than only concurrency:
+
+```yaml
+  verify:
+    command:
+      check: [test, lint, typecheck]
+      mode: parallel      # run everything, fail if any failed
+    on: { passed: done, failed: implement }
+```
+
+- `ordered` (default) runs in sequence and **stops at the first failure** — a
+  later step is usually pointless once an earlier one fails.
+- `parallel` runs concurrently and **runs every step**, so one round surfaces
+  every problem and the agent fixes them together. Each step's output is buffered
+  to `attempts/<id>/<n>-<label>/`, numbered in **declared** order, so concurrent
+  evidence reads exactly like sequential evidence.
+
+`hex doctor` reports whether every configured worker and check can actually run,
+and `hex run` refuses to start when the graph needs an agent CLI that is not on
+`PATH` — rather than discovering it as a failed first attempt.
+
+```bash
+hex doctor
+#   ok      worker  codex    /opt/homebrew/bin/codex
+#   MISSING check   lint     `ruff` not found on PATH
+```
 
 A **preset** is a named graph resolved through three layers: `.hex/graphs/`
 (project) > `~/.config/hex/graphs/` (user) > built-in. The built-in library
-(claude implements/plans, codex reviews — a different model reviews than wrote
-the code):
+(the `reviewer` role runs a different agent from `implementer`, so a different
+model reviews than wrote the code):
 
-| Preset | Loop |
-|---|---|
-| `critique-loop` | implement → review → test (the flagship) |
-| `implement-until-green` | implement → test (the Ralph loop; tests are the only backpressure) |
-| `tdd` | write-failing-test → implement → test |
-| `plan-build-review` | plan → implement → test → review |
-| `review` | reviewer over the current `git diff`, no implementer |
+| Preset | Loop | Needs a check? |
+|---|---|---|
+| `critique-loop` | implement → review, until approved (the flagship) | no |
+| `plan-build-review` | plan → implement → review | no |
+| `review` | reviewer over the current `git diff`, no implementer | no |
+| `implement-until-green` | implement → test (the Ralph loop) | **`checks.test`** |
+| `tdd` | write-failing-test → prove red → implement → prove green | **`checks.test`** |
 
-Their gates run `cargo test`; a preset is a starting point — copy it to
-`.hex/graphs/` and change the gate command for your stack. `hex list` shows each
-graph with its origin, description, and an example invocation; a custom graph can
-set optional top-level `description:` and `example:` fields to appear the same
-way.
+The first three are gate-free, so they run in any repo with no setup — the
+reviewer is the backpressure. The last two exist *to* run your tests, so they
+refuse to start until you declare `checks.test`. A preset is a starting point:
+copy it out and edit it to change the topology, or just redefine a role in your
+config to change how every preset behaves. `hex list` shows each graph with its origin, description, and an example
+invocation; a custom graph can set optional top-level `description:` and
+`example:` fields to appear the same way.
 
 The operator supplies exactly one thing — the **prompt** — inline or from a
 file; it fills `{{prompt}}` wherever the graph's node prompts reference it:
@@ -217,9 +300,6 @@ Heavy artifacts (code, diffs) stay in the workspace — the reviewer runs
 the runtime routes a synthesized `done`. Nodes with more than one outcome still
 `hex emit <signal>`. (Full typed per-node inputs/outputs are a later phase.)
 
-An authoring skill (SKILL.md shipped in-repo) teaches coding agents to draft
-graph YAML from a task description and iterate against `hex validate`.
-
 ## CLI surface
 
 The same verbs work from the CLI, MCP, and dashboard; all support `--json` /
@@ -227,21 +307,55 @@ NDJSON, stable exit codes, and `capabilities` introspection.
 
 ```text
 hex list                 list runnable graphs (project > user > built-in)
-hex validate <graph>     schema, references, bounded cycles, capability match
-hex graph <graph>        render (ascii/mermaid/dot)
+hex doctor               are the configured workers and checks usable?
+hex validate <graph>     schema, references, bounded cycles, a reachable success
+hex graph <graph>        render a graph as text
 hex run [<graph>]        start a NEW run (no graph → list what's runnable)
-                         [--no-preview] disables the live in-flight pane
-hex resume <run>         continue the SAME run (after pause or crash)
-hex pause|cancel <run>   operator control
+                         [--detach] return a run id immediately
+                         [--no-preview] disable the live in-flight pane
+hex resume <run>         continue the SAME run (after a pause or a crash)
+hex runs                 list runs, newest activity first
 hex status <run>         projected run status
-hex watch <run>          stream events (NDJSON with --json)
-hex logs <run> [--node <id>] [--full]   per-attempt final message (--full: stdout/stderr)
+hex wait <run>           block until it finishes; exit with its disposition
+hex watch <run>          print the recorded event stream
+hex logs <run> [--node <id>] [--full]   per-attempt final message
+hex pause <run>          pause at the next attempt boundary
+hex steer <run> <text>   add operator guidance to the next attempt
+hex respond <run> <text> answer a blocking `human` node
+hex cancel <run>         cancel, live or idle
 hex emit <event>         worker→runtime, scoped-token control
-hex respond <req>        human answer (interactive Q&A; later: approve/reject)
 ```
 
-Deliberately absent: `retry`, `replay`, `skip`. Redoing work is always a new
-`run` — the journal keeps the old one inspectable and resumable.
+**Exit codes** encode the outcome, so a script or a driving agent branches without
+parsing output: `0` succeeded · `1` failed · `2` usage error · `3` timed out ·
+`4` budget exhausted · `5` cancelled · `6` paused.
+
+Still unbuilt: `interactive` sessions, `context: continue` (a reviewer with memory
+across rounds), cost/token accounting, stall detection, a run digest,
+`watch --follow`, and `graph --format mermaid|dot`.
+
+### Driving hex from another agent, or from a second terminal
+
+Control is a **file inbox** at `.hex/runs/<id>/control/`, written temp-then-rename
+and drained at attempt boundaries — no daemon, and it works whether the run is
+live or is resumed later. The same commands reach it from your shell, from a
+driving agent's `Bash` call, or (later) from MCP: one protocol, many transports,
+authority scoped per actor.
+
+```bash
+id=$(hex run critique-loop -p "fix the flaky auth test" --detach)
+hex runs                              # what's alive, hung, or abandoned
+hex steer  "$id" "prefer the existing retry helper"
+hex pause  "$id"; hex resume "$id"
+hex respond "$id" "approved, but skip the cache part"
+hex wait   "$id"                      # exits with the disposition
+```
+
+A detached run re-execs the binary in its own process group with stdio to files
+and outlives the launcher. Liveness comes from the run lock (kernel-released on
+death, unlike a pidfile) plus a heartbeat, so `hex runs` distinguishes *running*
+from *hung* from *crashed* — and a crashed run is continued with `hex resume`,
+which marks the orphaned attempt `interrupted` rather than silently rerunning it.
 
 On an interactive terminal, `hex run`/`hex resume` show a **live preview**: a
 sticky footer that tails the in-flight attempt's output with a status line
@@ -263,16 +377,59 @@ worktrees, and a serialized integration queue arrive later.
 
 ## Status
 
-**Phase 1 (slim MVP) works.** The critique loop runs end-to-end on real agent
-CLIs, records everything to a JSONL journal, enforces budgets, and resumes a
-killed run. `hex-mcp` / `hex-dashboard` are still stubs. Phased roadmap and
-what's deferred: [`TODO.md`](TODO.md).
+**Phase 1 works, plus three follow-up passes.** The critique loop runs end-to-end
+on real agent CLIs, records everything to a JSONL journal, enforces run *and*
+per-attempt budgets, resumes a killed run, and reports why it stopped.
+
+Landed 2026-07-30 — operability: project-defined `checks:`, `hex doctor` +
+start-time preflight, disposition exit codes, terminal reasons in the journal, and
+the `gate`→`command` kind merge.
+
+Landed 2026-07-31 — roles & gating: layered `roles:` config (deep-merged, with
+`prompt`/`prompt_append`); built-in defaults as embedded YAML through the same
+loader; gate-free presets; undeclared checks refused at compile time; multi-step
+`command` nodes with `ordered`/`parallel` modes; per-node `budget: { visits: N }`;
+`accept.on_unmet` rerouting; a reachable-success validation check; and the
+`autoresearch` preset.
+
+Landed 2026-07-31 — control & detach: the file-based control inbox
+(`cancel`/`pause`/`resume`/`steer`/`respond`), working `human` nodes, detached
+runs with heartbeat liveness, and `hex runs`/`wait`. hex now reviews its own
+diffs: see [`.hex/graphs/self-review.yaml`](.hex/graphs/self-review.yaml).
+
+### Known broken
+
+Two unbounded-loop holes, found by hex reviewing its own diff and **not yet
+fixed** — both in the `accept.on_unmet` cycle validation added 2026-07-31, so
+fixing one unbounded cycle opened two more. Avoid `on_unmet` and `human` cycles in
+an unattended run until these land:
+
+- A terminal's `budget: { visits: N }` satisfies cycle validation but is never
+  enforced — `schedule` settles terminals before it checks visit budgets, so
+  `implement → done → implement` with the bound on `done` alone loops forever.
+- `budget.attempts` does not bound a **human-only** cycle: a human response spends
+  no attempt, so `human A → human B → human A` spins forever while validating.
+
+Also unexplained: an fs4/flock flake where a just-released lock still reads as
+busy. Seen on both worktree-slot and run locks; its user-visible symptom is
+`hex cancel` right after a run ends queuing instead of recording. The tests that
+would catch it are serialized, so **"parallel runs grow the pool" is currently an
+untested claim.**
+
+**Not built** (designed, decided, not yet shipped): `context: continue` (a reviewer
+with memory across rounds), stall detection, cost/token accounting, a run digest,
+`hex config show`, `graph --source`, `watch --follow`, `interactive` sessions,
+`templates:`/`extends:`, capability matching, and the MCP client. `hex-mcp` /
+`hex-dashboard` are still stubs. A timed-out attempt also discards the agent's
+partial output, which is the wrong shape for a tool built on bounded runs.
+Roadmap and the locked decisions behind each: [`TODO.md`](TODO.md).
 
 ```bash
 cargo build --workspace     # build everything
 cargo test  --workspace
 cargo clippy --workspace --all-targets
 hex list
+hex doctor                  # are codex/claude installed? are my checks runnable?
 hex validate critique-loop
 hex run critique-loop -p "fix the flaky auth test"
 ```

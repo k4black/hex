@@ -120,6 +120,362 @@ fail-closed, typed timeout disposition, evidence/correlation guards).
       projection; unbounded cycles rejected) + kill-and-resume integration +
       critique-loop e2e + budget-exhaustion e2e on the mock worker.
 
+## Operability pass — landed 2026-07-31
+
+Pulled forward out of Phases 2/3 because each one blocked *daily* use rather than
+being a hardening nicety. Driven by an honest review: the tool had 4 recorded
+runs ever, all against its own repo, because the presets only worked in a Rust
+project and a hung agent could block forever.
+
+- [x] **Project-defined `checks:`** — a graph names a check
+      (`command: { check: test }`); `.hex/config.yaml`'s `checks:` map supplies the
+      argv; **empty by default**, and an unconfigured check routes `passed` with a
+      journaled `Note`. Presets stopped hardcoding `cargo test`, so the built-in
+      library runs in a Python/Node/Go repo unedited. Resolved at compile time and
+      recorded in `RunCreated.checks`, so a config edit cannot change what a
+      *resumed* run executes.
+- [x] **`gate` merged into `command`** — the two IR variants were identical
+      (same fields, one validation arm, one executor). Four node kinds now; a gate
+      is the *role* a `command` plays when `accept.require` names its signal
+      (which already worked for agent signals). `Effect::RunGate` → `RunCommand`.
+      Core rule 4 updated.
+- [x] **Every attempt is bounded** — `Budget.attempt_elapsed_ms`, always set by
+      the loader (default 30m, `budget: { attempt: … }` to override).
+      **This was a real hang**: with no `elapsed` declared, `wait_bounded` fell
+      back to a bare blocking `child.wait()`, and the shipped `review` preset had
+      exactly that shape. `attempt_deadline()` now takes whichever bound bites
+      first.
+- [x] **`hex doctor` + start-time preflight** — probes every configured worker
+      and check against `PATH`; `run`/`resume` now *refuse to start* when the
+      graph needs an agent CLI that is missing, instead of surfacing it as a
+      failed first attempt. Stdlib `which` (no new dep).
+- [x] **Exit codes encode the disposition** — 0/1/3/4/5 (2 stays clap's usage
+      error). Previously everything non-success was `1`, which the README already
+      claimed otherwise.
+- [x] **The kernel says *why* a run ended** — `Effect::RecordTerminal` carries
+      `why`, journaled as a `Note`: which budget ran out (attempts vs cycle
+      visits, previously indistinguishable) and which `accept.require` evidence
+      was missing (previously a bare `failed` — the worst diagnostic in the
+      tool). Gave the computed-then-discarded `Acceptance::Missing` a consumer.
+- [x] **Doc honesty** — the README's flagship YAML example did not parse (unknown
+      `gates:`, missing `entry:`, unimplemented `gate: { use: … }`,
+      `interactive:`); it is replaced and **pinned by a test** that compiles the
+      README's first `yaml` block. Removed claims for `hex pause`, `hex respond`,
+      `graph --format mermaid|dot`, and an in-repo authoring SKILL.md that does
+      not exist.
+- [x] **Bug fixes from a cross-model audit** — `hex watch` panicked byte-slicing
+      a multibyte `graph_hash` from the (unvalidated) journal; `status --json`
+      silently dropped `disposition`; test temp dirs keyed on PID alone could read
+      a previous run's leftovers (the likely cause of the `worktree.rs` flake,
+      which did *not* reproduce in 25 workspace runs); the timeout test raced its
+      own run budget and now exercises the per-attempt bound instead.
+
+## Roles & gating pass — landed 2026-07-31
+
+Decisions locked in a design interview before implementing; each bullet is the
+outcome, not a guess.
+
+- [x] **Two-level config: `workers:` + `roles:`.** Workers are CLI adapters
+      (internal); roles (`implementer`/`reviewer`/`planner`/`researcher`) are what a
+      graph names, each binding a worker plus `model`/`effort`/`read_only`/`prompt`.
+      `Workers::from_config` registers workers under their own names *and* roles
+      under theirs (roles last, so they win a clash). Four roles ship; there is
+      deliberately **no orchestrator** — Roo shipped one with zero tools, Kilo
+      deprecated theirs, and LangGraph/Anthropic keep routing in the framework;
+      all of them converge on hex's core rule 9.
+- [x] **Layered deep merge**, built-in → user → project, per key: overriding
+      `roles.reviewer.model` inherits the rest. `prompt:` replaces an inherited
+      preamble, `prompt_append:` extends it. Preambles are prepended at *compile*
+      time, so they are part of the IR a resumed run replays.
+- [x] **Built-in defaults are `hex-runtime/src/defaults.yaml`**, embedded via
+      `include_str!` and parsed by the same loader/merge path as user config —
+      no hardcoded `Config::builtin()` to drift. Every surveyed tool that
+      hardcoded defaults (Roo `DEFAULT_MODES`, Cline's mode union, Cursor's
+      removed Custom Modes) forced all-or-nothing overrides; Cursor's team
+      publicly conceded the cost.
+- [x] **Undeclared checks are refused at compile time**, naming the key to add.
+      Consequence, accepted deliberately: built-in presets ship **gate-free**
+      (`critique-loop`, `plan-build-review`, `review`), while `tdd` and
+      `implement-until-green` — whose gate *is* the preset — refuse to start until
+      `checks.test` exists. This replaced the previous "pass with a note", which
+      let a run reach `succeeded` having verified nothing.
+- [x] **Multi-step command nodes with a mode**, one kind not two (kind count
+      stays at four). The modes differ in *failure* semantics, not just
+      concurrency: `ordered` stops at the first failure, `parallel` runs every
+      step and fails if any did. Parallel buffers each step to
+      `attempts/<id>/<n>-<label>/` in **declared** order, so concurrent evidence
+      reads like sequential evidence and the journal stays deterministic.
+- [x] **Per-node `budget: { visits: N }`** — bounds one loop (cap a review cycle
+      at 3 without capping a cheap lint cycle). The run-wide `cycle_visits` stays
+      as a blanket backstop.
+- [x] **`accept.on_unmet: <node>`** reroutes a run that reached a success terminal
+      without its required evidence, instead of dead-ending on `failed`. Carried by
+      its own `EventBody::AcceptanceUnmet`, *not* a synthesized `Signal`, because
+      `reduce` deliberately drops routing signals no in-flight attempt produced —
+      a fail-closed guard that must not be relaxed to express this.
+- [x] **`E-no-happy-path`**: a graph with no reachable `terminal: succeeded` is
+      invalid. Reachability, terminal-exists and unbounded-cycle checks already
+      existed; "any terminal counts" was the gap, so a graph that could only ever
+      fail passed validation.
+- [x] **Cleanups**: dropped the two ignored `_read_only` worker params; `effort`
+      wired per agent (codex `-c model_reasoning_effort`, claude `--effort`) —
+      which is exactly the per-worker divergence that justified keeping three
+      adapter structs rather than collapsing them.
+
+### Decided but NOT yet built — the agreed sequence
+
+**(b) Detached runs + control inbox** — the prerequisite for driving hex from a
+Claude session, and the largest remaining piece.
+
+- [ ] `hex run --detach` (foreground stays the default): spawn with
+      `process_group(0)`, never `fork()` (unsafe in a multithreaded Rust process),
+      stdio to files, parent exits without `wait()`. Keep the advisory lock as the
+      liveness signal — kernel-released on death, unlike a pidfile, and PID reuse
+      is real — plus a journal heartbeat to tell "hung" from "crashed".
+- [ ] Control inbox `.hex/runs/<id>/control/`: write temp then `rename()`
+      (Maildir), polled at attempt boundaries. **cancel · pause/resume · steer**,
+      each journaled with an actor so replay stays honest. Every daemonless job
+      runner (GitHub Actions, GitLab, Buildkite) converges on polled shared state
+      because there is no persistent listener to push to.
+- [ ] `hex respond` over the same inbox — the **only** human-node transport, so it
+      works foreground or detached, human or agent. Makes `human` nodes real;
+      plan → approve → implement is the most universally shipped loop shape in the
+      field survey (Cursor, Claude Code, aider, Cline, Roo).
+- [ ] `hex runs` (list), `hex wait <id>`, `hex cancel` on a live run.
+- [ ] A shipped SKILL.md teaching an agent to drive the CLI, and `hex-mcp` as a
+      second thin client over the same `RuntimeClient` (kept for this reason).
+
+## Control & detach pass — landed 2026-07-31
+
+Phase (b) of the agreed sequence, implemented as specified.
+
+- [x] **Control inbox** `.hex/runs/<id>/control/{tmp,inbox,done}/` — write to
+      `tmp/`, `sync_all`, `rename()` into `inbox/`; the driver drains before each
+      `schedule()` and renames into `done/` **before** applying, i.e. deliberately
+      at-most-once (losing a `steer` beats double-applying a terminal). Files sort
+      `{now_ms:013}-{uuid}.json`. `cancel` · `pause`/`resume` · `steer` ·
+      `respond`, each journaled with its actor so replay reproduces the run.
+- [x] **`pause` returns without a terminal** — `drive()` now returns
+      `Option<Disposition>`; `None` = paused, no `RunFinished` written, `hex resume`
+      continues the same run. `Status::Paused` finally has a producer.
+- [x] **`human` nodes work** — `HumanRequested` (prompt interpolated) then blocks
+      on the inbox at 250ms, bounded by `attempt_deadline()`; the answer is stored
+      as the node result so `{{node.result}}` behaves exactly like an agent's.
+      Validator honesty: `E-human-no-edge` / `E-human-multi-edge`.
+- [x] **Detached runs** — re-exec `current_exe()` with a hidden
+      `--reserved-run-id`, stdio to `detached.{out,err}`, `process_group(0)`,
+      launcher exits without `wait()`. Never `fork()` (unsafe in a multithreaded
+      Rust process). Liveness = run lock + 5s heartbeat → live / hung / abandoned.
+- [x] **New verbs** `runs`, `wait`, `pause`, `steer`, `respond`; `cancel` now works
+      on a *live* run (inbox) as well as an idle one (direct append). Exit code
+      **6 = paused** joins 0–5.
+- [x] **34 new tests** (200 total), including a half-written file in `tmp/` never
+      being consumed, and a detached run outliving its launcher.
+- [x] **hex now reviews itself**: `.hex/config.yaml` (roles → codex reviews,
+      claude implements; checks `test`/`fmt`/`clippy`) and
+      `.hex/graphs/self-review.yaml`, a parallel-gated review-only graph.
+
+### Known warts from this pass
+
+- [ ] A human answer is fenced downstream as "untrusted agent output" —
+      `interpolate` does not know node kinds. Safe default, factually wrong label
+      for an operator's own words. Cheap fix.
+- [ ] `hex status` says "run not found" in the window between `--detach`
+      reserving a run dir and the journal's first write; `hex runs` correctly says
+      "no journal yet". Make `status` agree.
+- [ ] Pause + `--worktree`: `start` releases the slot lease when it returns, so a
+      *paused* worktree run's slot can be reclaimed (its uncommitted work
+      discarded-and-logged) by another run before `hex resume`. In-scope of the
+      documented reclaim behaviour, but new now that pause can return mid-run.
+- [ ] **The fs4/flock flake is NOT root-caused, and it is not worktree-specific.**
+      Now observed on the **run** lock too (`tests/control.rs::cancel_of_an_idle_run_is_recorded_directly`
+      fails ~1 in 14 workspace runs: `RunLock::acquire` gets `WouldBlock` on a lock
+      the just-returned `start` released, so `cancel` returns `Requested` instead
+      of `Recorded`). That has a real user-facing analogue — `hex cancel` right
+      after a run ends can spuriously queue instead of recording. Two independent
+      sightings on two different lock files means this is in our locking or in fs4
+      on macOS, not a worktree quirk. **Serializing the tests hid it rather than
+      fixing it, and worse, the pool's concurrent path is now not exercised at
+      all** — "parallel runs grow the pool" is an untested claim. Next step is a
+      real diagnosis (log thread id + realpath + inode at every lock attempt),
+      not another mutex. Original worktree symptom: Any concurrent in-process leasing made a
+      just-released slot look busy to a sibling test — across *separate repos with
+      distinct lock inodes*, which no obvious flock/fcntl semantics explain.
+      serialized 8/8 pass, parallel ~1-in-3 failed, claiming slot 1 instead of the
+      just-released slot 0. The safety invariant (no two live leases share a slot)
+      is intact either way, so the cost is a needless extra slot, never
+      corruption.
+- [ ] `RunReport.disposition` is now `Option<Disposition>` and `RuntimeClient`
+      gained `list_runs`/`control` with a new `cancel` signature — `hex-mcp` will
+      inherit these when it is built.
+
+### Quality pass — landed 2026-07-31 (`/simplify`, 4 parallel review angles)
+
+- [x] **Two more guard-drift instances closed at the root.** `check_journal` was
+      re-folding the journal after `reduce` already had (the read path folded
+      twice); it now returns the projection it built. And `check_journal` rejected
+      a duplicate `NodeResult` that `reduce` silently accepted — the *same* drift
+      class as the `on_unmet` bug, hiding inside the refactor built to prevent it.
+      The rule moved into `lifecycle::node_result_ok` (derivable from
+      `state.results`, no new field), and `lifecycle.rs`'s doc now enumerates
+      **all** remaining deliberate asymmetries instead of claiming there is one.
+- [x] **One definition of a transition**: `Graph::implicit_reroutes()` /
+      `implicit_reroute_from()` replace the `on_unmet` edge being derived
+      independently by `schedule` and by cycle validation.
+- [x] `ResultKind` deleted (was a duplicate of `hex_worker::ResultCapture` plus a
+      zero-logic `From`); `preset::builtin()` now looks up `BUILTINS` instead of
+      restating it; `push_flag` in `hex-worker`; two intentionally-different
+      disposition renderers in `hex-cli` (JSON keeps `null`, humans get a word);
+      `stage_then_rename` with a `Durability` enum; shared `test_support` modules.
+- [x] Comment trims where the prose dwarfed the code — including my own
+      17-line-comment/4-line-function `pool_shape_gate`.
+
+### OPEN BUGS — found by review round 3, introduced by round 2's cycle fix
+
+Both are unbounded-loop holes in the `accept.on_unmet` cycle validation added on
+2026-07-31, i.e. the fix for one unbounded-cycle bug opened two more. Neither is
+fixed. **Fix before trusting `on_unmet` or `human` nodes in an unattended run.**
+
+- [ ] **A terminal's `budget: { visits: N }` is honoured by the validator but never
+      enforced at runtime.** `check_cycles` (`hex-kernel/src/validate.rs:648`)
+      treats *any* node carrying `max_visits` as breaking the cycle, but
+      `schedule` (`hex-kernel/src/lib.rs:380`) settles terminal nodes **before** it
+      checks visit budgets. So `implement → done → implement` (via `on_unmet`) with
+      `budget.visits` on `done` alone passes validation and then reroutes forever.
+      Fix: either check a terminal's visit bound before emitting `RerouteUnmet`, or
+      stop counting terminal bounds as cycle breakers during validation. The
+      second is probably right — a terminal spends no attempt, so bounding it is a
+      confusing place to express a loop limit.
+- [ ] **An attempt budget does not bound a human-only cycle.** `Graph::implicit_reroutes`
+      (`graph.rs:236`) and `check_cycles` (`validate.rs:615`) both assume
+      `budget.attempts` stops every cycle, but a human response creates **no
+      attempt** — so `human A → human B → human A` costs one attempt to enter and
+      then spins forever with `attempts: 2` while validation passes. Fix: treat an
+      attempt budget as bounding only cycles that contain an `agent` or `command`
+      node; a human-only cycle must require a visit bound. (Only reachable now that
+      `human` nodes actually run, i.e. it arrived with the control pass.)
+
+### Deliberately deferred by the quality pass (real, but need a decision)
+
+- [ ] **`hex wait` re-verifies the entire run every 500ms** — re-reads
+      `graph.yaml`, recomputes its SHA-256, re-parses and re-validates the graph,
+      and re-folds the journal, on every tick for the run's whole lifetime. The
+      biggest efficiency finding. Needs a cache-invalidation decision (the
+      recorded hash makes the compiled graph safe to cache once verified), plus a
+      liveness-only fast path — `wait` needs finished/paused/live/hung, not full
+      state, until the final tick.
+- [ ] **`hex runs` re-folds every historical run's journal on every call**, including
+      runs that finished long ago and can never change. A sidecar summary written
+      once at `RunFinished` would bound listing cost to in-flight runs.
+- [ ] `Runtime::logs` loads every attempt's full stdout/stderr into memory with no
+      cap — fine today, bad against a very verbose long run.
+- [ ] Structural splits declined as churn on just-rewritten files: `start_attempt`
+      (164 lines), `check_journal`'s 9 repeated guard arms (a `reject_unless`
+      helper), `driver.rs` and `hex-runtime/src/lib.rs` both >700 lines.
+- [ ] **Roles and workers share one shadowing namespace** because the compiled IR
+      erases the distinction (`NodeSpec::Agent.worker` always holds the *role*
+      name). The loader knows which YAML key the author wrote, so a
+      `WorkerRef::Role | Direct` in the IR would remove the footgun documented in
+      gotcha 19 instead of relying on insertion order. Invasive; noted.
+
+**(c) Loop quality & observability**
+
+- [ ] `context: continue` — real session resume (codex `exec resume`, claude
+      `--resume`), capability-gated on `SessionResume`, degrading if a session
+      expired. The biggest quality gap: the reviewer currently re-reads the diff
+      cold each round and cannot know it already raised an ask.
+- [ ] Stall breaker: stop and report when a check fails with an identical
+      signature N times, or a node is revisited with an identical result.
+- [ ] Cost/token accounting (`CostReporting`, kept for this): `claude
+      --output-format json` already returns usage and it is currently discarded.
+- [ ] Run digest + `hex watch --follow`; `hex config show` with per-key provenance;
+      `hex graph <name> --source` to copy a preset out.
+
+**(d) Presets & remaining cleanups**
+
+- [ ] `autoresearch`: research → critique(`enough`/`more_needed`) → report, critic
+      = the `reviewer` role reused, bounded by per-node visits. Matches
+      open_deep_research's two-way exit (explicit signal OR hard cap); no surveyed
+      research loop uses a deterministic content gate.
+- [~] Approved deletion batch — **done 2026-07-31**: `EventBody::BudgetExhausted`,
+      `Journal::path()`, `hex_runtime::open()`, plus `Inbox::drain()` and
+      `Builder::commands()` found dead by the simplify pass. **Still open**:
+      the unadvertised `Capability` variants except `SessionResume`/`CostReporting`
+      (kept — session resume and cost accounting will consume them),
+      `hex-worker`'s unused `hex-kernel` dep, hardcoded
+      `HEX_EMIT_FILE`/`HEX_MAY_PROPOSE` literals in the CLI;
+      drop `graph.sha256` (duplicates `RunCreated.graph_hash`); promote the
+      worktree lease out of `RunCreated.inputs` into a typed event (it stores an
+      absolute path next to the operator prompt today). `supports()` and
+      `Status::Paused` are **kept** — session resume and pause give them consumers.
+      Decided to keep: all 8 crates, `RuntimeClient` (MCP will use it), and the
+      three worker adapter structs.
+- [ ] Re-test the reviewer/implementer asymmetry: a published experiment found
+      Claude reviewing Codex lifts pass rate 71.6%→89.7% while the reverse shows
+      no gain or a regression. `defaults.yaml` now pairs codex-implements with
+      claude-reviews on that basis; worth one deliberate A/B rather than trusting
+      one paper.
+- [ ] `effort` needs a live smoke test per agent — the flag spellings could not be
+      verified here without agent auth.
+
+### Superseded by the roles pass (kept for history)
+
+- [ ] **Detached runs + a control inbox** — the prerequisite for driving hex from
+      a Claude session. Research settled the design: spawn (never `fork()`, unsafe
+      in a multithreaded Rust process) with `process_group(0)` and stdio to files,
+      parent exits without `wait()`; keep the existing advisory lock as the
+      liveness signal (kernel-released on death, unlike a pidfile — PID reuse is
+      real) plus a journal heartbeat to tell "hung" from "crashed"; steer/cancel
+      via `.hex/runs/<id>/control/` written temp-then-`rename()` (Maildir) and
+      polled at attempt boundaries. Every daemonless job runner (GitHub Actions,
+      GitLab, Buildkite) converges on exactly this because there is no persistent
+      listener to push to. Separate verbs over the id (`hex wait`, `hex logs -f`),
+      per docker/kubectl convention — not more flags on `run`.
+- [ ] **Run digest + `hex watch --follow`** — an end-of-run summary (what
+      changed, what the reviewer said, why it stopped, what it cost) and a
+      live tail from a second terminal. `hex status` is still four lines.
+- [ ] **`hex cancel` on a live run** — currently refused, because it needs the
+      lock the driver holds. Falls out of the control inbox.
+- [ ] **Stall / oscillation circuit breaker** — an unattended loop with no
+      progress detection is a budget-burning machine. The incumbent
+      `critique-loop` *skill* already does this (same asks 3 rounds → stop and
+      report); hex does not.
+- [ ] **Cost/token accounting** — `Capability::CostReporting` is declared and
+      implemented by nobody; `claude --output-format json` already returns usage
+      and `capture_result` throws it away. Unattended loops spend money silently.
+- [ ] **`context: continue` (session resume)** — the reviewer currently re-reads
+      the diff cold every round, so it cannot know it already raised an ask. This
+      is the single biggest *quality* gap against the skill, which keeps one
+      persistent navigator session. Would also give `Capability::SessionResume`
+      its first real consumer instead of deleting it.
+- [ ] **`human` approval node + `hex respond`** — plan → *operator approves* →
+      implement is the most universally validated loop shape in the field survey
+      (Cursor Plan Mode, Claude Code plan mode, aider architect, Cline Plan/Act,
+      Roo Architect→Code). Today a `human` node passes `hex validate` and then
+      fails the run.
+- [ ] **An `autoresearch` preset** — every current preset is code-shaped with a
+      test gate. Research has no deterministic gate; the field's substitutes are
+      (a) a model self-assessment signal (maps onto `may_propose` as-is),
+      (b) depth/breadth budget caps as the hard backstop (maps onto `Budget`),
+      and (c) a post-hoc citation/grounding check as the one place a real
+      deterministic gate fits.
+- [ ] **Reconsider reviewer/implementer model assignment** — the presets pair
+      claude-implements with codex-reviews. A published cross-model experiment
+      found Claude reviewing Codex lifts pass rate 71.6%→89.7% while the reverse
+      shows no gain or a regression, i.e. the presets may have the asymmetry
+      backwards. Worth one deliberate A/B before flipping on one paper.
+- [ ] **Structural cleanups an audit priced but that need a decision**: delete
+      the zero-call-site `RuntimeClient` trait (−71 lines); collapse the three
+      near-identical typed workers into one table-driven adapter (−90, contradicts
+      gotcha 5c); delete the 6 never-advertised `Capability` variants and
+      `supports()`; delete `EventBody::BudgetExhausted` (never constructed);
+      drop `graph.sha256` (duplicates `RunCreated.graph_hash`, violating
+      journal-is-authoritative); promote the worktree lease out of
+      `RunCreated.inputs`, where it is stringly-typed next to the operator prompt
+      and stores an absolute path; and decide whether 8 crates earn their keep at
+      ~9k LOC (`hex-mcp`/`hex-dashboard`/`hex-bench` are ~130 lines of scaffold).
+      Audit total: ~-1370 lines, -7 deps available.
+
 ## Phase 2 — hardening & correctness
 
 The robustness cut from the MVP: make the kernel/runtime trustworthy before
@@ -252,8 +608,10 @@ Phase-2 kernel; none change kernel semantics.
 - [ ] **Authoring skill**: SKILL.md shipped in-repo teaching an agent to
       draft graph YAML from a task description and iterate against
       `hex validate` / `hex graph`.
-- [ ] `hex init` (scaffold `.hex/` + example graph) + `hex doctor` (workers
-      installed/authed/versions).
+- [~] `hex doctor` **shipped 2026-07-31** (workers + checks probed against
+      `PATH`, plus a start-time preflight that refuses a run with a missing agent
+      CLI). Still open: version/auth probing, and `hex init` to scaffold `.hex/`
+      with an example graph and a `checks:` block.
 - [x] **Built-in preset library** (shipped 2026-07-21), roles as topology +
       prompts (never new kinds): `implement-until-green` (Ralph: implement→test),
       `tdd` (spec→implement→test), `plan-build-review` (plan→implement→test→

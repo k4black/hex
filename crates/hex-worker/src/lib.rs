@@ -116,6 +116,14 @@ pub trait Worker {
     /// The capability manifest this worker advertises to the graph validator.
     fn capabilities(&self) -> CapabilityManifest;
 
+    /// The executable this worker spawns, for preflight (`hex doctor`) — so a
+    /// missing or unauthenticated agent CLI is reported *before* a run is
+    /// created, instead of failing the first attempt. `None` for a worker that
+    /// spawns nothing (the mock).
+    fn program(&self) -> Option<&str> {
+        None
+    }
+
     /// Run one attempt to completion and report the outcome. Effectful (this
     /// is the adapter layer); the runtime journals around it.
     fn run(&self, request: &WorkRequest) -> WorkOutcome;

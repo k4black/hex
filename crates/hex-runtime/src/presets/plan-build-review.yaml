@@ -1,19 +1,20 @@
 version: 1
 name: plan-build-review
-description: "Full pipeline — plan, implement, test, cross-model review; passes only when green & approved"
+description: "Full pipeline — plan, then implement, then a different model reviews"
 example: "refactor the auth module to use middleware"
 
-# The full pipeline: plan → implement → test → review. The planner's result is
-# handed to the implementer and reviewer as {{plan.result}}; a different model
-# (codex) reviews than wrote the code (claude). Passes only when the tests pass
-# AND the reviewer approves. plan/implement finish without emitting (implicit
-# `done`); review emits its verdict.
+# The full pipeline: plan → implement → review. The planner's result is handed to
+# the implementer and reviewer as {{plan.result}}, and the `reviewer` role runs a
+# different agent from `implementer`. plan/implement finish without emitting
+# (implicit `done`); review emits its verdict.
 # Run it with:  hex run plan-build-review -p "…"
 #
-# The gate runs `cargo test`; copy to .hex/graphs/ and edit it for your stack.
+# Gate-free so it runs anywhere. To gate on your tests, declare
+# `checks: { test: [...] }` and copy this graph (`hex graph … --source`), adding a
+# `command: { check: test }` node between implement and review.
 
 defaults:
-  worker: claude
+  role: implementer
   context: fresh
   budget:
     attempts: 16
@@ -24,6 +25,7 @@ entry: plan
 nodes:
   plan:
     agent:
+      role: planner
       prompt: |
         Produce a short, concrete implementation plan for this task.
 
@@ -50,21 +52,13 @@ nodes:
         {{review.result}}
 
         Make the smallest change that satisfies the plan and keeps the test
-        suite passing. Run `cargo test` yourself to check. Finish when done.
+        suite passing. Run the project's tests yourself to check. Finish when done.
     on:
-      done: test
-
-  test:
-    gate:
-      run: [cargo, test]
-    on:
-      passed: review
-      failed: implement
+      done: review
 
   review:
     agent:
-      worker: codex
-      read_only: true
+      role: reviewer
       prompt: |
         Review the change that was just implemented.
 
@@ -81,6 +75,8 @@ nodes:
         handed back to the implementer) and run:
           hex emit changes_requested
       may_propose: [approved, changes_requested]
+    budget:
+      visits: 4
     on:
       approved: done
       changes_requested: implement
@@ -89,4 +85,5 @@ nodes:
     terminal: succeeded
 
 accept:
-  require: [test.passed, review.approved]
+  require: [review.approved]
+  on_unmet: implement

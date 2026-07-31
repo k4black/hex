@@ -17,14 +17,42 @@ const IMPLEMENT_UNTIL_GREEN: &str = include_str!("presets/implement-until-green.
 const TDD: &str = include_str!("presets/tdd.yaml");
 const PLAN_BUILD_REVIEW: &str = include_str!("presets/plan-build-review.yaml");
 const REVIEW: &str = include_str!("presets/review.yaml");
+const AUTORESEARCH: &str = include_str!("presets/autoresearch.yaml");
 
-/// Names of the graphs shipped in the binary.
-const BUILTINS: &[&str] = &[
-    "critique-loop",
-    "implement-until-green",
-    "tdd",
-    "plan-build-review",
-    "review",
+/// One graph shipped in the binary.
+pub struct Builtin {
+    /// The preset's name, as `hex run <name>` takes it.
+    pub name: &'static str,
+    /// Its embedded YAML source.
+    pub source: &'static str,
+}
+
+/// The graphs shipped in the binary, in listing order.
+pub const BUILTINS: &[Builtin] = &[
+    Builtin {
+        name: "critique-loop",
+        source: CRITIQUE_LOOP,
+    },
+    Builtin {
+        name: "implement-until-green",
+        source: IMPLEMENT_UNTIL_GREEN,
+    },
+    Builtin {
+        name: "tdd",
+        source: TDD,
+    },
+    Builtin {
+        name: "plan-build-review",
+        source: PLAN_BUILD_REVIEW,
+    },
+    Builtin {
+        name: "review",
+        source: REVIEW,
+    },
+    Builtin {
+        name: "autoresearch",
+        source: AUTORESEARCH,
+    },
 ];
 
 /// A resolved graph source plus a label describing where it came from.
@@ -102,15 +130,10 @@ pub fn resolve(reference: &str, project_root: &Path) -> Result<Resolved> {
     )))
 }
 
+/// The embedded source of the built-in named `name` — looked up in [`BUILTINS`]
+/// so shipping a preset means adding one table entry, not two.
 fn builtin(name: &str) -> Option<&'static str> {
-    match name {
-        "critique-loop" => Some(CRITIQUE_LOOP),
-        "implement-until-green" => Some(IMPLEMENT_UNTIL_GREEN),
-        "tdd" => Some(TDD),
-        "plan-build-review" => Some(PLAN_BUILD_REVIEW),
-        "review" => Some(REVIEW),
-        _ => None,
-    }
+    BUILTINS.iter().find(|b| b.name == name).map(|b| b.source)
 }
 
 /// List every runnable graph across the three layers, deduped by name with the
@@ -121,7 +144,7 @@ pub fn list(project_root: &Path) -> Vec<Entry> {
     use std::collections::BTreeMap;
     // Insert lowest precedence first so higher layers overwrite the origin.
     let mut found: BTreeMap<String, String> = BTreeMap::new();
-    for name in BUILTINS {
+    for name in BUILTINS.iter().map(|b| b.name) {
         found.insert((*name).to_owned(), "built-in".to_owned());
     }
     if let Some(dir) = user_graphs_dir() {
@@ -183,7 +206,9 @@ fn user_graphs_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::test_support::unique;
 
     #[test]
     fn resolves_the_builtin_critique_loop() {
@@ -206,7 +231,8 @@ mod tests {
     fn a_yml_graph_is_both_listed_and_resolvable() {
         // Regression: `list` and `resolve` must agree on extensions, so a graph
         // shown by `hex list` is exactly what `hex run` executes.
-        let root = std::env::temp_dir().join(format!("hex-yml-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("hex-yml-{}-{}", std::process::id(), unique()));
         let graphs = root.join(".hex").join("graphs");
         std::fs::create_dir_all(&graphs).expect("mkdir");
         std::fs::write(graphs.join("only-yml.yml"), "version: 1").expect("write");
@@ -218,7 +244,8 @@ mod tests {
 
     #[test]
     fn list_includes_builtins_and_project_graphs() {
-        let root = std::env::temp_dir().join(format!("hex-list-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("hex-list-{}-{}", std::process::id(), unique()));
         let graphs = root.join(".hex").join("graphs");
         std::fs::create_dir_all(&graphs).expect("mkdir");
         std::fs::write(graphs.join("mine.yaml"), "version: 1").expect("write");

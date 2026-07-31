@@ -472,7 +472,9 @@ fn cap_line(mut s: String) -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::test_support::unique;
 
     fn view(worker: Option<&str>, kind: NodeKind, deadline_ms: Option<u64>) -> OwnedView {
         OwnedView {
@@ -509,18 +511,15 @@ mod tests {
     }
 
     #[test]
-    fn status_line_labels_workerless_nodes_by_kind_not_always_gate() {
-        // A gate shows "gate"…
-        let g = status_line(&view(None, NodeKind::Gate, None), Duration::from_secs(5), 0);
-        assert!(g.contains("build · gate · attempt 2/8"), "got: {g}");
-        assert!(!g.contains("left"), "no countdown without a deadline: {g}");
-        // …but a command shows "command", not "gate".
+    fn status_line_labels_a_workerless_node_by_its_kind() {
+        // A command node has no worker, so the status line shows its kind there.
         let c = status_line(
             &view(None, NodeKind::Command, None),
             Duration::from_secs(5),
             0,
         );
         assert!(c.contains("build · command · attempt 2/8"), "got: {c}");
+        assert!(!c.contains("left"), "no countdown without a deadline: {c}");
     }
 
     /// Append `bytes` to `path`, like an agent's stdout growing.
@@ -534,7 +533,11 @@ mod tests {
     }
 
     fn tmp(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hex-tail-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hex-tail-{tag}-{}-{}",
+            std::process::id(),
+            unique()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("log")
     }

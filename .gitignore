@@ -25,6 +25,8 @@ target
 
 # hex run artifacts (journals, snapshots, attempt logs)
 .hex/runs/
+# scratch notes the autoresearch preset accumulates in the workspace
+.hex/research-notes.md
 
 
 

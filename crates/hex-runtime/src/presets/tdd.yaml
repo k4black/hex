@@ -9,10 +9,13 @@ example: "add input validation to the signup form"
 # Both work agents finish without emitting (implicit `done`).
 # Run it with:  hex run tdd -p "…"
 #
-# The gates run `cargo test`; copy to .hex/graphs/ and edit them for your stack.
+# REQUIRES a `test` check — a red phase that cannot fail proves nothing, so hex
+# refuses to start until your project declares one. In .hex/config.yaml:
+#   checks:
+#     test: [pytest, -q]        # or [npm, test] / [cargo, test] / [make, test]
 
 defaults:
-  worker: claude
+  role: implementer
   context: fresh
   budget:
     attempts: 14
@@ -38,8 +41,8 @@ nodes:
   # expected outcome here (→ implement); an already-green suite means the test
   # doesn't fail, so go back and write a real failing test.
   red:
-    gate:
-      run: [cargo, test]
+    command:
+      check: test
     on:
       failed: implement
       passed: spec
@@ -55,13 +58,13 @@ nodes:
         {{spec.result}}
 
         Implement only what makes that test (and the rest of the suite) pass.
-        Run `cargo test` yourself to check. Finish when you believe it is green.
+        Run the project's tests yourself to check. Finish when you believe it is green.
     on:
       done: green
 
   green:
-    gate:
-      run: [cargo, test]
+    command:
+      check: test
     on:
       passed: done
       failed: implement
@@ -71,3 +74,4 @@ nodes:
 
 accept:
   require: [green.passed]
+  on_unmet: implement

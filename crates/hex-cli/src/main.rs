@@ -4,17 +4,23 @@
 //! [`hex_runtime::RuntimeClient`]. A human at a TTY and an agent (via injected
 //! `hex emit`) share the same control protocol; every action becomes an event.
 //!
-//! Verbs (slim MVP): `validate` · `graph` · `run` · `resume` · `status` ·
-//! `watch` · `cancel`, plus the worker-side `emit`. Redoing work is a new
-//! `run`; there is no `retry`/`replay`.
+//! Verbs: `validate` · `graph` · `run` · `resume` · `runs` · `status` · `watch` ·
+//! `wait` · `logs` · `pause` · `steer` · `respond` · `cancel`, plus the
+//! worker-side `emit`. Redoing work is a new `run`; there is no
+//! `retry`/`replay`. The mid-run verbs are all thin writes to the run's control
+//! inbox — the same transport a human and an agent use.
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use hex_runtime::{Disposition, Isolation, Runtime};
+use hex_runtime::{
+    Actor, Cancellation, Command as ControlCommand, Disposition, Isolation, Runtime,
+};
 
 mod preview;
+#[cfg(test)]
+mod test_support;
 
 /// Worked examples, shown under `hex --help`.
 const EXAMPLES: &str = "\
@@ -23,8 +29,13 @@ Examples:
   hex validate critique-loop           check a graph before running it
   hex run critique-loop -p \"fix bug\"   start a run with an inline prompt
   hex run critique-loop -f task.md     read the prompt from a file
+  hex run tdd -p \"fix bug\" --detach    start a run in the background
+  hex runs                             list runs (ids, status, age)
   hex status <run-id>                  show a run's status
   hex logs <run-id> --node reviewer    show one node's agent output
+  hex wait <run-id>                    block until a run finishes
+  hex steer <run-id> \"use the v2 API\"  guide the next attempt
+  hex respond <run-id> \"approved\"      answer a waiting human node
   hex resume <run-id>                  continue a run after a pause or crash
 
 Add --json to any command for machine-readable output on stdout.
@@ -60,6 +71,8 @@ enum Command {
     /// List runnable graphs (project, then user, then built-in)
     #[command(visible_alias = "ls")]
     List,
+    /// Check that configured workers and checks are actually usable
+    Doctor,
     /// Validate a graph: schema, references, bounded cycles
     Validate {
         /// Graph reference: a preset name or a path to a `.yaml` file
@@ -101,12 +114,20 @@ enum Command {
         /// Warmup argv run once in a fresh/reclaimed worktree (no shell)
         #[arg(long, value_name = "CMD", requires = "worktree")]
         worktree_init: Option<String>,
+        /// Run in the background: print the run id and return immediately
+        #[arg(long)]
+        detach: bool,
+        /// Internal: drive the run id a `--detach` launcher reserved
+        #[arg(long, value_name = "RUN_ID", hide = true, conflicts_with = "detach")]
+        reserved_run_id: Option<String>,
     },
     /// Resume the SAME run from its journal (after a pause or crash)
     Resume {
         /// Run id, as printed by `hex run`
         run_id: String,
     },
+    /// List runs (newest activity first)
+    Runs,
     /// Show a run's projected status
     Status {
         /// Run id, as printed by `hex run`
@@ -127,6 +148,32 @@ enum Command {
         /// Show full captured stdout/stderr, not just each attempt's final message
         #[arg(long)]
         full: bool,
+    },
+    /// Block until a run finishes, exiting with its disposition code
+    Wait {
+        /// Run id, as printed by `hex run`
+        run_id: String,
+    },
+    /// Pause a run at its next attempt boundary (`hex resume` continues it)
+    Pause {
+        /// Run id, as printed by `hex run`
+        run_id: String,
+    },
+    /// Add operator guidance to the run's next attempt
+    Steer {
+        /// Run id, as printed by `hex run`
+        run_id: String,
+        /// Guidance text, injected into the next attempt's prompt
+        #[arg(value_name = "TEXT")]
+        text: String,
+    },
+    /// Answer a `human` node that is blocking a run
+    Respond {
+        /// Run id, as printed by `hex run`
+        run_id: String,
+        /// The answer, stored as the node's result
+        #[arg(value_name = "TEXT")]
+        text: String,
     },
     /// Cancel a run (records a terminal cancellation event)
     Cancel {
@@ -168,6 +215,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
 
     match command {
         Command::List => cmd_list(json),
+        Command::Doctor => cmd_doctor(json),
         Command::Validate { graph } => cmd_validate(&graph, json),
         Command::Graph { graph } => cmd_graph(&graph, json),
         Command::Run {
@@ -178,22 +226,55 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             worktree,
             no_worktree,
             worktree_init,
+            detach,
+            reserved_run_id,
         } => cmd_run(
             graph.as_deref(),
-            &prompt,
-            &file,
+            resolve_prompt(&prompt, &file)?,
             name.as_deref(),
             isolation_from(worktree.as_deref(), no_worktree, worktree_init.as_deref()),
+            RunMode {
+                detach,
+                reserved: reserved_run_id,
+            },
             json,
             no_preview,
         ),
         Command::Resume { run_id } => cmd_resume(&run_id, json, no_preview),
+        Command::Runs => cmd_runs(json),
         Command::Status { run_id } => cmd_status(&run_id, json),
         Command::Watch { run_id } => cmd_watch(&run_id, json),
         Command::Logs { run_id, node, full } => cmd_logs(&run_id, node.as_deref(), full, json),
+        Command::Wait { run_id } => cmd_wait(&run_id, json),
+        Command::Pause { run_id } => cmd_control(&run_id, &ControlCommand::Pause, json),
+        Command::Steer { run_id, text } => {
+            cmd_control(&run_id, &ControlCommand::Steer { text }, json)
+        }
+        Command::Respond { run_id, text } => {
+            cmd_control(&run_id, &ControlCommand::Respond { text }, json)
+        }
         Command::Cancel { run_id } => cmd_cancel(&run_id, json),
         Command::Emit { event } => cmd_emit(&event),
     }
+}
+
+/// How `hex run` should execute: foreground (the default), detaching, or — when
+/// the launcher re-execs us — driving the run id it reserved.
+struct RunMode {
+    detach: bool,
+    reserved: Option<String>,
+}
+
+/// The actor a command from this CLI is issued as. A human at a TTY and an agent
+/// share one protocol, so the *identity* is what distinguishes them; `$USER` is
+/// the best local handle available without asking.
+fn operator_actor() -> Actor {
+    Actor::human(
+        std::env::var("USER")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "local".to_owned()),
+    )
 }
 
 /// Open a runtime rooted at the current directory.
@@ -260,6 +341,51 @@ fn print_graph_list(runtime: &Runtime, json: bool) {
         let example = g.example.as_deref().unwrap_or("<prompt>");
         println!("      hex run {} -p \"{example}\"\n", g.name);
     }
+}
+
+/// Report whether every configured worker and check can actually run. Exit 1 if
+/// anything is broken, so CI (or a driving agent) can gate on it.
+fn cmd_doctor(json: bool) -> Result<ExitCode, String> {
+    let runtime = open_runtime()?;
+    let report = runtime.doctor();
+    if json {
+        let findings = report
+            .findings
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "kind": f.kind,
+                    "name": f.name,
+                    "program": f.program,
+                    "ok": f.ok,
+                    "detail": f.detail,
+                })
+            })
+            .collect::<Vec<_>>();
+        let v = serde_json::json!({ "ok": report.ok(), "findings": findings });
+        println!("{v}");
+    } else if report.findings.is_empty() {
+        println!("no workers or checks configured");
+    } else {
+        for f in &report.findings {
+            let mark = if f.ok { "ok     " } else { "MISSING" };
+            println!("  {mark} {:<7} {:<12} {}", f.kind, f.name, f.detail);
+        }
+        if report.ok() {
+            println!("\nall good");
+        } else {
+            eprintln!(
+                "\n{} unusable: {}\ninstall the missing tools, or fix `.hex/config.yaml`",
+                report.broken().len(),
+                report.broken().join(", ")
+            );
+        }
+    }
+    Ok(if report.ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }
 
 fn cmd_validate(reference: &str, json: bool) -> Result<ExitCode, String> {
@@ -341,10 +467,10 @@ fn isolation_from(worktree: Option<&str>, no_worktree: bool, init: Option<&str>)
 
 fn cmd_run(
     reference: Option<&str>,
-    prompt: &Option<String>,
-    file: &Option<String>,
+    prompt: Option<String>,
     name: Option<&str>,
     isolation: Isolation,
+    mode: RunMode,
     json: bool,
     no_preview: bool,
 ) -> Result<ExitCode, String> {
@@ -354,38 +480,274 @@ fn cmd_run(
         print_graph_list(&runtime, json);
         return Ok(ExitCode::SUCCESS);
     };
-    let prompt = resolve_prompt(prompt, file)?;
-    let report = runtime
-        .start(reference, prompt.as_deref(), name, &isolation)
-        .map_err(|e| e.to_string())?;
-    if json {
-        let v = serde_json::json!({
-            "run_id": report.run_id,
-            "origin": report.origin,
-            "disposition": report.disposition,
-        });
-        println!("{v}");
-    } else {
-        println!("run {} ({})", report.run_id, report.origin);
-        println!("disposition: {}", report.disposition);
+    if mode.detach {
+        return cmd_detach(
+            &runtime,
+            reference,
+            prompt.as_deref(),
+            name,
+            &isolation,
+            json,
+        );
     }
-    Ok(exit_for(report.disposition))
+    let report = match &mode.reserved {
+        Some(run_id) => runtime.start_reserved(run_id, reference, prompt.as_deref(), &isolation),
+        None => runtime.start(reference, prompt.as_deref(), name, &isolation),
+    }
+    .map_err(|e| e.to_string())?;
+    print_outcome(&report, json, "run");
+    Ok(exit_for_report(&report))
+}
+
+/// Launch a run in the background and return its id immediately.
+///
+/// The run id is reserved (and the graph validated) here, in the foreground, so a
+/// bad graph or a missing agent CLI is reported to the operator instead of dying
+/// unseen in the child. Then we re-exec ourselves to drive that reservation.
+fn cmd_detach(
+    runtime: &Runtime,
+    reference: &str,
+    prompt: Option<&str>,
+    name: Option<&str>,
+    isolation: &Isolation,
+    json: bool,
+) -> Result<ExitCode, String> {
+    let (run_id, run_dir) = runtime
+        .reserve(reference, prompt, name)
+        .map_err(|e| e.to_string())?;
+
+    let mut argv: Vec<String> = vec![
+        "run".to_owned(),
+        reference.to_owned(),
+        "--reserved-run-id".to_owned(),
+        run_id.clone(),
+    ];
+    if let Some(text) = prompt {
+        // Pass the resolved text, not `-f`: the child must run the prompt the
+        // launcher validated, even if the file changes underneath it.
+        argv.push("--prompt".to_owned());
+        argv.push(text.to_owned());
+    }
+    if let Isolation::Worktree { base, init } = isolation {
+        argv.push("--worktree".to_owned());
+        argv.push(base.clone().unwrap_or_default());
+        if !init.is_empty() {
+            argv.push("--worktree-init".to_owned());
+            argv.push(init.join(" "));
+        }
+    }
+    spawn_detached(&argv, &run_dir)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "run_id": run_id, "detached": true })
+        );
+    } else {
+        println!("{run_id}");
+        eprintln!("detached; follow with `hex wait {run_id}` or `hex watch {run_id}`");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Spawn `hex <argv>` as a run that outlives this process.
+///
+/// `spawn`, never `fork()` — forking a multithreaded Rust process is unsafe, and
+/// this binary is multithreaded. `process_group(0)` puts the child in its own
+/// process group so a Ctrl-C (or the shell reaping our group) does not kill the
+/// run, and we deliberately never `wait()`: the parent exits at once, the child
+/// is reparented, and no zombie is left behind.
+#[cfg(unix)]
+fn spawn_detached(argv: &[String], run_dir: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Command as Proc, Stdio};
+
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate the hex binary: {e}"))?;
+    let out = std::fs::File::create(run_dir.join("detached.out"))
+        .map_err(|e| format!("cannot create detached.out: {e}"))?;
+    let err = std::fs::File::create(run_dir.join("detached.err"))
+        .map_err(|e| format!("cannot create detached.err: {e}"))?;
+    Proc::new(exe)
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("cannot spawn the detached run: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn spawn_detached(_argv: &[String], _run_dir: &std::path::Path) -> Result<(), String> {
+    Err("--detach needs a unix process group; run in the foreground".to_owned())
 }
 
 fn cmd_resume(run_id: &str, json: bool, no_preview: bool) -> Result<ExitCode, String> {
     let runtime = open_runtime_streaming(json, no_preview)?;
     let report = runtime.resume(run_id).map_err(|e| e.to_string())?;
+    print_outcome(&report, json, "resumed");
+    Ok(exit_for_report(&report))
+}
+
+/// Render the end of a `run`/`resume`. A paused run has no disposition — saying
+/// `succeeded` (or nothing) would misreport a run that is merely suspended.
+fn print_outcome(report: &hex_runtime::RunReport, json: bool, verb: &str) {
+    let disposition = disposition_label(report.disposition, "paused");
     if json {
         let v = serde_json::json!({
             "run_id": report.run_id,
-            "disposition": report.disposition,
+            "origin": report.origin,
+            "disposition": disposition,
+            "paused": report.disposition.is_none(),
         });
         println!("{v}");
     } else {
-        println!("resumed {}", report.run_id);
-        println!("disposition: {}", report.disposition);
+        println!("{verb} {} ({})", report.run_id, report.origin);
+        println!("disposition: {disposition}");
+        if report.disposition.is_none() {
+            eprintln!("paused; continue with `hex resume {}`", report.run_id);
+        }
     }
-    Ok(exit_for(report.disposition))
+}
+
+fn cmd_runs(json: bool) -> Result<ExitCode, String> {
+    let runtime = open_runtime()?;
+    let runs = runtime.list_runs().map_err(|e| e.to_string())?;
+    if json {
+        let items: Vec<_> = runs
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "run_id": r.run_id,
+                    "status": r.status.as_ref().map(ToString::to_string),
+                    "current": r.current,
+                    "attempts": r.attempts,
+                    "disposition": disposition_json(r.disposition),
+                    "liveness": r.liveness.to_string(),
+                    "created_at_ms": r.created_at_ms,
+                    "updated_at_ms": r.updated_at_ms,
+                    "error": r.error,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "runs": items }));
+        return Ok(ExitCode::SUCCESS);
+    }
+    if runs.is_empty() {
+        println!("no runs yet (start one with `hex run <graph> -p \"…\"`)");
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!(
+        "{:<34} {:<12} {:<10} {:<14} PROCESS",
+        "RUN", "STATE", "AGE", "NODE"
+    );
+    for r in &runs {
+        let state = r
+            .status
+            .as_ref()
+            .map_or("unreadable".to_owned(), ToString::to_string);
+        println!(
+            "{:<34} {:<12} {:<10} {:<14} {}",
+            r.run_id,
+            state,
+            age(r.updated_at_ms),
+            r.current.as_deref().unwrap_or("-"),
+            r.liveness,
+        );
+        if let Some(err) = &r.error {
+            eprintln!("  {}: {err}", r.run_id);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A compact "how long ago" for a listing (`3m`, `2h`, `4d`).
+fn age(at_ms: u64) -> String {
+    if at_ms == 0 {
+        return "-".to_owned();
+    }
+    let secs = hex_runtime::journal::now_ms().saturating_sub(at_ms) / 1000;
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+/// How long `wait` tolerates "nobody is driving this unfinished run" before
+/// giving up. A grace period, because a just-detached run has not yet taken its
+/// lock and would otherwise look abandoned the instant it was launched.
+const WAIT_ABANDONED_GRACE_MS: u64 = 5_000;
+
+/// Block until a run reaches an outcome, then exit with its disposition code.
+///
+/// Also returns when the run *cannot* finish on its own — paused, or abandoned by
+/// its driver — rather than waiting forever for a process that is not coming
+/// back.
+fn cmd_wait(run_id: &str, json: bool) -> Result<ExitCode, String> {
+    let runtime = open_runtime()?;
+    let mut abandoned_since: Option<std::time::Instant> = None;
+    loop {
+        let summary = runtime.summary(run_id).map_err(|e| e.to_string())?;
+        let verdict = match summary.liveness {
+            hex_runtime::Liveness::Finished => Some((
+                disposition_label(summary.disposition, "failed"),
+                summary.disposition.map_or(ExitCode::from(1), exit_for),
+            )),
+            hex_runtime::Liveness::Paused => Some(("paused".to_owned(), ExitCode::from(PAUSED))),
+            hex_runtime::Liveness::Abandoned => {
+                let since = abandoned_since.get_or_insert_with(std::time::Instant::now);
+                let waited = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
+                (waited >= WAIT_ABANDONED_GRACE_MS)
+                    .then(|| ("abandoned".to_owned(), ExitCode::from(1)))
+            }
+            hex_runtime::Liveness::Live | hex_runtime::Liveness::Hung => {
+                abandoned_since = None;
+                None
+            }
+        };
+        if let Some((state, code)) = verdict {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "run_id": summary.run_id,
+                        "state": state,
+                        "disposition": disposition_json(summary.disposition),
+                    })
+                );
+            } else {
+                println!("{state}");
+                if state == "abandoned" {
+                    eprintln!("nothing is driving `{run_id}` — continue it with `hex resume`");
+                }
+            }
+            return Ok(code);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// Queue a control command (pause/steer/respond) for whoever is driving the run.
+fn cmd_control(run_id: &str, command: &ControlCommand, json: bool) -> Result<ExitCode, String> {
+    let runtime = open_runtime()?;
+    let actor = operator_actor();
+    runtime
+        .control(run_id, &actor, command)
+        .map_err(|e| e.to_string())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "run_id": run_id, "queued": command.as_str() })
+        );
+    } else {
+        // Queued, not applied: the driver picks it up at its next attempt
+        // boundary, and the journal is where the effect shows up.
+        println!("queued {} for {run_id}", command.as_str());
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_status(run_id: &str, json: bool) -> Result<ExitCode, String> {
@@ -397,6 +759,7 @@ fn cmd_status(run_id: &str, json: bool) -> Result<ExitCode, String> {
             "status": s.status.to_string(),
             "current": s.current,
             "attempts": s.attempts,
+            "disposition": disposition_json(s.disposition),
         });
         println!("{v}");
     } else {
@@ -497,10 +860,21 @@ fn grey(s: &str, is_tty: bool) -> String {
 
 fn cmd_cancel(run_id: &str, json: bool) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
-    runtime.cancel(run_id).map_err(|e| e.to_string())?;
+    let outcome = runtime
+        .cancel(run_id, &operator_actor())
+        .map_err(|e| e.to_string())?;
+    // A live run is cancelled by its own driver (it holds the journal's single
+    // write lock), so the honest report is "requested", not "cancelled".
+    let requested = outcome == Cancellation::Requested;
     if json {
-        let v = serde_json::json!({"run_id": run_id, "cancelled": true});
+        let v = serde_json::json!({
+            "run_id": run_id,
+            "cancelled": !requested,
+            "requested": requested,
+        });
         println!("{v}");
+    } else if requested {
+        println!("cancel queued for {run_id} (a live driver will stop at its next boundary)");
     } else {
         println!("cancelled {run_id}");
     }
@@ -549,20 +923,76 @@ fn resolve_prompt(
     }
 }
 
+/// Map a run's disposition to a distinct exit code, so a script (or a driving
+/// agent) can branch on the outcome without parsing output. `2` is reserved by
+/// clap for usage errors, so the dispositions start at `3`.
+///
+/// | code | meaning |
+/// |---|---|
+/// | 0 | succeeded |
+/// | 1 | failed (or a hex error) |
+/// | 2 | usage error (clap) |
+/// | 3 | timed out |
+/// | 4 | budget exhausted |
+/// | 5 | cancelled |
+/// | 6 | paused (no disposition yet — resumable) |
 fn exit_for(d: Disposition) -> ExitCode {
-    match d {
-        Disposition::Succeeded => ExitCode::SUCCESS,
-        _ => ExitCode::from(1),
-    }
+    ExitCode::from(match d {
+        Disposition::Succeeded => 0,
+        Disposition::Failed => 1,
+        Disposition::TimedOut => 3,
+        Disposition::BudgetExhausted => 4,
+        Disposition::Cancelled => 5,
+    })
+}
+
+/// Exit code for a paused run. Deliberately *not* 0: a suspended run has not
+/// succeeded, and a script that treated it as success would move on from work
+/// that has not happened yet.
+const PAUSED: u8 = 6;
+
+/// A disposition for a `--json` field: `null` when the run has no terminal
+/// disposition yet, **never** a stand-in word — a machine consumer must be able
+/// to tell "not finished" from an outcome, and this field once did not exist at
+/// all, forcing one to string-split `status`.
+fn disposition_json(disposition: Option<Disposition>) -> Option<String> {
+    disposition.map(|d| d.to_string())
+}
+
+/// A disposition as one display word, with the caller naming what *its* "no
+/// disposition yet" means. The two callers genuinely differ, which is why the
+/// fallback is a parameter rather than a constant: a `run`/`resume` that returned
+/// without a terminal is **paused** (see [`print_outcome`]), whereas `wait` only
+/// formats a disposition once liveness says `Finished`, so a missing one there is
+/// a journal that lost its outcome — reported `failed`, fail-closed.
+fn disposition_label(disposition: Option<Disposition>, if_none: &str) -> String {
+    disposition.map_or_else(|| if_none.to_owned(), |d| d.to_string())
+}
+
+/// Exit code for a finished-or-paused `run`/`resume`.
+fn exit_for_report(report: &hex_runtime::RunReport) -> ExitCode {
+    report.disposition.map_or(ExitCode::from(PAUSED), exit_for)
 }
 
 fn event_summary(body: &hex_runtime::EventBody) -> String {
     use hex_runtime::EventBody as B;
     match body {
         B::RunCreated { graph_hash, .. } => {
-            format!("run_created ({})", &graph_hash[..graph_hash.len().min(12)])
+            format!(
+                "run_created ({})",
+                graph_hash.chars().take(12).collect::<String>()
+            )
         }
         B::RunStarted => "run_started".to_owned(),
+        B::RunPaused => "run_paused".to_owned(),
+        B::RunResumed => "run_resumed".to_owned(),
+        B::Steered { text } => format!("steer: {text}"),
+        B::HumanRequested { prompt } => format!("human_requested: {prompt}"),
+        B::HumanResponded { text, signal } => format!("human_responded [{signal}]: {text}"),
+        B::AcceptanceUnmet { missing, to } => format!(
+            "acceptance unmet (missing {}) → back to {to}",
+            missing.join(", ")
+        ),
         B::AttemptStarted { worker, .. } => {
             format!(
                 "attempt_started{}",
@@ -578,7 +1008,6 @@ fn event_summary(body: &hex_runtime::EventBody) -> String {
             reason,
             disposition,
         } => format!("attempt_failed [{disposition}]: {reason}"),
-        B::BudgetExhausted { detail } => format!("budget_exhausted: {detail}"),
         B::RunFinished { disposition } => format!("run_finished: {disposition}"),
         B::Note { text } => format!("note: {text}"),
     }
@@ -586,7 +1015,9 @@ fn event_summary(body: &hex_runtime::EventBody) -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::test_support::unique;
 
     fn parse(xs: &[&str]) -> Result<Cli, clap::Error> {
         let mut v = vec!["hex"];
@@ -656,7 +1087,8 @@ mod tests {
 
     #[test]
     fn file_flag_reads_the_prompt_from_disk() {
-        let dir = std::env::temp_dir().join(format!("hex-cli-p-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hex-cli-p-{}-{}", std::process::id(), unique()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("prompt.md");
         std::fs::write(&path, "prompt from file").unwrap();

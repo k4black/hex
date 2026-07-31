@@ -39,7 +39,11 @@ const MAX_RESULT_BYTES: usize = 16 * 1024;
 const MAX_STREAM_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How a worker's final message is extracted from a completed attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Deserializable so project config names these modes directly, rather than a
+/// parallel config-side enum plus a `From` bridge that had to be kept in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResultCapture {
     /// The worker wrote its final message to the `{result}` file /
     /// `HEX_RESULT_FILE` (e.g. codex `--output-last-message`); read that file.
@@ -67,12 +71,24 @@ fn fresh() -> CapabilityManifest {
 pub struct CodexWorker {
     /// `--model` override, if any.
     pub model: Option<String>,
+    /// Reasoning effort, passed as a `-c model_reasoning_effort=…` override.
+    pub effort: Option<String>,
 }
 
 impl CodexWorker {
     #[must_use]
     pub fn new(model: Option<String>) -> Self {
-        Self { model }
+        Self {
+            model,
+            effort: None,
+        }
+    }
+
+    /// Set the reasoning effort (builder style).
+    #[must_use]
+    pub fn with_effort(mut self, effort: Option<String>) -> Self {
+        self.effort = effort;
+        self
     }
 
     /// Build the argv template. `read_only` is advisory only: a true read-only
@@ -95,20 +111,24 @@ impl CodexWorker {
         // Under worktree isolation the control files live outside the workspace,
         // so the sandbox must be told that directory is writable, or `hex emit`/
         // result capture would be blocked.
-        if let Some(dir) = extra_writable {
-            argv.push("--add-dir".to_owned());
-            argv.push(dir.to_string_lossy().into_owned());
-        }
-        if let Some(model) = &self.model {
-            argv.push("--model".to_owned());
-            argv.push(model.clone());
-        }
+        let extra_dir = extra_writable.map(|d| d.to_string_lossy().into_owned());
+        push_flag(&mut argv, "--add-dir", extra_dir.as_deref());
+        push_flag(&mut argv, "--model", self.model.as_deref());
+        // codex takes reasoning effort as a config override, not a flag.
+        let effort = self
+            .effort
+            .as_ref()
+            .map(|e| format!("model_reasoning_effort=\"{e}\""));
+        push_flag(&mut argv, "-c", effort.as_deref());
         argv.push("{prompt}".to_owned());
         argv
     }
 }
 
 impl Worker for CodexWorker {
+    fn program(&self) -> Option<&str> {
+        Some("codex")
+    }
     fn capabilities(&self) -> CapabilityManifest {
         fresh()
     }
@@ -127,20 +147,32 @@ impl Worker for CodexWorker {
 pub struct ClaudeWorker {
     /// `--model` override, if any.
     pub model: Option<String>,
+    /// Reasoning effort, mapped to claude's own effort scale.
+    pub effort: Option<String>,
 }
 
 impl ClaudeWorker {
     #[must_use]
     pub fn new(model: Option<String>) -> Self {
-        Self { model }
+        Self {
+            model,
+            effort: None,
+        }
     }
 
-    // `_read_only` is advisory (see `CodexWorker::command`): the allow/deny
-    // classifier below still leaves write-capable `Bash` (needed for `hex
-    // emit`), so read-only can't be enforced here without breaking the control
-    // channel. The reviewer's prompt keeps it read-only.
+    /// Set the reasoning effort (builder style).
     #[must_use]
-    pub fn command(&self, _read_only: bool) -> Vec<String> {
+    pub fn with_effort(mut self, effort: Option<String>) -> Self {
+        self.effort = effort;
+        self
+    }
+
+    // Read-only is advisory here: the allow/deny classifier below still leaves
+    // write-capable `Bash` (needed for `hex emit`), so it can't be enforced
+    // without breaking the control channel. The role's prompt keeps it
+    // read-only. (Enforced read-only awaits a non-workspace control transport.)
+    #[must_use]
+    pub fn command(&self) -> Vec<String> {
         // Codex confines effects with an OS sandbox (`workspace-write`); Claude
         // has no equivalent flag here, so we approximate an *auto classifier*
         // instead of bypassing every check:
@@ -167,10 +199,8 @@ impl ClaudeWorker {
             "--disallowedTools",
             CLAUDE_DENIED_TOOLS,
         ]);
-        if let Some(model) = &self.model {
-            argv.push("--model".to_owned());
-            argv.push(model.clone());
-        }
+        push_flag(&mut argv, "--model", self.model.as_deref());
+        push_flag(&mut argv, "--effort", self.effort.as_deref());
         argv
     }
 }
@@ -192,13 +222,16 @@ const CLAUDE_DENIED_TOOLS: &str = concat!(
 );
 
 impl Worker for ClaudeWorker {
+    fn program(&self) -> Option<&str> {
+        Some("claude")
+    }
     fn capabilities(&self) -> CapabilityManifest {
         fresh()
     }
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         run_agent(
             "claude",
-            &self.command(request.read_only),
+            &self.command(),
             Some(ResultCapture::JsonResult),
             request,
         )
@@ -219,29 +252,29 @@ impl OpencodeWorker {
     }
 
     #[must_use]
-    pub fn command(&self, _read_only: bool) -> Vec<String> {
+    pub fn command(&self) -> Vec<String> {
         // `--auto` so it never blocks on a permission prompt. Unlike Claude, this
         // is a blanket approve with no deny-list: opencode's classifier lives in
         // an `opencode.json` `permission` block (allow/ask/deny), which hex would
         // have to generate per-run — deferred (see TODO). `read_only` is advisory
         // only (not enforced here — see `CodexWorker::command`).
         let mut argv = strs(&["opencode", "run", "{prompt}", "--auto", "--format", "json"]);
-        if let Some(model) = &self.model {
-            argv.push("--model".to_owned());
-            argv.push(model.clone());
-        }
+        push_flag(&mut argv, "--model", self.model.as_deref());
         argv
     }
 }
 
 impl Worker for OpencodeWorker {
+    fn program(&self) -> Option<&str> {
+        Some("opencode")
+    }
     fn capabilities(&self) -> CapabilityManifest {
         fresh()
     }
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         run_agent(
             "opencode",
-            &self.command(request.read_only),
+            &self.command(),
             Some(ResultCapture::JsonlLastText),
             request,
         )
@@ -282,6 +315,9 @@ impl CommandWorker {
 }
 
 impl Worker for CommandWorker {
+    fn program(&self) -> Option<&str> {
+        self.command.first().map(String::as_str)
+    }
     fn capabilities(&self) -> CapabilityManifest {
         self.capabilities.clone()
     }
@@ -292,6 +328,16 @@ impl Worker for CommandWorker {
 
 fn strs(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// Append `flag <value>` when `value` is set, and nothing when it is not — the
+/// shape every optional argv pair here takes (`--model`, `--effort`, `--add-dir`,
+/// codex's `-c <override>`).
+fn push_flag(argv: &mut Vec<String>, flag: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        argv.push(flag.to_owned());
+        argv.push(value.to_owned());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -662,11 +708,27 @@ fn read_signal(
 
 #[cfg(test)]
 mod tests {
+
+    /// A per-call unique suffix for temp dirs. PIDs are recycled, so a name keyed
+    /// on the PID alone can collide with a *previous* test run's leftovers and
+    /// read stale files (these tests assert exact log contents).
+    fn unique() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+            .wrapping_add(N.fetch_add(1, Ordering::Relaxed))
+    }
     use super::*;
     use std::path::PathBuf;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hex-agent-test-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hex-agent-test-{tag}-{}-{}",
+            std::process::id(),
+            unique()
+        ));
         fs::create_dir_all(&dir).expect("mkdir");
         dir
     }
@@ -793,9 +855,9 @@ mod tests {
 
     #[test]
     fn claude_and_opencode_argv_shapes() {
-        let c = ClaudeWorker::new(None).command(false).join(" ");
+        let c = ClaudeWorker::new(None).command().join(" ");
         assert!(c.contains("claude -p {prompt} --output-format json"), "{c}");
-        let o = OpencodeWorker::new(None).command(false).join(" ");
+        let o = OpencodeWorker::new(None).command().join(" ");
         assert!(
             o.contains("opencode run {prompt} --auto --format json"),
             "{o}"
@@ -804,7 +866,7 @@ mod tests {
 
     #[test]
     fn claude_uses_an_allow_deny_classifier_not_a_blanket_bypass() {
-        let c = ClaudeWorker::new(None).command(false).join(" ");
+        let c = ClaudeWorker::new(None).command().join(" ");
         // A real classifier — never the blanket bypass the operator rejected.
         assert!(!c.contains("--dangerously-skip-permissions"), "{c}");
         assert!(c.contains("--permission-mode acceptEdits"), "{c}");

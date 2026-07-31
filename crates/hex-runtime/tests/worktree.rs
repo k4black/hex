@@ -43,6 +43,16 @@ fn temp_repo(tag: &str) -> PathBuf {
     root
 }
 
+/// Serializes every test that asserts *which* pool slot is leased: `lease` takes
+/// the first slot it can lock, so "slot 0 is reused" only holds when no sibling
+/// test is leasing concurrently. Not root-caused, and not a product bug — see
+/// AGENTS.md gotcha 24.
+fn pool_shape_gate() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GATE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn sh(script: &str) -> Vec<String> {
     vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()]
 }
@@ -67,6 +77,7 @@ fn ensure_gitignored_is_idempotent() {
 
 #[test]
 fn lease_creates_then_reuses_the_same_slot_when_clean() {
+    let _gate = pool_shape_gate();
     let root = temp_repo("reuse");
     let (base_ref, sha) = worktree::resolve_base(&root, None).unwrap();
 
@@ -92,6 +103,7 @@ fn lease_creates_then_reuses_the_same_slot_when_clean() {
 
 #[test]
 fn parallel_lease_grows_the_pool() {
+    let _gate = pool_shape_gate();
     let root = temp_repo("parallel");
     let (base_ref, sha) = worktree::resolve_base(&root, None).unwrap();
     // Hold the first lease while leasing again → a second slot must be created.
@@ -103,6 +115,7 @@ fn parallel_lease_grows_the_pool() {
 
 #[test]
 fn dirty_slot_is_reclaimed_and_deps_survive() {
+    let _gate = pool_shape_gate();
     let root = temp_repo("reclaim");
     let (base_ref, sha) = worktree::resolve_base(&root, None).unwrap();
 
@@ -135,6 +148,7 @@ fn dirty_slot_is_reclaimed_and_deps_survive() {
 
 #[test]
 fn reattach_recreates_a_missing_checkout_from_the_branch() {
+    let _gate = pool_shape_gate();
     let root = temp_repo("reattach");
     let (base_ref, sha) = worktree::resolve_base(&root, None).unwrap();
     let leased = worktree::lease(&root, "hex/r1", &base_ref, &sha).unwrap();
@@ -156,6 +170,7 @@ fn reattach_recreates_a_missing_checkout_from_the_branch() {
 
 #[test]
 fn run_warmup_runs_argv_and_propagates_failure() {
+    let _gate = pool_shape_gate();
     let root = temp_repo("warmup");
     let (base_ref, sha) = worktree::resolve_base(&root, None).unwrap();
     let slot = worktree::lease(&root, "hex/r1", &base_ref, &sha).unwrap();
@@ -170,6 +185,7 @@ fn run_warmup_runs_argv_and_propagates_failure() {
 
 #[test]
 fn end_to_end_run_executes_in_the_leased_worktree() {
+    let _gate = pool_shape_gate();
     const GRAPH: &str = r#"
 version: 1
 name: wt
@@ -214,7 +230,7 @@ accept: { require: [] }
         .expect("run");
     assert!(matches!(
         report.disposition,
-        hex_runtime::Disposition::Succeeded
+        Some(hex_runtime::Disposition::Succeeded)
     ));
 
     // The slot was created and the agent ran inside it.

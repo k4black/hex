@@ -8,11 +8,13 @@ example: "make the failing parser tests pass"
 # finishes without emitting — a clean exit routes the synthesized `done`.
 # Run it with:  hex run implement-until-green -p "…"
 #
-# The gate runs `cargo test`; copy this to .hex/graphs/ and change the gate
-# command for your stack (npm test, pytest, make test, …).
+# REQUIRES a `test` check: the gate *is* this preset, so hex refuses to start
+# until your project declares one. Add to .hex/config.yaml:
+#   checks:
+#     test: [pytest, -q]        # or [npm, test] / [cargo, test] / [make, test]
 
 defaults:
-  worker: claude
+  role: implementer
   context: fresh
   budget:
     attempts: 10
@@ -29,15 +31,15 @@ nodes:
         Task: {{prompt}}
 
         Implement the smallest change that satisfies the task. Run the test
-        suite yourself (`cargo test`) to find and fix failures — if you were
+        suite yourself to find and fix failures — if you were
         sent back here, a gate found the tests still failing. Just finish when
         you believe the tests pass; no command is needed.
     on:
       done: test
 
   test:
-    gate:
-      run: [cargo, test]
+    command:
+      check: test
     on:
       passed: done
       failed: implement
@@ -47,3 +49,4 @@ nodes:
 
 accept:
   require: [test.passed]
+  on_unmet: implement

@@ -1,10 +1,15 @@
-//! Layered configuration: `~/.config/hex/config.yaml` (user) then
-//! `.hex/config.yaml` (project). Project wins on conflict.
+//! Layered configuration: built-in defaults, then
+//! `~/.config/hex/config.yaml` (user), then `.hex/config.yaml` (project).
+//! Layers **deep-merge per key**, so a project overrides only what it names.
 //!
-//! Config holds the **worker registry** — how to invoke each external agent —
-//! plus fallback defaults used only when a graph omits its own. Built-in
-//! registry entries for `codex` and `claude` mean the flagship critique loop
-//! runs out of the box; config entries override them.
+//! Config holds three things: the **worker registry** (how to invoke each agent
+//! CLI — internal plumbing), the **roles** a graph actually names
+//! (implementer/reviewer/planner/researcher, each binding a worker to a model,
+//! effort, read-only policy and prompt preamble), and the project's **checks**.
+//!
+//! The built-in layer is [`DEFAULTS`] — a real YAML file embedded in the binary
+//! and parsed through this same loader, not a hardcoded Rust value. One format,
+//! one code path, nothing to drift.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,12 +18,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
+/// The built-in configuration layer, embedded and parsed like any other.
+pub const DEFAULTS: &str = include_str!("defaults.yaml");
+
 /// Merged configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Worker registry: name → how to invoke it.
+    /// Worker registry: name → how to invoke that agent CLI. Internal plumbing;
+    /// graphs name a [`RoleSpec`], not a worker.
     pub workers: BTreeMap<String, WorkerSpec>,
+    /// Roles a graph can name (`worker: reviewer`): a worker plus the model,
+    /// effort, read-only policy and prompt preamble that define the job.
+    pub roles: BTreeMap<String, RoleSpec>,
+    /// Project checks: name → argv, referenced by a graph as
+    /// `command: { check: <name> }`.
+    ///
+    /// **Empty by default, deliberately** — what "green" means is a per-project
+    /// decision, so no built-in preset gates on a check. A graph that *does* name
+    /// a check must have it declared here, or the run is refused before it
+    /// starts: a check that silently passed would let a run report `succeeded`
+    /// having verified nothing.
+    pub checks: BTreeMap<String, Vec<String>>,
     /// Fallback defaults when a graph omits its own.
     pub defaults: DefaultsSpec,
 }
@@ -41,7 +62,7 @@ pub struct WorkerSpec {
     pub command: Vec<String>,
     /// Result capture for `kind: command` (typed kinds set their own).
     #[serde(default)]
-    pub result: Option<ResultKind>,
+    pub result: Option<hex_worker::ResultCapture>,
 }
 
 /// Which adapter a worker uses.
@@ -59,24 +80,73 @@ pub enum WorkerKind {
     Opencode,
 }
 
-/// Result-capture strategy in config form (maps to `hex_worker::ResultCapture`).
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResultKind {
-    /// The worker wrote its final message to the `{result}` file.
-    File,
-    /// stdout is a single JSON object; take `.result` (honoring `.is_error`).
-    JsonResult,
-    /// stdout is JSONL; take the last `type == "text"` line's `part.text`.
-    JsonlLastText,
+/// One role: the job a graph names, bound to a worker.
+///
+/// Every field is optional so a higher layer can override one of them and
+/// inherit the rest — see [`RoleSpec::merge`].
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoleSpec {
+    /// Which worker (CLI adapter) runs this role.
+    pub worker: Option<String>,
+    /// Model override passed to the worker.
+    pub model: Option<String>,
+    /// Reasoning effort, where the agent supports one (e.g. `high`).
+    pub effort: Option<String>,
+    /// Whether this role must not modify the workspace (a reviewer/planner).
+    pub read_only: Option<bool>,
+    /// Prompt preamble prepended to the node's own prompt. Setting this
+    /// **replaces** any inherited preamble.
+    pub prompt: Option<String>,
+    /// Text appended to the inherited preamble instead of replacing it — the
+    /// common case for a project tightening a shipped role ("only flag security
+    /// issues", "fix at most 50% of the bugs").
+    pub prompt_append: Option<String>,
 }
 
-impl From<ResultKind> for hex_worker::ResultCapture {
-    fn from(kind: ResultKind) -> Self {
-        match kind {
-            ResultKind::File => Self::File,
-            ResultKind::JsonResult => Self::JsonResult,
-            ResultKind::JsonlLastText => Self::JsonlLastText,
+impl RoleSpec {
+    /// Merge `other` (a higher layer) over `self`, per key.
+    ///
+    /// `prompt` replaces; `prompt_append` accumulates onto whatever prompt
+    /// survives, so a project can extend a built-in role's preamble without
+    /// restating it.
+    fn merge(&mut self, other: Self) {
+        if other.worker.is_some() {
+            self.worker = other.worker;
+        }
+        if other.model.is_some() {
+            self.model = other.model;
+        }
+        if other.effort.is_some() {
+            self.effort = other.effort;
+        }
+        if other.read_only.is_some() {
+            self.read_only = other.read_only;
+        }
+        if other.prompt.is_some() {
+            // An explicit prompt replaces the inherited one, and also discards
+            // any appendix inherited with it — otherwise a redefinition would
+            // silently keep text the author meant to drop.
+            self.prompt = other.prompt;
+            self.prompt_append = None;
+        }
+        if let Some(extra) = other.prompt_append {
+            let appended = match self.prompt_append.take() {
+                Some(existing) => format!("{}\n\n{extra}", existing.trim_end()),
+                None => extra,
+            };
+            self.prompt_append = Some(appended);
+        }
+    }
+
+    /// The effective preamble: the prompt plus any appended text.
+    #[must_use]
+    pub fn preamble(&self) -> Option<String> {
+        match (self.prompt.as_deref(), self.prompt_append.as_deref()) {
+            (None, None) => None,
+            (Some(p), None) => Some(p.trim_end().to_owned()),
+            (None, Some(a)) => Some(a.trim_end().to_owned()),
+            (Some(p), Some(a)) => Some(format!("{}\n\n{}", p.trim_end(), a.trim_end())),
         }
     }
 }
@@ -85,8 +155,8 @@ impl From<ResultKind> for hex_worker::ResultCapture {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DefaultsSpec {
-    /// Default worker name for agent nodes.
-    pub worker: Option<String>,
+    /// Default role for agent nodes that name none.
+    pub role: Option<String>,
     /// Default context policy (`fresh`/`continue`).
     pub context: Option<String>,
 }
@@ -111,26 +181,14 @@ impl Config {
         Ok(config)
     }
 
-    /// Built-in registry so a fresh checkout can run `critique-loop`.
+    /// The built-in layer, parsed from the embedded [`DEFAULTS`] YAML.
+    ///
+    /// # Panics
+    /// Panics only if the embedded defaults are malformed, which a unit test
+    /// pins — it is a build-time bug, never a user-facing failure.
     #[must_use]
     pub fn builtin() -> Self {
-        let typed = |kind| WorkerSpec {
-            kind,
-            model: None,
-            command: Vec::new(),
-            result: None,
-        };
-        let mut workers = BTreeMap::new();
-        workers.insert("codex".to_owned(), typed(WorkerKind::Codex));
-        workers.insert("claude".to_owned(), typed(WorkerKind::Claude));
-        workers.insert("opencode".to_owned(), typed(WorkerKind::Opencode));
-        Self {
-            workers,
-            defaults: DefaultsSpec {
-                worker: Some("codex".to_owned()),
-                context: Some("fresh".to_owned()),
-            },
-        }
+        yaml_serde::from_str(DEFAULTS).expect("embedded defaults.yaml is valid")
     }
 
     fn read(path: &Path) -> Result<Self> {
@@ -139,12 +197,24 @@ impl Config {
     }
 
     /// Merge `other` over `self` (other wins), for the user→project layering.
-    fn merge(&mut self, other: Self) {
+    ///
+    /// Public so callers can compose layers explicitly (and so tests can assert
+    /// the merge rules that decide which role a graph actually gets).
+    pub fn merge(&mut self, other: Self) {
         for (name, spec) in other.workers {
             self.workers.insert(name, spec);
         }
-        if other.defaults.worker.is_some() {
-            self.defaults.worker = other.defaults.worker;
+        // Per-check granularity: a project overriding `test` keeps a user-level
+        // `lint` rather than replacing the whole map.
+        for (name, argv) in other.checks {
+            self.checks.insert(name, argv);
+        }
+        // Roles merge per field, so overriding one model inherits the rest.
+        for (name, spec) in other.roles {
+            self.roles.entry(name).or_default().merge(spec);
+        }
+        if other.defaults.role.is_some() {
+            self.defaults.role = other.defaults.role;
         }
         if other.defaults.context.is_some() {
             self.defaults.context = other.defaults.context;

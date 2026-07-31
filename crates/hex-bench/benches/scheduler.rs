@@ -6,12 +6,12 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use hex_kernel::graph::{Budget, Graph};
 use hex_kernel::{RunState, Status, schedule};
 use hex_proto::Disposition;
-use hex_runtime::config::DefaultsSpec;
+use hex_runtime::config::Config;
 
 fn loop_graph() -> Graph {
     Graph::builder("bench", "implement")
         .agent("implement", "codex", "do it", &["ready"])
-        .gate("test", &["true"])
+        .command("test", &["true"])
         .terminal("done", Disposition::Succeeded)
         .edge("implement", "ready", "test")
         .edge("test", "passed", "done")
@@ -38,11 +38,9 @@ fn bench_schedule(c: &mut Criterion) {
 
 fn bench_load(c: &mut Criterion) {
     let source = include_str!("../../hex-runtime/src/presets/critique-loop.yaml");
-    let defaults = DefaultsSpec::default();
+    let config = Config::default();
     c.bench_function("runtime_load_critique_loop", |b| {
-        b.iter(|| {
-            hex_runtime::loader::load(black_box(source), black_box(&defaults)).expect("loads")
-        });
+        b.iter(|| hex_runtime::loader::load(black_box(source), black_box(&config)).expect("loads"));
     });
 }
 

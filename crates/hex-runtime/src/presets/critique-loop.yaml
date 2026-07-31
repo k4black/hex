@@ -1,16 +1,26 @@
 version: 1
 name: critique-loop
-description: "Cross-model loop — claude implements, codex reviews, gated by tests, until approved & green"
+description: "Cross-model loop — one agent implements, a different model reviews, until approved"
 example: "add retry with exponential backoff to the HTTP client"
 
-# The flagship built-in: claude implements, codex critiques (a different model
-# reviews than wrote the code), a gate proves it, and the loop repeats until the
-# change is approved AND the tests pass.
-# Run it with:  hex run critique-loop -p "…"   (or -f prompt.md)
-# `{{prompt}}` below is filled with the operator's prompt.
+# The flagship built-in: the implementer writes, the reviewer critiques, and the
+# loop repeats until the change is approved. Cross-model by default — the
+# `reviewer` role runs a different agent from `implementer`, so the model judging
+# the change is not the one that wrote it (see `roles:` in your config).
+#
+# Deliberately gate-free, so it runs in any repo with no setup. To add real test
+# backpressure, declare a check and copy this graph:
+#
+#   hex graph critique-loop --source > .hex/graphs/critique-loop.yaml
+#   # .hex/config.yaml:  checks: { test: [pytest, -q] }
+#   # then add:
+#   #   test:
+#   #     command: { check: test }
+#   #     on: { passed: done, failed: implement }
+#   # and require it:  accept: { require: [review.approved, test.passed] }
 
 defaults:
-  worker: claude
+  role: implementer
   context: fresh
   budget:
     attempts: 12
@@ -21,10 +31,7 @@ entry: implement
 nodes:
   implement:
     agent:
-      worker: claude
       prompt: |
-        You are making a focused change in this repository.
-
         Task: {{prompt}}
 
         If a reviewer sent it back, address this feedback (empty on the first
@@ -39,30 +46,29 @@ nodes:
 
   review:
     agent:
-      worker: codex
+      role: reviewer
       prompt: |
-        Review the current working-tree changes against this prompt: {{prompt}}
+        Review the current working-tree changes against this task: {{prompt}}
 
-        Judge correctness, scope, and quality — review only, do not edit files.
-        If the change is acceptable, run:
+        Run `git diff` (and `git status`) to see them. If the change is
+        acceptable, run:
           hex emit approved
         Otherwise put concrete, actionable feedback in your final message (it is
         handed back to the implementer) and run:
           hex emit changes_requested
       may_propose: [approved, changes_requested]
+    # At most 4 review rounds, however many attempts the run budget allows.
+    budget:
+      visits: 4
     on:
-      approved: test
+      approved: done
       changes_requested: implement
-
-  test:
-    gate:
-      run: [cargo, test]
-    on:
-      passed: done
-      failed: implement
 
   done:
     terminal: succeeded
 
 accept:
-  require: [test.passed]
+  require: [review.approved]
+  # If `done` is somehow reached without an approval on record, go back and earn
+  # one rather than failing the run outright.
+  on_unmet: implement

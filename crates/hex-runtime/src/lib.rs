@@ -10,14 +10,20 @@
 //! client (per-run background controller) arrives later behind the same trait.
 
 pub mod config;
+pub mod control;
+pub mod doctor;
 pub mod driver;
 pub mod error;
 pub mod journal;
 pub mod loader;
 pub mod preset;
+#[cfg(test)]
+mod test_support;
 pub mod workers;
 pub mod worktree;
 
+pub use control::{Inbox, Liveness};
+pub use doctor::Report as DoctorReport;
 pub use driver::{AttemptView, ProgressSink};
 pub use error::{HexError, Result};
 pub use hex_kernel::graph::NodeKind;
@@ -34,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 use config::Config;
 use driver::{Session, check_workers, graph_hash};
-use hex_kernel::{RunState as State, reduce};
+use hex_kernel::RunState as State;
 use journal::Journal;
 
 // Keys under which a run's worktree lease is recorded in `RunCreated.inputs`
@@ -51,8 +57,43 @@ pub struct RunReport {
     pub run_id: String,
     /// Where the graph came from (path or `built-in:<name>`).
     pub origin: String,
-    /// The terminal disposition reached.
-    pub disposition: Disposition,
+    /// The terminal disposition reached, or `None` when an operator paused the
+    /// run: a pause is not an outcome, and the run continues with `hex resume`.
+    pub disposition: Option<Disposition>,
+}
+
+/// One row of `hex runs`: enough to pick a run out of a list without opening it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSummary {
+    /// The run's id.
+    pub run_id: String,
+    /// Lifecycle status, or `None` if the run could not be replayed.
+    pub status: Option<Status>,
+    /// The active node, if any.
+    pub current: Option<String>,
+    /// Attempts started so far.
+    pub attempts: u32,
+    /// Terminal disposition, if finished.
+    pub disposition: Option<Disposition>,
+    /// What can be concluded about the driving process (lock + heartbeat).
+    pub liveness: Liveness,
+    /// When the run was created (Unix epoch ms).
+    pub created_at_ms: u64,
+    /// When the journal last grew (Unix epoch ms) — the run's true "age".
+    pub updated_at_ms: u64,
+    /// Why the run could not be replayed, when `status` is `None`. A listing must
+    /// still show a broken run: hiding it is how a run gets lost.
+    pub error: Option<String>,
+}
+
+/// Whether a cancellation was applied directly or handed to a live driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cancellation {
+    /// No process was driving the run, so the terminal event was appended here.
+    Recorded,
+    /// A live driver holds the run lock; the command is queued in its control
+    /// inbox and takes effect at the next attempt boundary.
+    Requested,
 }
 
 /// A projected snapshot of a run's status.
@@ -206,14 +247,25 @@ impl Runtime {
     /// runtime's live config defaults. The operator prompt is not needed here —
     /// `{{prompt}}` is substituted at attempt-start, not at compile.
     fn compile(&self, source: &str) -> Result<Graph> {
-        self.compile_with(source, &self.config.defaults)
+        self.compile_with(
+            source,
+            &self.config.defaults,
+            &self.config.roles,
+            &self.config.checks,
+        )
     }
 
     /// Compile with an explicit set of fallback defaults — used on resume so a
     /// run recompiles against the defaults it was *created* with, not whatever
     /// the mutable config happens to say now.
-    fn compile_with(&self, source: &str, defaults: &config::DefaultsSpec) -> Result<Graph> {
-        let graph = loader::load(source, defaults)?;
+    fn compile_with(
+        &self,
+        source: &str,
+        defaults: &config::DefaultsSpec,
+        roles: &BTreeMap<String, config::RoleSpec>,
+        checks: &BTreeMap<String, Vec<String>>,
+    ) -> Result<Graph> {
+        let graph = loader::load_with(source, defaults, roles, checks)?;
         hex_kernel::validate(&graph).map_err(|issues| {
             let joined = issues
                 .iter()
@@ -257,7 +309,7 @@ impl Runtime {
         }
         // The run's creation record carries the hash, prompt, and defaults to
         // verify + recompile against (one pass, not three).
-        let (recorded_hash, inputs, defaults) = run_created(events)
+        let (recorded_hash, inputs, defaults, checks) = run_created(events)
             .ok_or_else(|| HexError::new("journal has no run_created record to verify against"))?;
         if recorded_hash != computed {
             return Err(HexError::new(
@@ -269,26 +321,25 @@ impl Runtime {
         // with the verified hash), not live config. The prompt is verified
         // present and re-substituted at attempt-start.
         let prompt = inputs.get("prompt").map(String::as_str);
-        let graph = self.compile_with(&source, &defaults)?;
+        // Roles come from live config on resume: their preambles are already baked
+        // into the recorded prompts via `checks`-style resolution at creation, and
+        // re-resolving them cannot change the graph's shape.
+        let graph = self.compile_with(&source, &defaults, &self.config.roles, &checks)?;
         if prompt.is_none() && loader::uses_prompt(&graph) {
             return Err(HexError::new(
                 "run_created is missing the prompt required by graph.yaml",
             ));
         }
 
-        // Fail closed on a malformed lifecycle before folding it into state.
-        hex_kernel::check_journal(&graph, events)
+        // Fail closed on a malformed lifecycle, and take the projection the audit
+        // folded on its way through rather than folding the same events again.
+        let state = hex_kernel::check_journal(&graph, events)
             .map_err(|i| HexError::new(format!("journal is invalid: {i}")))?;
-
-        let mut state = State::default();
-        for event in events {
-            state = reduce(&graph, state, event);
-        }
         Ok((graph, state))
     }
 
     /// Start a new run of `reference` with an optional operator prompt. Blocks
-    /// until the run reaches a terminal disposition (foreground MVP).
+    /// until the run reaches a terminal disposition (or an operator pauses it).
     ///
     /// # Errors
     /// Fails on resolution/validation, missing workers, or IO errors.
@@ -299,10 +350,67 @@ impl Runtime {
         name: Option<&str>,
         isolation: &Isolation,
     ) -> Result<RunReport> {
-        // Resolve the source exactly once, then compile that same text — no
-        // second resolution that could observe a changed file (TOCTOU).
+        self.start_run(reference, prompt, name, isolation, None)
+    }
+
+    /// Reserve a run id and directory without driving anything.
+    ///
+    /// `hex run --detach` needs the id *before* the driving process exists: it is
+    /// what the launcher prints, and it names the directory the child's stdio is
+    /// redirected into. Resolving and compiling here also means a bad graph, a
+    /// missing prompt, or an uninstalled agent CLI fails in the foreground rather
+    /// than in a detached child nobody is watching.
+    ///
+    /// # Errors
+    /// Fails on the same conditions as [`Runtime::start`], before any run exists.
+    pub fn reserve(
+        &self,
+        reference: &str,
+        prompt: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<(String, PathBuf)> {
         let resolved = preset::resolve(reference, &self.root)?;
-        let graph = self.compile(&resolved.source)?;
+        let graph = self.prepare(&resolved.source, prompt)?;
+        self.new_run(&graph.name, name)
+    }
+
+    /// Drive a run whose id and directory were already reserved by a launcher.
+    ///
+    /// # Errors
+    /// Fails if the reservation is unusable, or on the same conditions as
+    /// [`Runtime::start`].
+    pub fn start_reserved(
+        &self,
+        run_id: &str,
+        reference: &str,
+        prompt: Option<&str>,
+        isolation: &Isolation,
+    ) -> Result<RunReport> {
+        let run_dir = self.run_dir(run_id)?;
+        if !run_dir.is_dir() {
+            return Err(HexError::new(format!(
+                "run `{run_id}` was not reserved (no run directory)"
+            )));
+        }
+        if run_dir.join("events.jsonl").exists() {
+            return Err(HexError::new(format!(
+                "run `{run_id}` already has a journal — use `resume`, never a second start"
+            )));
+        }
+        self.start_run(
+            reference,
+            prompt,
+            None,
+            isolation,
+            Some((run_id.to_owned(), run_dir)),
+        )
+    }
+
+    /// Compile `source` and refuse everything that must not reach a run: an
+    /// invalid graph, a missing operator prompt, an unknown worker, an agent CLI
+    /// that is not installed.
+    fn prepare(&self, source: &str, prompt: Option<&str>) -> Result<Graph> {
+        let graph = self.compile(source)?;
         // A graph that references {{prompt}} in a node prompt needs one at run
         // time (validate and graph stay lenient).
         if prompt.is_none() && loader::uses_prompt(&graph) {
@@ -311,8 +419,27 @@ impl Runtime {
             ));
         }
         check_workers(&graph, &self.workers)?;
+        doctor::preflight(&graph, &self.workers)?;
+        Ok(graph)
+    }
 
-        let (run_id, run_dir) = self.new_run(&graph.name, name)?;
+    fn start_run(
+        &self,
+        reference: &str,
+        prompt: Option<&str>,
+        name: Option<&str>,
+        isolation: &Isolation,
+        reserved: Option<(String, PathBuf)>,
+    ) -> Result<RunReport> {
+        // Resolve the source exactly once, then compile that same text — no
+        // second resolution that could observe a changed file (TOCTOU).
+        let resolved = preset::resolve(reference, &self.root)?;
+        let graph = self.prepare(&resolved.source, prompt)?;
+
+        let (run_id, run_dir) = match reserved {
+            Some(pair) => pair,
+            None => self.new_run(&graph.name, name)?,
+        };
         std::fs::create_dir_all(run_dir.join("attempts"))?;
         let _lock = RunLock::acquire(&run_dir)?;
 
@@ -369,6 +496,7 @@ impl Runtime {
                 graph_hash: hash,
                 inputs,
                 defaults: defaults_to_map(&self.config.defaults),
+                checks: resolved_checks(&graph),
             },
         )?;
         // A reclaimed slot discarded a prior run's uncommitted work — record
@@ -443,7 +571,7 @@ impl Runtime {
         // Read the creation record once: the operator prompt plus any recorded
         // worktree lease to reattach.
         let created = run_created(&events);
-        let inputs = created.as_ref().map(|(_, inputs, _)| inputs);
+        let inputs = created.as_ref().map(|(_, inputs, _, _)| inputs);
         let prompt = inputs.and_then(|i| i.get("prompt").cloned());
         let mut workdir = self.root.clone();
         let mut worktree_ctx = None;
@@ -473,6 +601,7 @@ impl Runtime {
         }
         let (graph, state) = self.verify_and_fold(run_id, &events)?;
         check_workers(&graph, &self.workers)?;
+        doctor::preflight(&graph, &self.workers)?;
 
         let mut session = Session::new(
             &graph,
@@ -492,13 +621,19 @@ impl Runtime {
             return Ok(RunReport {
                 run_id: run_id.to_owned(),
                 origin: format!("resume:{run_id}"),
-                disposition,
+                disposition: Some(disposition),
             });
         }
 
         // Crashed after RunCreated but before RunStarted: activate the entry.
         if matches!(session.state().status, Status::Created) {
             session.record(None, None, Actor::runtime(), EventBody::RunStarted)?;
+        }
+
+        // Paused by an operator: lift the pause before scheduling, so the journal
+        // shows the suspension being ended rather than silently ignored.
+        if matches!(session.state().status, Status::Paused) {
+            session.record(None, None, Actor::runtime(), EventBody::RunResumed)?;
         }
 
         // Orphaned attempt (started, no terminal): mark it interrupted — with
@@ -527,8 +662,19 @@ impl Runtime {
     /// # Errors
     /// Fails if the run does not exist or cannot be replayed.
     pub fn status(&self, run_id: &str) -> Result<StatusReport> {
-        let events = journal::read_all(&self.run_dir(run_id)?.join("events.jsonl"))
-            .map_err(|_| HexError::new(format!("run `{run_id}` not found")))?;
+        let run_dir = self.run_dir(run_id)?;
+        // The same distinction `hex runs` makes, and for the same reason: a
+        // detached run is reserved a moment before its driver writes anything, and
+        // reporting "not found" in that window sends an operator looking for a run
+        // that exists. Only a missing *directory* means missing.
+        if !run_dir.is_dir() {
+            return Err(HexError::new(format!("run `{run_id}` not found")));
+        }
+        let events = journal::read_all(&run_dir.join("events.jsonl")).map_err(|_| {
+            HexError::new(format!(
+                "run `{run_id}` has no journal yet (reserved, or never started)"
+            ))
+        })?;
         let (_, state) = self.verify_and_fold(run_id, &events)?;
         Ok(StatusReport {
             run_id: run_id.to_owned(),
@@ -592,67 +738,242 @@ impl Runtime {
         Ok(logs)
     }
 
-    /// Cancel a run: if it has not finished, record a terminal `Cancelled`.
-    /// Refuses if the run is actively locked by a driving process — writing a
-    /// second terminal from here would violate the single-writer invariant.
+    /// Probe every configured worker and check for usability — the preflight
+    /// behind `hex doctor`.
+    #[must_use]
+    pub fn doctor(&self) -> DoctorReport {
+        doctor::report(&self.workers, &self.config.checks)
+    }
+
+    /// Cancel a run, whether or not something is driving it.
+    ///
+    /// Two paths, one invariant (a single writer per journal): if nobody holds the
+    /// run lock, the terminal event is appended here; if a live driver holds it,
+    /// the cancel is queued in that run's control inbox and the driver records the
+    /// terminal itself at the next attempt boundary.
     ///
     /// # Errors
-    /// Fails if the run does not exist, is active, or cannot be appended to.
-    pub fn cancel(&self, run_id: &str) -> Result<()> {
+    /// Fails if the run does not exist or cannot be appended to.
+    pub fn cancel(&self, run_id: &str, actor: &Actor) -> Result<Cancellation> {
         let run_dir = self.run_dir(run_id)?;
-        // Take the same exclusive lock a driver holds: acquiring it proves no
-        // live process is writing, and holding it makes the append atomic w.r.t.
-        // a concurrent resume. `acquire` fails cleanly if the run is active.
-        let _lock = RunLock::acquire(&run_dir).map_err(|_| {
-            HexError::new(
-                "run is active (locked by a live process); external cancellation of a live \
-                 foreground run is not supported in the slim MVP",
-            )
-        })?;
+        // Taking the same exclusive lock a driver holds proves no live process is
+        // writing, and holding it makes the append atomic w.r.t. a concurrent
+        // resume. `acquire` fails cleanly if the run is active.
+        let Ok(lock) = RunLock::acquire(&run_dir) else {
+            self.control(run_id, actor, &Command::Cancel)?;
+            return Ok(Cancellation::Requested);
+        };
+        // A reserved run whose driver has not started yet has no journal to
+        // append to, so the cancel waits in its inbox instead — the driver
+        // consumes it at its very first boundary, before any attempt runs.
+        if !run_dir.join("events.jsonl").exists() {
+            drop(lock);
+            self.control(run_id, actor, &Command::Cancel)?;
+            return Ok(Cancellation::Requested);
+        }
+        let _lock = lock;
         // One scan: open the writer (repairs a torn tail, returns events), then
         // verify + fold those same events.
         let (mut journal, events) = Journal::open_append(run_dir.join("events.jsonl"))?;
         let (_, state) = self.verify_and_fold(run_id, &events)?;
         if state.is_finished() {
-            return Ok(());
+            return Ok(Cancellation::Recorded);
         }
         journal.append(
             run_id,
             None,
             None,
-            Actor::runtime(),
+            actor.clone(),
             EventBody::RunFinished {
                 disposition: Disposition::Cancelled,
             },
         )?;
-        Ok(())
+        Ok(Cancellation::Recorded)
+    }
+
+    /// Queue an operator command in a run's control inbox, to be applied by
+    /// whoever is (or will be) driving it. The command file is a transport; what
+    /// happened is whatever the driver journals in response.
+    ///
+    /// # Errors
+    /// Fails if the run does not exist, has already finished, or the inbox cannot
+    /// be written.
+    pub fn control(&self, run_id: &str, actor: &Actor, command: &Command) -> Result<()> {
+        let run_dir = self.run_dir(run_id)?;
+        // The *directory* is the existence test, not the journal: a detached run
+        // is reserved a moment before its driver writes anything, and `hex steer`
+        // one keystroke later must queue rather than claim the run is missing.
+        if !run_dir.is_dir() {
+            return Err(HexError::new(format!("run `{run_id}` not found")));
+        }
+        // Refuse up front rather than leaving a command nobody will ever read.
+        // Cheap honesty: the projection comes from the journal either way.
+        if let Ok(report) = self.status(run_id)
+            && let Some(d) = report.disposition
+        {
+            return Err(HexError::new(format!(
+                "run `{run_id}` already finished ({d}) — start a new run instead"
+            )));
+        }
+        Inbox::new(&run_dir).send(actor, command)
+    }
+
+    /// Every run under the project, newest activity first.
+    ///
+    /// A run that cannot be replayed is still listed (with its error): the point
+    /// of this verb is that a run id is findable, and hiding a broken run is how
+    /// one gets lost.
+    ///
+    /// # Errors
+    /// Fails only if `.hex/runs` exists but cannot be read.
+    pub fn list_runs(&self) -> Result<Vec<RunSummary>> {
+        let runs = self.runs_dir();
+        let entries = match std::fs::read_dir(&runs) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let run_id = entry.file_name().to_string_lossy().into_owned();
+            if validate_run_id(&run_id).is_err() || !entry.path().is_dir() {
+                continue;
+            }
+            out.push(self.summarize(&run_id, &entry.path()));
+        }
+        out.sort_by_key(|r| std::cmp::Reverse(r.updated_at_ms));
+        Ok(out)
+    }
+
+    /// One run's summary, including whether a process is still driving it — what
+    /// `hex wait` polls, and one row of `hex runs`.
+    ///
+    /// # Errors
+    /// Fails if the run id is unsafe or the run does not exist.
+    pub fn summary(&self, run_id: &str) -> Result<RunSummary> {
+        let run_dir = self.run_dir(run_id)?;
+        if !run_dir.is_dir() {
+            return Err(HexError::new(format!("run `{run_id}` not found")));
+        }
+        Ok(self.summarize(run_id, &run_dir))
+    }
+
+    /// One run's listing row.
+    fn summarize(&self, run_id: &str, run_dir: &Path) -> RunSummary {
+        let events = journal::read_all(&run_dir.join("events.jsonl")).unwrap_or_default();
+        let created_at_ms = events.first().map_or(0, |e| e.at_ms);
+        let updated_at_ms = events.last().map_or(0, |e| e.at_ms);
+        let (status, current, attempts, disposition, error) =
+            match self.verify_and_fold(run_id, &events) {
+                Ok((_, state)) => (
+                    Some(state.status.clone()),
+                    state.current.clone(),
+                    state.attempts_total,
+                    state.disposition(),
+                    None,
+                ),
+                // A journal-less run is normal for a moment (a detached run between
+                // reservation and its driver's first write), so say that rather than
+                // reporting the generic replay failure.
+                Err(_) if events.is_empty() => (
+                    None,
+                    None,
+                    0,
+                    None,
+                    Some("no journal yet (reserved, or never started)".to_owned()),
+                ),
+                Err(e) => (None, None, 0, None, Some(e.to_string())),
+            };
+        RunSummary {
+            run_id: run_id.to_owned(),
+            liveness: liveness_of(run_dir, status.as_ref()),
+            status,
+            current,
+            attempts,
+            disposition,
+            created_at_ms,
+            updated_at_ms,
+            error,
+        }
+    }
+}
+
+/// Classify a run's process from its lock and heartbeat.
+///
+/// The lock is the primary signal because the OS releases it when the holder
+/// dies — a pidfile cannot promise that, and PID reuse is real. The heartbeat
+/// only refines "a process is alive" into "and it is still ticking".
+fn liveness_of(run_dir: &Path, status: Option<&Status>) -> Liveness {
+    match status {
+        Some(Status::Finished(_)) => return Liveness::Finished,
+        Some(Status::Paused) => return Liveness::Paused,
+        _ => {}
+    }
+    // Probing takes the lock for an instant; dropping it immediately is the whole
+    // test ("could anyone else have it?").
+    match try_lock_file(&run_dir.join("run.lock")) {
+        Ok(Some(_free)) => Liveness::Abandoned,
+        Ok(None) => match control::last_beat_ms(run_dir) {
+            Some(beat) if journal::now_ms().saturating_sub(beat) <= control::HEARTBEAT_STALE_MS => {
+                Liveness::Live
+            }
+            _ => Liveness::Hung,
+        },
+        // Unreadable lock: report the conservative answer rather than guessing
+        // that nobody is driving (which would invite a second writer).
+        Err(_) => Liveness::Hung,
     }
 }
 
 /// The run's creation record — hash, inputs, and effective defaults — read in a
 /// single pass over the journal.
-fn run_created(
-    events: &[Event],
-) -> Option<(String, BTreeMap<String, String>, config::DefaultsSpec)> {
+type RunCreation = (
+    String,
+    BTreeMap<String, String>,
+    config::DefaultsSpec,
+    BTreeMap<String, Vec<String>>,
+);
+
+fn run_created(events: &[Event]) -> Option<RunCreation> {
     events.iter().find_map(|e| match &e.body {
         EventBody::RunCreated {
             graph_hash,
             inputs,
             defaults,
+            checks,
         } => Some((
             graph_hash.clone(),
             inputs.clone(),
             defaults_from_map(defaults),
+            checks.clone(),
         )),
         _ => None,
     })
 }
 
+/// The project checks a compiled graph actually resolved, recorded at creation so
+/// a resumed run re-executes the same argv even if `.hex/config.yaml` changed.
+/// Every check a graph names is present: an undeclared one is refused at compile
+/// time, so a run cannot exist with an unresolved check to record.
+fn resolved_checks(graph: &Graph) -> BTreeMap<String, Vec<String>> {
+    let mut map = BTreeMap::new();
+    for node in graph.nodes.values() {
+        if let hex_kernel::graph::NodeSpec::Command { steps, .. } = &node.spec {
+            for step in steps {
+                if let Some(name) = &step.check {
+                    map.insert(name.clone(), step.argv.clone());
+                }
+            }
+        }
+    }
+    map
+}
+
 /// Encode compile defaults as a stable string map for the RunCreated event.
 fn defaults_to_map(defaults: &config::DefaultsSpec) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
-    if let Some(worker) = &defaults.worker {
-        map.insert("worker".to_owned(), worker.clone());
+    if let Some(role) = &defaults.role {
+        map.insert("role".to_owned(), role.clone());
     }
     if let Some(context) = &defaults.context {
         map.insert("context".to_owned(), context.clone());
@@ -663,7 +984,9 @@ fn defaults_to_map(defaults: &config::DefaultsSpec) -> BTreeMap<String, String> 
 /// Decode compile defaults from the RunCreated event's map.
 fn defaults_from_map(map: &BTreeMap<String, String>) -> config::DefaultsSpec {
     config::DefaultsSpec {
-        worker: map.get("worker").cloned(),
+        // `worker` is the pre-roles spelling; still read so a run created by an
+        // older hex resumes instead of losing its default.
+        role: map.get("role").or_else(|| map.get("worker")).cloned(),
         context: map.get("context").cloned(),
     }
 }
@@ -813,11 +1136,21 @@ pub trait RuntimeClient {
     /// # Errors
     /// Fails if the run does not exist.
     fn logs(&self, run_id: &str) -> Result<Vec<AttemptLog>>;
-    /// Cancel a run.
+    /// Every run under the project.
+    ///
+    /// # Errors
+    /// Fails if the runs directory cannot be read.
+    fn list_runs(&self) -> Result<Vec<RunSummary>>;
+    /// Queue an operator command for a run (pause/resume/steer/respond).
+    ///
+    /// # Errors
+    /// Fails if the run does not exist, has finished, or the inbox is unwritable.
+    fn control(&self, run_id: &str, actor: &Actor, command: &Command) -> Result<()>;
+    /// Cancel a run, directly or via a live driver's control inbox.
     ///
     /// # Errors
     /// Propagates IO failures.
-    fn cancel(&self, run_id: &str) -> Result<()>;
+    fn cancel(&self, run_id: &str, actor: &Actor) -> Result<Cancellation>;
 }
 
 impl RuntimeClient for Runtime {
@@ -845,8 +1178,14 @@ impl RuntimeClient for Runtime {
     fn logs(&self, run_id: &str) -> Result<Vec<AttemptLog>> {
         Runtime::logs(self, run_id)
     }
-    fn cancel(&self, run_id: &str) -> Result<()> {
-        Runtime::cancel(self, run_id)
+    fn list_runs(&self) -> Result<Vec<RunSummary>> {
+        Runtime::list_runs(self)
+    }
+    fn control(&self, run_id: &str, actor: &Actor, command: &Command) -> Result<()> {
+        Runtime::control(self, run_id, actor, command)
+    }
+    fn cancel(&self, run_id: &str, actor: &Actor) -> Result<Cancellation> {
+        Runtime::cancel(self, run_id, actor)
     }
 }
 
@@ -856,14 +1195,6 @@ impl RuntimeClient for Runtime {
 /// Fails if the current directory cannot be read.
 pub fn project_root() -> Result<PathBuf> {
     std::env::current_dir().map_err(Into::into)
-}
-
-/// Convenience: build a [`Runtime`] rooted at `root`.
-///
-/// # Errors
-/// Propagates config load failures.
-pub fn open(root: &Path) -> Result<Runtime> {
-    Runtime::new(root.to_path_buf())
 }
 
 #[cfg(test)]

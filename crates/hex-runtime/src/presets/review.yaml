@@ -10,7 +10,7 @@ example: "check the diff for security and error-handling gaps"
 # Run it with:  hex run review -p "what to check for"
 
 defaults:
-  worker: codex
+  role: reviewer
   context: fresh
   budget:
     attempts: 2
@@ -20,7 +20,6 @@ entry: review
 nodes:
   review:
     agent:
-      read_only: true
       prompt: |
         Review the current working-tree changes.
 

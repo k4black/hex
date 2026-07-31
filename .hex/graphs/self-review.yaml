@@ -1,0 +1,93 @@
+version: 1
+name: self-review
+description: "Review the working-tree diff with codex, gated on fmt+clippy+test in parallel"
+example: "review the roles/config pass for correctness and invariant violations"
+
+# hex reviewing its own changes. Review-only: no implementer, nothing is edited —
+# this is the shape you run before committing.
+#
+# It deliberately exercises the parts of hex most likely to be wrong, so a green
+# run is evidence the tool works and not just that codex was agreeable:
+#   - `roles:` resolution + a role's `prompt_append` reaching the agent
+#   - a parallel `command` node running three project checks at once
+#   - `accept.require` over BOTH a model verdict and deterministic evidence
+#   - `accept.on_unmet` routing instead of dead-ending
+#   - a per-node visit bound
+#
+# Run it with:  hex run self-review -p "what to look at"
+
+defaults:
+  role: reviewer
+  context: fresh
+  budget:
+    attempts: 6
+    elapsed: 90m
+    # A real review of a large diff at high reasoning effort takes a while: 15m
+    # killed codex mid-review on a ~5k-line change. Bound it, but not tightly.
+    attempt: 45m
+
+entry: verify
+
+nodes:
+  # Deterministic evidence first, and all of it at once: fmt, clippy and the test
+  # suite are independent, so `parallel` surfaces every failure in one round
+  # rather than making a human re-run after fixing the first one. Each step's
+  # output lands in attempts/<id>/<n>-<label>/ in declared order.
+  verify:
+    command:
+      check: [fmt, clippy, test]
+      mode: parallel
+    on:
+      passed: review
+      failed: report
+
+  review:
+    agent:
+      prompt: |
+        Review the current working-tree changes in this repository.
+
+        What to focus on: {{prompt}}
+
+        Run `git status` and `git diff` (the diff is large — read it in parts if
+        you must, but do not review only the first hunk). Review only; do not
+        edit any file.
+
+        The deterministic checks (fmt, clippy, cargo test) already pass, so do not
+        spend the review on those. Look for what they cannot catch:
+          - logic that is wrong rather than merely untidy, with a concrete
+            failure scenario (inputs → wrong behaviour)
+          - violations of the invariants in AGENTS.md, especially: the journal is
+            authoritative and state is always a projection of it; the kernel is
+            pure and deterministic; dependency direction points inward; every
+            cycle is bounded
+          - a new event/effect variant whose guards let a forged or replayed
+            journal record desync the projection
+          - anything documented as working that is not, or vice versa
+
+        If the change is sound, run:
+          hex emit approved
+        Otherwise put your findings in your final message, ordered most serious
+        first, each with file:line and why it matters. Then run:
+          hex emit changes_requested
+      may_propose: [approved, changes_requested]
+    # At most two review rounds: this graph has no implementer, so a second pass
+    # only helps if a human fixed something in between.
+    budget:
+      visits: 2
+    on:
+      approved: done
+      changes_requested: report
+
+  # A terminal for "there is something to fix" that is honest about it: the run
+  # failed, and `hex logs --node review` (or the per-step check logs) says why.
+  report:
+    terminal: failed
+
+  done:
+    terminal: succeeded
+
+accept:
+  # Both kinds of evidence: a model's approval AND the deterministic checks.
+  # Model assertions never outrank the checks (core rule 6).
+  require: [review.approved, verify.passed]
+  on_unmet: verify

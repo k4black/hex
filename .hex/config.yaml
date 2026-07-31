@@ -1,0 +1,25 @@
+# hex's own project config — hex uses hex on itself.
+#
+# This layers over the built-in defaults (crates/hex-runtime/src/defaults.yaml);
+# only the keys below differ, and each key set here wins for this project.
+
+roles:
+  # codex reviews what claude wrote: a different model reviews than wrote the
+  # code (rationale and the study to A/B it against are in TODO.md).
+  reviewer:
+    worker: codex
+    effort: high
+    prompt_append: |
+      This is a Rust workspace with hard architectural invariants in AGENTS.md —
+      read it before judging a design choice, and say so if a change violates one.
+      Prefer concrete objections (file:line, a failure scenario) over style notes.
+
+  implementer:
+    worker: claude
+    effort: high
+
+# What "green" means here. Referenced by graphs as `command: { check: <name> }`.
+checks:
+  test: [cargo, test, --workspace]
+  fmt: [cargo, fmt, --all, --check]
+  clippy: [cargo, clippy, --workspace, --all-targets]
