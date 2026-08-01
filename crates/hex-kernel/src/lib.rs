@@ -20,9 +20,11 @@ use hex_proto::{Disposition, Event, EventBody};
 pub mod graph;
 mod lifecycle;
 pub mod template;
+pub mod topology;
 pub mod validate;
 
 pub use graph::{Budget, Context, Edge, Graph, Node, NodeKind, NodeSpec, Requirement};
+pub use topology::{Cycle, EdgeClass, Topology, Transition};
 pub use validate::{Issue, check_journal, validate};
 
 /// Status of a run, derived purely by folding [`reduce`] over the journal.

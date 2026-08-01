@@ -12,6 +12,7 @@ use hex_kernel::graph::{
     Node, NodeSpec, Requirement,
 };
 use hex_proto::Disposition;
+use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::config::{Config, DefaultsSpec, RoleSpec};
@@ -116,7 +117,10 @@ struct RawNode {
     #[serde(default)]
     human: Option<RawHuman>,
     #[serde(default)]
-    on: BTreeMap<String, String>,
+    /// Authored order matters: a node's first-written edge is usually its happy
+    /// path, and rendering it alphabetically ("failed" before "passed") misreads
+    /// the author. An insertion-ordered map keeps YAML map semantics *and* order.
+    on: IndexMap<String, String>,
     /// Per-node bounds. Only `visits` today: how many times this node may be
     /// entered, so one loop can be capped without capping every loop.
     #[serde(default)]

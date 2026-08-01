@@ -29,6 +29,8 @@ pub use doctor::Report as DoctorReport;
 pub use driver::{AttemptView, ProgressSink};
 pub use error::{HexError, Result};
 pub use hex_kernel::graph::NodeKind;
+pub use hex_kernel::graph::{Budget, Context, Node, NodeSpec};
+pub use hex_kernel::topology::{Cycle, EdgeClass, Topology, Transition};
 pub use hex_kernel::{Graph, RunState, Status, Totals, Usage};
 pub use hex_proto::{Actor, Command, Disposition, Event, EventBody, ModelUsage, PROTOCOL_VERSION};
 pub use preset::Entry as GraphEntry;
@@ -942,6 +944,19 @@ impl Runtime {
             }
         }
         Ok(logs)
+    }
+
+    /// Registry name → the program each entry actually spawns.
+    ///
+    /// A graph names a *role*; which CLI that lands on comes from config and is
+    /// the fact a reader of someone else's graph most wants — and the only way
+    /// gotcha 19's role-shadows-worker trap is visible at all.
+    #[must_use]
+    pub fn worker_bindings(&self) -> BTreeMap<String, String> {
+        self.workers
+            .entries()
+            .filter_map(|(name, worker)| Some((name.to_owned(), worker.program()?.to_owned())))
+            .collect()
     }
 
     /// Probe every configured worker and check for usability — the preflight

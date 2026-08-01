@@ -329,6 +329,21 @@ impl Graph {
     /// here: that is validation's `E-accept-unmet-node` and the reroute's own
     /// lifecycle guard, and a nonexistent target has no outgoing edges so it can
     /// close no cycle either.
+    /// Whether `id` is acting as a **gate**: a `command` node whose verdict the
+    /// acceptance contract names.
+    ///
+    /// Gate-ness is a role, not a kind (core rule 4), so it is derived — and it
+    /// is derived *here* rather than in each of the four renderers that need it,
+    /// because a fact recomputed in four places is a fact that can disagree with
+    /// itself.
+    #[must_use]
+    pub fn is_gate(&self, id: &str) -> bool {
+        matches!(
+            self.node(id).map(|n| &n.spec),
+            Some(NodeSpec::Command { .. })
+        ) && self.accept.require.iter().any(|r| r.node == id)
+    }
+
     #[must_use]
     pub fn implicit_reroutes(&self) -> Vec<(&str, &str)> {
         let Some(to) = self.accept.on_unmet.as_deref() else {

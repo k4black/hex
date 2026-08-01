@@ -18,6 +18,8 @@ use hex_runtime::{
     Actor, Cancellation, Command as ControlCommand, Disposition, Isolation, Runtime,
 };
 
+mod glyphs;
+mod graph_view;
 mod preview;
 #[cfg(test)]
 mod test_support;
@@ -596,36 +598,19 @@ fn cmd_validate(reference: &str, json: bool) -> Result<ExitCode, String> {
 fn cmd_graph(reference: &str, json: bool) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     let graph = runtime.validate(reference).map_err(|e| e.to_string())?;
+    let topo = hex_runtime::Topology::of(&graph);
     if json {
-        let nodes: Vec<_> = graph
-            .nodes
-            .values()
-            .map(|n| serde_json::json!({"id": n.id, "kind": n.spec.kind().as_str()}))
-            .collect();
-        let edges: Vec<_> = graph
-            .edges
-            .iter()
-            .map(|e| serde_json::json!({"from": e.from, "on": e.on, "to": e.to}))
-            .collect();
-        let v = serde_json::json!({"name": graph.name, "entry": graph.entry, "nodes": nodes, "edges": edges});
-        println!("{v}");
+        println!("{}", graph_view::to_json(&graph, &topo, reference));
         return Ok(ExitCode::SUCCESS);
     }
-    println!("graph: {}   entry: {}", graph.name, graph.entry);
-    println!("nodes:");
-    for node in graph.nodes.values() {
-        println!("  {} [{}]", node.id, node.spec.kind().as_str());
-    }
-    println!("edges:");
-    for edge in &graph.edges {
-        println!("  {} --{}--> {}", edge.from, edge.on, edge.to);
-    }
+    let glyphs = crate::glyphs::Charset::resolve(None).glyphs();
+    print!(
+        "{}",
+        graph_view::render(&graph, reference, None, &runtime.worker_bindings(), &glyphs)
+    );
     Ok(ExitCode::SUCCESS)
 }
 
-/// Build the isolation policy from the CLI flags. `--no-worktree` (or neither
-/// flag) → shared; `--worktree` → worktree from HEAD; `--worktree <base>` → from
-/// that base. `--worktree-init "<argv>"` is whitespace-split (no shell).
 fn isolation_from(worktree: Option<&str>, no_worktree: bool, init: Option<&str>) -> Isolation {
     if no_worktree {
         return Isolation::Shared;
