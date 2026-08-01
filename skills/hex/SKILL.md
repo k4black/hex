@@ -17,195 +17,175 @@ license: MIT
 
 # hex
 
-`hex` runs an existing coding-agent CLI in a loop over a graph you declare, records every step to
-an append-only journal, and stops on bounds you set. **The one idea that makes it different: the
-agent does not decide when the loop ends.** A worker saying "done" is a proposal; `accept.require`
-and the deterministic gates decide the outcome.
+Runs an existing coding-agent CLI in a loop over a graph you declare, journals every step, and
+stops on bounds you set. **The agent does not decide when the loop ends** — a worker saying "done"
+is a proposal; `accept.require` and the deterministic gates decide.
 
-`hex --help` and `hex <verb> --help` are authoritative. hex is pre-1.0 and moves — when this file
-and the CLI disagree, believe the CLI, and say so.
+`hex --help` and `hex <verb> --help` are authoritative. hex is pre-1.0; when this file and the CLI
+disagree, believe the CLI and say so.
 
-## When to use hex — and when not to
+## Use it when — and when not
 
-Reach for hex when **all** of these hold:
+**Use** when all hold: the task takes more than one round · "done" is checkable (tests, a
+reviewer's verdict) · you want a different model to judge than wrote it, or the work to outlive one
+context window, or to survive a crash.
 
-- the task takes more than one round, and "done" is checkable (a test suite, a reviewer's verdict);
-- you want a *different model* to judge the work than wrote it, or the work to outlive one context
-  window, or to survive a crash and resume;
-- a bound on spend and wall-clock is worth having.
+**Do not use** when: you can just make the change · there is no checkable definition of done ·
+every step needs a human decision · **you are already inside a hex attempt** (a worker has `hex` on
+`PATH` and will recurse).
 
-Do **not** reach for hex when:
+**Cost is real and uncapped in money.** A measured 10-attempt cross-model run in hex's own repo
+spent **≥ $9.70 over ~40 min and ended `budget_exhausted` with nothing accepted.** Worst case is
+`attempts × budget.attempt` — `attempts: 12` at the 30m default is six hours. Say the estimate
+before starting.
 
-- you can just make the change — one edit through a loop is pure overhead;
-- there is no checkable definition of done ("make it nicer");
-- every step needs a human decision — that is a conversation, not a loop;
-- **you are already running inside a hex attempt.** A worker has `hex` on `PATH` and will recurse.
-
-**Cost is real and not capped in money.** A measured 10-attempt cross-model run in hex's own repo
-spent **≥ $9.70 over ~40 minutes and ended `budget_exhausted` with no accepted result.** Worst case
-is `attempts × budget.attempt` of wall clock — `attempts: 12` with the 30m default is six hours.
-Say the estimate out loud before starting one.
-
-## Orient first — never skip
+## 1. Orient (never skip)
 
 ```bash
-hex doctor                 # are the agent CLIs and this project's checks runnable?
-hex list                   # what graphs exist here (project > user > built-in)
-hex validate <graph>       # schema, references, bounded cycles, a reachable success
+hex doctor              # are the agent CLIs and this project's checks runnable?
+hex list                # graphs available here (project > user > built-in)
+hex validate <graph>    # schema, references, bounded cycles, a reachable success
 ```
 
-`hex doctor` matters because preflight **refuses to start** a run whose agent CLI is missing,
-rather than burning an attempt discovering it. If it reports `MISSING self hex`, put the `hex`
-binary on `PATH` before running anything with a multi-outcome node: the worker→hex control channel
-is a plain `PATH` lookup in the agent's own shell.
+`doctor` matters because preflight **refuses to start** a run whose agent CLI is missing instead of
+burning an attempt. `MISSING self hex` means the `hex` binary is not on `PATH` — fix that before
+running any graph with a multi-outcome node, because the worker→hex channel is a plain `PATH`
+lookup in the agent's own shell.
 
-**Always run `hex` from the repository root.** hex reads `.hex/` from the current directory and
-**does not walk up**. From a subdirectory `hex list` silently shows no project graphs and
-`hex runs` reports "no runs yet" — and `hex run` will *create a second `.hex/`* there.
+**Always run `hex` from the repository root.** It reads `.hex/` from the current directory and
+**does not walk up**. From a subdirectory `hex list` silently shows nothing and `hex run` creates a
+*second* `.hex/`.
 
-## Pick a preset
+## 2. Pick a graph
 
-| Preset | Loop | Needs `checks.test`? |
+| Preset | Loop | Needs `checks.test` |
 |---|---|---|
 | `critique-loop` | implement → review, until approved | no |
 | `plan-build-review` | plan → implement → review | no |
-| `review` | a reviewer over the current diff, no implementer | no |
+| `review` | one reviewer over the current diff | no |
 | `implement-until-green` | implement → test, until green | **yes** |
-| `tdd` | failing test → prove red → implement → prove green | **yes** |
+| `tdd` | write failing test → prove red → implement → prove green | **yes** |
 | `autoresearch` | research → critic judges sufficiency → report | no |
 
-The first three are gate-free and run in any repo with no setup. The two that need `checks.test`
-refuse to start without it — that is the design, not a bug.
+Behaviour worth knowing: `critique-loop`, `plan-build-review`, `tdd` and `implement-until-green`
+run their **implementer with `context: continue`** (it keeps what it worked out) and their
+**reviewer fresh** (a reviewer continuing its own session talks itself into approving what it
+already argued about). `autoresearch` is all-fresh because its continuity is on disk in
+`.hex/research-notes.md`. With `review`, `changes_requested` routes to a **failure terminal**, so a
+useful review exits 1.
 
-## Give it the task
+Fork any of them: `hex graph <name> --format source > .hex/graphs/<name>.yaml`.
 
-hex takes **exactly one** operator value: the prompt.
+## 3. Give it the task
+
+One operator value only — the prompt. There is **no `--input k=v`**; `-p` and `-f` conflict.
 
 ```bash
 hex run critique-loop -p "fix the flaky auth test"
-hex run plan-build-review -f prompts/task.md        # same channel, from a file
-hex run tdd -p "add a --json flag" --name json-flag # stable run id
+hex run plan-build-review -f prompts/task.md
+hex run tdd -p "add a --json flag" --name json-flag   # stable run id
 ```
 
-There is **no `--input k=v`.** `-p` and `-f` are mutually exclusive.
+**Reference files by path; never paste them.** The agent has filesystem access, so
+`-p "fix the retry logic in src/http/client.rs; failing case at tests/retry.rs:88"` costs no tokens
+and cannot go stale mid-run.
 
-**Reference files by path, do not paste them.** The agent has filesystem access, so
-`-p "fix the retry logic in src/http/client.rs; the failing case is tests/retry.rs:88"` is better
-than embedding either file — it costs no tokens and cannot go stale mid-run.
+## 4. Run, watch, steer
 
-## Run, observe, steer
-
-| Verb | Blocks? | Use |
+| Command | Blocks | Does |
 |---|---|---|
-| `hex run <graph> --detach` | no, prints the run id | start it and keep working |
-| `hex wait <run>` | yes, until terminal | exits with the disposition code |
+| `hex run <graph> --detach` | no | starts it, prints the run id |
+| `hex wait <run>` | yes | exits with the disposition code |
 | `hex status <run>` | no | current node, in-flight attempt + elapsed, queued steer, spend |
-| `hex logs <run> [--node N] [--full] [--tail K] [--follow]` | `--follow` does | what the agent actually said |
-| `hex watch <run> [--follow]` | `--follow` does | the event stream |
+| `hex logs <run> [--node N] [--tail K] [--full] [--follow]` | `--follow` | what the agent said |
+| `hex watch <run> [--follow]` | `--follow` | the event stream |
 | `hex steer <run> "text"` | no | guidance for the **next** attempt |
 | `hex respond <run> "text"` | no | answer a blocking `human` node |
-| `hex pause` / `hex resume <run>` | resume blocks | stop at the next boundary / continue the same run |
+| `hex pause <run>` / `hex resume <run>` | resume does | stop at next boundary / continue same run |
 | `hex cancel <run>` | no | stop it |
-
-The driving-agent recipe:
 
 ```bash
 id=$(hex run critique-loop -p "…" --detach)
-hex logs "$id" --follow      # watch it work
+hex logs "$id" --follow
 hex wait "$id"; echo "exit $?"
 ```
 
-**A steer has two stages and `hex status` shows which.** `queued steer (not yet picked up)` means
-it is in the control inbox; `steer accepted (applies to the next agent attempt)` means the driver
-journaled it. An attempt already in flight will **not** see it — steering lands between attempts.
+A steer has **two stages**, both shown by `hex status`: `queued steer (not yet picked up)` is in the
+control inbox; `steer accepted (applies to the next agent attempt)` is journaled. An attempt already
+in flight will not see it — steering lands between attempts.
 
-## Read the result
+## 5. Read the result
 
-`hex run`/`hex resume` end by printing the terminal reason (`why:`), each failed check with its
-exit code and a tail of its output, the final message, and what was spent. `--json` carries
-`disposition`, `why`, `result`, `failed_steps`, `usage`, `paused`.
+`hex run`/`resume` end by printing the terminal reason (`why:`), each failed check with its exit
+code and output tail, the final message, and the spend. `--json` gives `disposition`, `why`,
+`result`, `failed_steps`, `usage`, `paused`.
 
-- `hex logs <run>` — each attempt's final message. `--node <id>` narrows it.
-- `hex logs <run> --full` — every captured byte, on stdout.
-- `hex status <run> --json` — the usage projection: `by_node`, `by_model`, `total`.
+- `hex logs <run>` — each attempt's final message (`--node` narrows, `--full` gives every byte).
+- `hex status <run> --json` — usage as `by_node` / `by_model` / `total`.
+- `--json` with `--follow` is rejected, not silently ignored.
 
-`--json` and `--follow` cannot be combined (there is no NDJSON log stream yet); hex rejects it
-rather than quietly ignoring one.
+Costs render `—` when the agent reported none (codex reports tokens only), and a mixed run's total
+is `≥ $X` with a line saying how much is unpriced. hex ships **no price table and never estimates**.
 
-## Exit codes
-
-Branch on these instead of parsing output.
+## 6. Exit codes
 
 | Code | Meaning |
 |---|---|
 | 0 | succeeded |
-| 1 | failed (**including a reviewer requesting changes** — see below) |
-| 2 | usage error, unknown run, **or a graph/config problem** — read stderr; do not retry the same command |
+| 1 | failed — **including a reviewer requesting changes** |
+| 2 | usage error, unknown run, **or a graph/config problem** — read stderr, do not retry unchanged |
 | 3 | timed out |
 | 4 | budget exhausted |
 | 5 | cancelled |
-| 6 | paused (`hex resume` continues it) |
+| 6 | paused (`hex resume` continues) |
 
-Two traps. **Exit 1 does not distinguish "the reviewer found problems" from "hex broke"** — with
-`review`, `changes_requested` routes to a failure terminal, so read the final message before
-concluding anything went wrong. And **a failing check routes `failed` while a *broken* check fails
-the whole attempt**: hex deliberately never routes an infrastructure failure as evidence, because
-that would spend agent tokens fixing code on evidence never gathered.
+**A failing check routes `failed`; a *broken* check fails the whole attempt.** hex never routes an
+infrastructure failure as evidence, because that spends agent tokens fixing code on evidence never
+gathered.
 
-## Bounds and cost
+## 7. Bounds
 
 ```yaml
 defaults:
   budget:
     attempts: 12            # run-wide
     elapsed: 30m            # run-wide wall clock
-    attempt: 20m            # per attempt — always set, defaults to 30m
+    attempt: 20m            # per attempt; always set, defaults to 30m
     output_tokens: 200000   # run-wide, GENERATION tokens only
 nodes:
   review:
     budget: { visits: 3 }   # this loop only
 ```
 
-`output_tokens` counts generation, not total: a review reads millions of cached tokens to produce
-tens of thousands, so a total-token bound would track context size rather than work.
+`output_tokens` counts generation because a review reads millions of cached tokens to produce tens
+of thousands — a total-token bound would track context size, not work. Whichever bound bites first
+wins. Prefer `--detach` + `hex status` over fire-and-forget; tighten a node's `visits` before
+raising `attempts`.
 
-**hex ships no price table and never estimates.** codex reports tokens and no money, so its cost
-shows `—` and a mixed run's total renders `≥ $X` with a line saying how much is unpriced. Prefer
-`--detach` plus `hex status` over fire-and-forget, and tighten a node's `visits` before loosening
-`attempts`.
+## 8. Project setup
 
-## Set the project up
-
-```bash
-hex init      # .hex/, .hex/graphs/, a commented config, .gitignore entries; idempotent
-```
-
-`.hex/config.yaml` holds three things:
+`hex init` creates `.hex/`, `.hex/graphs/`, a commented config and `.gitignore` entries. Idempotent.
 
 ```yaml
-workers:                      # how to invoke an agent CLI — plumbing; a graph never names one
-  codex:  { kind: codex }
-roles:                        # what a graph names
+# .hex/config.yaml
+workers:                    # how to invoke a CLI — plumbing; a graph never names one
+  codex:  { kind: codex }   # kind: codex | claude | opencode | command
+roles:                      # what a graph names
   implementer: { worker: codex, effort: high }
   reviewer:    { worker: claude, read_only: true, prompt_append: "Only correctness and security." }
-checks:                       # what "green" means HERE. Empty by default.
+checks:                     # what "green" means HERE. Empty by default.
   test: [cargo, test, --workspace]
 ```
 
-A graph naming a check you have not declared is **refused at compile time**, exit 2, naming the key
-to add. That is deliberate: a run reporting `succeeded` having verified nothing is the failure mode
-hex exists to prevent. Config layers built-in → `~/.config/hex/config.yaml` → `.hex/config.yaml`
-and deep-merges per key.
+Layers built-in → `~/.config/hex/config.yaml` → `.hex/config.yaml`, deep-merged per key.
+`prompt:` replaces a role's preamble, `prompt_append:` extends it. A graph naming an undeclared
+check is **refused at compile time (exit 2)** naming the key to add — a run reporting `succeeded`
+having verified nothing is the failure mode hex exists to prevent.
 
-## Write a custom graph
+Trap: a `roles:` entry **shadows** a same-named `workers:` entry. Never name a scratch worker
+`implementer`/`reviewer`/`planner`/`researcher`.
 
-Start from a built-in rather than a blank file:
-
-```bash
-hex graph critique-loop --format source > .hex/graphs/my-loop.yaml
-```
-
-A complete, valid graph:
+## 9. Write a graph
 
 ```yaml
 version: 1
@@ -221,7 +201,7 @@ nodes:
       prompt: "{{prompt}}\n\nReviewer said:\n{{review.result}}"
     on: { done: test }                  # one outcome: finishing cleanly IS the signal
   test:
-    command: { check: test }            # or a literal argv: run: [cargo, test]
+    command: { check: test }            # or a literal argv: run: [cargo, test, --workspace]
     on: { passed: review, failed: implement }
   review:
     agent:
@@ -239,29 +219,83 @@ accept:
 
 Rules that bite:
 
-- **Four node kinds only**: `agent`, `command`, `human`, `terminal`.
-- A node with **one** outcome just finishes — hex synthesizes `done`. A node with **more than one**
-  must call `hex emit <signal>`, and every signal must be in `may_propose` *and* have an edge.
-- **Every cycle must be bounded** or validation fails. Bound the expensive node with `visits`.
-- `{{prompt}}` is the operator's text; `{{node.result}}` is another node's final message.
-- Validate before running: `hex validate <graph>`.
+- **Four node kinds**: `agent`, `command`, `human`, `terminal`. Exactly one per node.
+- One outcome → the node just finishes and hex synthesizes `done`. **More than one → the agent must
+  call `hex emit <signal>`**, and every signal needs both a `may_propose` entry and an edge.
+- **Every cycle must be bounded** or validation fails.
+- Authored edge order is preserved — write the happy path first.
+- `hex validate <graph>` before running.
 
-Full schema and every `E-*` error code → `references/graph-schema.md`.
+### Schema
 
-## Known broken — do not rely on
+| Where | Key | Notes |
+|---|---|---|
+| top | `version` `name` `entry` `nodes` | required (`version` defaults to 1) |
+| top | `description` `example` | shown by `hex list` |
+| `defaults` | `role` `context` `budget` | `context`: `fresh` (default) or `continue` |
+| `budget` | `attempts` `elapsed` `attempt` `cycle_visits` `output_tokens` | run-wide, under `defaults:` |
+| node | `budget: { visits: N }` | the only per-node budget |
+| `agent` | `prompt` (required) `role` `may_propose` `context` `read_only` | `read_only` is advisory, prompt-enforced |
+| `command` | `check:` or `run:`, `mode:` | `mode`: `ordered` (stop at first failure) or `parallel` (run all, fail if any did) |
+| `human` | `prompt` | blocks until `hex respond`; **exactly one** outgoing edge |
+| `terminal` | `succeeded` or `failed` **only** | the other dispositions are outcomes hex assigns |
+| `accept` | `require: [node.signal]` `on_unmet: <node>` | evidence for a success terminal to count |
 
-Checked 2026-08-01; verify against `hex --help` and the README's "Known broken" rather than
-trusting this list.
+`check:` names an entry in config; `run:` is a literal argv needing no config — `run: [cargo, test]`
+for one, or a list of lists for several. Both accept one name/argv or a list.
 
-- **`accept.on_unmet` has two open unbounded-loop bugs.** A terminal's `visits` bound is validated
+Interpolation: `{{prompt}}` is the operator's text; `{{<node>.result}}` is another node's final
+message (or a human's answer), substituted at attempt start. Agent output is fenced as untrusted
+data, a human answer as operator input.
+
+Durations are humantime: `500ms` `30s` `20m` `2h` `1h30m`. **`m` is minutes, `M` is months.**
+
+### Validation errors
+
+| Code | Fix |
+|---|---|
+| `E-empty` / `E-entry` | no nodes / `entry` names none |
+| `E-edge-from` `E-edge-to` `E-accept-node` `E-accept-unmet-node` `E-result-ref` | an id that does not exist |
+| `E-unreachable` | connect or delete the node |
+| `E-no-terminal` / `E-no-happy-path` | add a reachable `terminal: succeeded` |
+| `E-terminal-edge` | terminals have no outgoing edges |
+| `E-unbounded-cycle` | add `budget.attempts`, `cycle_visits`, or a node's `visits` |
+| `E-proposal-no-edge` / `E-edge-not-proposable` | `may_propose` and the edges must match |
+| `E-bad-signal-name` | signals are `[a-z][a-z0-9_]*` |
+| `E-gate-signal` | a `command` node's edges are `passed`/`failed` |
+| `E-human-no-edge` / `E-human-multi-edge` | a human node needs exactly one |
+| `E-accept-unsatisfiable` | required evidence no node can produce |
+| `E-accept-unmet-terminal` | `on_unmet` must name a node that can produce evidence |
+| `E-done-reserved` | `done` is reserved for implicit completion |
+| `E-budget-zero` | `output_tokens: 0` is spent before the first attempt |
+| `E-journal-lifecycle` | not a graph error — that run's journal is corrupt |
+
+## 10. When something is wrong
+
+| Symptom | Cause and fix |
+|---|---|
+| `hex list`/`runs`/`doctor` show nothing you expect | not in the repo root; hex does not walk up. `cd` there — do **not** add a second config |
+| ``needs check `test`, which this project does not declare`` | add it to `checks:`, or use a literal `run:` step. If it *is* declared, you are in the wrong directory |
+| ``worker `x` cannot resume a session`` | `context: continue` on a worker without sessions — use `fresh`, or bind the role to codex/claude |
+| `MISSING self hex` | put the `hex` binary on `PATH`, or multi-outcome nodes cannot route |
+| ``unknown field `argv`, expected `kind`, `model`, `command`, `result``` | a config typo; every struct denies unknown fields |
+| a worker runs the wrong agent | a `roles:` entry shadowed your `workers:` entry — rename the worker |
+| ``hex emit must be run inside a hex attempt`` | worker-side only; you ran it yourself |
+| ``agent emitted `x` which is not in may_propose`` | add the signal + an edge, or fix the prompt |
+| a steer looks ignored | `hex status` — queued vs accepted; in-flight attempts never see it |
+| `hex cancel` says "queued" and it keeps going | a live driver holds the lock; applies at the next attempt boundary |
+| `(no final message captured)` | the attempt produced none; a timeout or crash leaves a `[partial output — …]` tail instead |
+| `unreadable` in `hex runs` | that run's stored graph predates a schema change; history is intact but unreplayable |
+| exit 1 but the work looks fine | with `review`, `changes_requested` *is* a failure terminal — read the final message |
+| run is `running` but idle | `hex status` shows the in-flight attempt; if the process died, `hex resume` continues it |
+
+## Known broken (checked 2026-08-01)
+
+- **`accept.on_unmet` has two open unbounded-loop bugs** — a terminal's `visits` bound is validated
   but not enforced, and `attempts` cannot bound a human-only cycle. Avoid `on_unmet` and `human`
-  cycles in an unattended run.
+  cycles in unattended runs.
 - **`budget.output_tokens` has no end-to-end test** — no fake worker reports usage, so enforcement
   is covered by unit tests only.
 - `interactive: true`, `templates:`/`extends:` and stall detection are unbuilt.
 
-## References
-
-- `references/graph-schema.md` — every YAML field, defaults, and all validation error codes.
-- `references/presets.md` — the six built-ins node by node, and how to fork one.
-- `references/troubleshooting.md` — literal error text → cause → fix.
+Verify against `hex --help` and the README's "Known broken" rather than trusting this list.
