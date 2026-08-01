@@ -13,12 +13,16 @@
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use hex_runtime::{
     Actor, Cancellation, Command as ControlCommand, Disposition, Isolation, Runtime,
 };
 
+#[macro_use]
+mod out;
+mod agent_stream;
 mod glyphs;
+mod graph_export;
 mod graph_view;
 mod preview;
 #[cfg(test)]
@@ -84,11 +88,14 @@ enum Command {
         #[arg(value_name = "GRAPH")]
         graph: String,
     },
-    /// Render a graph as text (its nodes and edges)
+    /// Render a graph: as text, JSON, mermaid, or graphviz DOT
     Graph {
         /// Graph reference: a preset name or a path to a `.yaml` file
         #[arg(value_name = "GRAPH")]
         graph: String,
+        /// Output format (`mermaid` pastes into a GitHub comment; `dot` feeds graphviz)
+        #[arg(long, value_enum, default_value_t = GraphFormat::Text)]
+        format: GraphFormat,
     },
     /// Start a NEW run of a graph
     Run {
@@ -202,6 +209,19 @@ enum Command {
     },
 }
 
+/// How `hex graph` renders. Every one of these goes to stdout and exits 0.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GraphFormat {
+    /// The flow, for a terminal.
+    Text,
+    /// The compiled IR plus edge classification, for a machine.
+    Json,
+    /// A mermaid `flowchart`, for a Markdown comment.
+    Mermaid,
+    /// A graphviz `digraph`, for `dot -Tsvg`.
+    Dot,
+}
+
 fn main() -> ExitCode {
     // clap handles `--help`/`-h`/`--version` and parse/usage errors itself
     // (usage errors exit 2, help/version exit 0), matching the old exit codes.
@@ -233,7 +253,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Command::List => cmd_list(json),
         Command::Doctor => cmd_doctor(json),
         Command::Validate { graph } => cmd_validate(&graph, json),
-        Command::Graph { graph } => cmd_graph(&graph, json),
+        Command::Graph { graph, format } => cmd_graph(&graph, format, json),
         Command::Run {
             graph,
             prompt,
@@ -451,7 +471,7 @@ fn cmd_init(json: bool) -> Result<ExitCode, String> {
     }
 
     if json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({
                 "root": root.display().to_string(),
@@ -461,12 +481,12 @@ fn cmd_init(json: bool) -> Result<ExitCode, String> {
         );
     } else {
         for name in &created {
-            println!("created  {name}");
+            outln!("created  {name}");
         }
         for name in &existed {
-            println!("exists   {name}");
+            outln!("exists   {name}");
         }
-        println!(
+        outln!(
             "\ndeclare your checks in .hex/config.yaml, then `hex list` to see what you can run"
         );
     }
@@ -503,21 +523,21 @@ fn print_graph_list(runtime: &Runtime, json: bool) {
                 })
             })
             .collect();
-        println!("{}", serde_json::json!({ "graphs": items }));
+        outln!("{}", serde_json::json!({ "graphs": items }));
         return;
     }
     if graphs.is_empty() {
-        println!("no graphs found (add one to .hex/graphs/ or ~/.config/hex/graphs/)");
+        outln!("no graphs found (add one to .hex/graphs/ or ~/.config/hex/graphs/)");
         return;
     }
-    println!("available graphs:\n");
+    outln!("available graphs:\n");
     for g in &graphs {
-        println!("  {}  ({})", g.name, g.origin);
+        outln!("  {}  ({})", g.name, g.origin);
         if let Some(desc) = &g.description {
-            println!("      {desc}");
+            outln!("      {desc}");
         }
         let example = g.example.as_deref().unwrap_or("<prompt>");
-        println!("      hex run {} -p \"{example}\"\n", g.name);
+        outln!("      hex run {} -p \"{example}\"\n", g.name);
     }
 }
 
@@ -541,16 +561,16 @@ fn cmd_doctor(json: bool) -> Result<ExitCode, String> {
             })
             .collect::<Vec<_>>();
         let v = serde_json::json!({ "ok": report.ok(), "findings": findings });
-        println!("{v}");
+        outln!("{v}");
     } else if report.findings.is_empty() {
-        println!("no workers or checks configured");
+        outln!("no workers or checks configured");
     } else {
         for f in &report.findings {
             let mark = if f.ok { "ok     " } else { "MISSING" };
-            println!("  {mark} {:<7} {:<12} {}", f.kind, f.name, f.detail);
+            outln!("  {mark} {:<7} {:<12} {}", f.kind, f.name, f.detail);
         }
         if report.ok() {
-            println!("\nall good");
+            outln!("\nall good");
         } else {
             eprintln!(
                 "\n{} unusable: {}\ninstall the missing tools, or fix `.hex/config.yaml`",
@@ -573,9 +593,9 @@ fn cmd_validate(reference: &str, json: bool) -> Result<ExitCode, String> {
             if json {
                 let v =
                     serde_json::json!({"ok": true, "name": graph.name, "nodes": graph.nodes.len()});
-                println!("{v}");
+                outln!("{v}");
             } else {
-                println!(
+                outln!(
                     "ok: `{}` is valid ({} nodes)",
                     graph.name,
                     graph.nodes.len()
@@ -586,7 +606,7 @@ fn cmd_validate(reference: &str, json: bool) -> Result<ExitCode, String> {
         Err(e) => {
             if json {
                 let v = serde_json::json!({"ok": false, "error": e.to_string()});
-                println!("{v}");
+                outln!("{v}");
             } else {
                 eprintln!("{e}");
             }
@@ -595,19 +615,26 @@ fn cmd_validate(reference: &str, json: bool) -> Result<ExitCode, String> {
     }
 }
 
-fn cmd_graph(reference: &str, json: bool) -> Result<ExitCode, String> {
+fn cmd_graph(reference: &str, format: GraphFormat, json: bool) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     let graph = runtime.validate(reference).map_err(|e| e.to_string())?;
     let topo = hex_runtime::Topology::of(&graph);
-    if json {
-        println!("{}", graph_view::to_json(&graph, &topo, reference));
-        return Ok(ExitCode::SUCCESS);
+    // The global `--json` is an alias for `--format json` rather than a conflict:
+    // it is documented as working on any command, so rejecting it here would
+    // break the one habit every other verb teaches.
+    let format = if json { GraphFormat::Json } else { format };
+    match format {
+        GraphFormat::Json => outln!("{}", graph_view::to_json(&graph, &topo, reference)),
+        GraphFormat::Mermaid => out!("{}", graph_export::to_mermaid(&graph, &topo)),
+        GraphFormat::Dot => out!("{}", graph_export::to_dot(&graph, &topo)),
+        GraphFormat::Text => {
+            let glyphs = crate::glyphs::Charset::resolve(None).glyphs();
+            out!(
+                "{}",
+                graph_view::render(&graph, reference, None, &runtime.worker_bindings(), &glyphs)
+            );
+        }
     }
-    let glyphs = crate::glyphs::Charset::resolve(None).glyphs();
-    print!(
-        "{}",
-        graph_view::render(&graph, reference, None, &runtime.worker_bindings(), &glyphs)
-    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -699,12 +726,12 @@ fn cmd_detach(
     spawn_detached(&argv, &run_dir)?;
 
     if json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({ "run_id": run_id, "detached": true })
         );
     } else {
-        println!("{run_id}");
+        outln!("{run_id}");
         eprintln!("detached; follow with `hex wait {run_id}` or `hex watch {run_id}`");
     }
     Ok(ExitCode::SUCCESS)
@@ -770,10 +797,10 @@ fn print_outcome(
             "failed_steps": payoff.failed_steps.iter().map(|s| &s.label).collect::<Vec<_>>(),
             "usage": payoff.usage.as_ref().map(totals_json),
         });
-        println!("{v}");
+        outln!("{v}");
     } else {
-        println!("{verb} {} ({})", report.run_id, report.origin);
-        println!("disposition: {disposition}");
+        outln!("{verb} {} ({})", report.run_id, report.origin);
+        outln!("disposition: {disposition}");
         payoff.print();
         if report.disposition.is_none() {
             eprintln!("paused; continue with `hex resume {}`", report.run_id);
@@ -858,7 +885,7 @@ impl Payoff {
     fn print(&self) {
         let tty = std::io::stdout().is_terminal();
         if let Some(why) = &self.why {
-            println!("why: {why}");
+            outln!("why: {why}");
         }
         if let Some(usage) = &self.usage {
             let cost = if usage.cost_micro_usd > 0 {
@@ -866,25 +893,25 @@ impl Payoff {
             } else {
                 String::new()
             };
-            println!("spent: {} tokens{cost}", tokens(usage.tokens()));
+            outln!("spent: {} tokens{cost}", tokens(usage.tokens()));
         }
         for step in &self.failed_steps {
             let code = step.exit.as_deref().unwrap_or("?");
-            println!("\n── {} failed (exit {code}) ──", step.label);
+            outln!("\n── {} failed (exit {code}) ──", step.label);
             // A check's diagnosis is at the end of its output, not the start.
             let combined = format!("{}{}", step.stdout, step.stderr);
             let lines: Vec<&str> = combined.lines().collect();
             let start = lines.len().saturating_sub(FAILED_STEP_TAIL_LINES);
             if start > 0 {
-                println!("{}", grey(&format!("… {start} earlier line(s)"), tty));
+                outln!("{}", grey(&format!("… {start} earlier line(s)"), tty));
             }
             for line in &lines[start..] {
-                println!("{}", grey(line, tty));
+                outln!("{}", grey(line, tty));
             }
         }
         if let Some(result) = &self.result {
-            println!("\n── final message ──");
-            println!("{}", grey(result.trim_end(), tty));
+            outln!("\n── final message ──");
+            outln!("{}", grey(result.trim_end(), tty));
         }
     }
 }
@@ -909,11 +936,11 @@ fn cmd_runs(json: bool) -> Result<ExitCode, String> {
                 })
             })
             .collect();
-        println!("{}", serde_json::json!({ "runs": items }));
+        outln!("{}", serde_json::json!({ "runs": items }));
         return Ok(ExitCode::SUCCESS);
     }
     if runs.is_empty() {
-        println!("no runs yet (start one with `hex run <graph> -p \"…\"`)");
+        outln!("no runs yet (start one with `hex run <graph> -p \"…\"`)");
         return Ok(ExitCode::SUCCESS);
     }
     // Widths from the data, not constants: `finished:budget_exhausted` is 25
@@ -955,9 +982,9 @@ fn cmd_runs(json: bool) -> Result<ExitCode, String> {
         }
         out
     };
-    println!("{}", line(&headers.map(ToOwned::to_owned)));
+    outln!("{}", line(&headers.map(ToOwned::to_owned)));
     for (r, cells) in runs.iter().zip(&rows) {
-        println!("{}", line(cells));
+        outln!("{}", line(cells));
         if let Some(err) = &r.error {
             eprintln!("  {}: {err}", r.run_id);
         }
@@ -1019,7 +1046,7 @@ fn cmd_wait(run_id: &str, json: bool) -> Result<ExitCode, String> {
         };
         if let Some((state, code)) = verdict {
             if json {
-                println!(
+                outln!(
                     "{}",
                     serde_json::json!({
                         "run_id": summary.run_id,
@@ -1028,7 +1055,7 @@ fn cmd_wait(run_id: &str, json: bool) -> Result<ExitCode, String> {
                     })
                 );
             } else {
-                println!("{state}");
+                outln!("{state}");
                 if state == "abandoned" {
                     eprintln!("nothing is driving `{run_id}` — continue it with `hex resume`");
                 }
@@ -1047,14 +1074,14 @@ fn cmd_control(run_id: &str, command: &ControlCommand, json: bool) -> Result<Exi
         .control(run_id, &actor, command)
         .map_err(|e| e.to_string())?;
     if json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({ "run_id": run_id, "queued": command.as_str() })
         );
     } else {
         // Queued, not applied: the driver picks it up at its next attempt
         // boundary, and the journal is where the effect shows up.
-        println!("queued {} for {run_id}", command.as_str());
+        outln!("queued {} for {run_id}", command.as_str());
         // Say *when* it lands. A steer is drained at the next attempt boundary, so
         // an attempt already in flight will not see it — without that sentence the
         // operator reasonably expects the running agent to change course, and reads
@@ -1117,14 +1144,14 @@ fn cmd_status(run_id: &str, json: bool) -> Result<ExitCode, String> {
                 "total": totals_json(&s.usage.total),
             },
         });
-        println!("{v}");
+        outln!("{v}");
     } else {
-        println!("run: {}", s.run_id);
-        println!("status: {}", s.status);
+        outln!("run: {}", s.run_id);
+        outln!("status: {}", s.status);
         if let Some(c) = &s.current {
-            println!("current: {c}");
+            outln!("current: {c}");
         }
-        println!("attempts: {}", s.attempts);
+        outln!("attempts: {}", s.attempts);
         // The live picture, before the spend table: an operator checking on a
         // running loop wants "what is happening now", and a bare `running` sent
         // them to `hex watch` to find out.
@@ -1133,7 +1160,7 @@ fn cmd_status(run_id: &str, json: bool) -> Result<ExitCode, String> {
                 .worker
                 .as_deref()
                 .map_or(String::new(), |w| format!(" via {w}"));
-            println!(
+            outln!(
                 "in flight: {} on {}{via}, running {}",
                 f.attempt_id,
                 f.node_id,
@@ -1141,9 +1168,9 @@ fn cmd_status(run_id: &str, json: bool) -> Result<ExitCode, String> {
             );
         }
         if let Some(node) = &s.asked {
-            println!("waiting for you: `hex respond {} \"…\"` ({node})", s.run_id);
+            outln!("waiting for you: `hex respond {} \"…\"` ({node})", s.run_id);
             if let Some(q) = &s.question {
-                println!("{}", grey(q.trim_end(), std::io::stdout().is_terminal()));
+                outln!("{}", grey(q.trim_end(), std::io::stdout().is_terminal()));
             }
         }
         // Two stages of "sent but not applied", and conflating them is how a steer
@@ -1152,13 +1179,13 @@ fn cmd_status(run_id: &str, json: bool) -> Result<ExitCode, String> {
         for command in &s.queued {
             match command {
                 ControlCommand::Steer { text } => {
-                    println!("queued steer (not yet picked up): {text}");
+                    outln!("queued steer (not yet picked up): {text}");
                 }
-                other => println!("queued {} (not yet picked up)", other.as_str()),
+                other => outln!("queued {} (not yet picked up)", other.as_str()),
             }
         }
         for text in &s.pending_steer {
-            println!("steer accepted (applies to the next agent attempt): {text}");
+            outln!("steer accepted (applies to the next agent attempt): {text}");
         }
         print_usage(&s.usage, &s.visits);
     }
@@ -1179,7 +1206,7 @@ fn print_usage(usage: &hex_runtime::Usage, visits: &std::collections::BTreeMap<S
     // fact that 93% of a review run is cache. REASON is a *subset* of OUT, carried
     // for information and never added into the totals.
     let row = |left: &str, visits: String, t: &hex_runtime::Totals| {
-        println!(
+        outln!(
             "{left:<22} {visits:>6} {:>9} {:>9} {:>9} {:>9} {:>8} {:>12}",
             tokens(t.input_tokens),
             tokens(t.output_tokens),
@@ -1193,14 +1220,21 @@ fn print_usage(usage: &hex_runtime::Usage, visits: &std::collections::BTreeMap<S
     // a crash between `AttemptReported` and the attempt's terminal leaves two
     // reports against one visit. Calling it attempts would be a number that
     // occasionally disagrees with itself.
-    println!(
+    outln!(
         "\n{:<22} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8} {:>12}",
-        "NODE", "VISITS", "IN", "OUT", "CACHE R", "CACHE W", "REASON", "COST"
+        "NODE",
+        "VISITS",
+        "IN",
+        "OUT",
+        "CACHE R",
+        "CACHE W",
+        "REASON",
+        "COST"
     );
     for (node, t) in &usage.by_node {
         row(node, visits.get(node).copied().unwrap_or(0).to_string(), t);
     }
-    println!("MODEL");
+    outln!("MODEL");
     for (model, t) in &usage.by_model {
         row(model, String::new(), t);
     }
@@ -1213,7 +1247,7 @@ fn print_usage(usage: &hex_runtime::Usage, visits: &std::collections::BTreeMap<S
         .sum::<u32>();
     row("total", attempts.to_string(), &usage.total);
     if usage.total.cost_is_partial() {
-        println!(
+        outln!(
             "\ncost is a lower bound: {} attempt(s) reported tokens but no price",
             usage.total.unpriced_reports
         );
@@ -1294,12 +1328,12 @@ fn cmd_watch(run_id: &str, follow: bool, json: bool) -> Result<ExitCode, String>
     let print_from = |events: &[hex_runtime::Event], from: usize| -> Result<(), String> {
         for event in &events[from..] {
             if json {
-                println!(
+                outln!(
                     "{}",
                     serde_json::to_string(event).map_err(|e| e.to_string())?
                 );
             } else {
-                println!("{}", event_line(event));
+                outln!("{}", event_line(event));
             }
         }
         Ok(())
@@ -1371,10 +1405,10 @@ fn follow_logs(
             let via = worker
                 .as_deref()
                 .map_or(String::new(), |w| format!(" via {w}"));
-            println!("\u{2500}\u{2500} {attempt_id} [{node_id}]{via} \u{2500}\u{2500}");
+            outln!("\u{2500}\u{2500} {attempt_id} [{node_id}]{via} \u{2500}\u{2500}");
             let cursor = if attaching {
                 for line in tail_of(runtime, run_id, attempt_id, tail_lines) {
-                    println!("{}", grey(&line, tty));
+                    outln!("{}", grey(&line, tty));
                 }
                 hex_runtime::StreamCursor::at_end(runtime, run_id, attempt_id)
                     .map_err(|e| e.to_string())?
@@ -1389,7 +1423,7 @@ fn follow_logs(
 
         let status = runtime.status(run_id).map_err(|e| e.to_string())?;
         if status.status.is_finished() {
-            println!(
+            outln!(
                 "\u{2500}\u{2500} {} \u{2500}\u{2500}",
                 disposition_label(status.disposition, "finished")
             );
@@ -1417,7 +1451,9 @@ fn drain(
         .map_err(|e| e.to_string())?
     {
         for line in chunk.text.lines() {
-            println!("{}", grey(line, tty));
+            if let Some(shown) = agent_stream::humanize(line) {
+                outln!("{}", grey(&shown, tty));
+            }
         }
     }
     Ok(())
@@ -1430,7 +1466,12 @@ fn tail_of(runtime: &Runtime, run_id: &str, attempt_id: &str, lines: usize) -> V
         .read_streams(run_id, attempt_id, &mut cursor)
         .unwrap_or_default()
         .iter()
-        .flat_map(|c| c.text.lines().map(ToOwned::to_owned).collect::<Vec<_>>())
+        .flat_map(|c| {
+            c.text
+                .lines()
+                .filter_map(agent_stream::humanize)
+                .collect::<Vec<_>>()
+        })
         .collect();
     all[all.len().saturating_sub(lines)..].to_vec()
 }
@@ -1493,7 +1534,7 @@ fn cmd_logs(
                 })
             })
             .collect();
-        println!("{}", serde_json::json!({ "attempts": items }));
+        outln!("{}", serde_json::json!({ "attempts": items }));
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1508,21 +1549,21 @@ fn cmd_logs(
             .worker
             .as_deref()
             .map_or(String::new(), |w| format!(" via {w}"));
-        println!("── {} [{node}]{via} ──", l.attempt_id);
+        outln!("── {} [{node}]{via} ──", l.attempt_id);
         if full {
             print_captured(&l.stdout, tty);
             print_captured(&l.stderr, tty);
         } else {
             // Default: just the attempt's final message, dimmed.
             match &l.result {
-                Some(text) => println!("{}", grey(text, tty)),
+                Some(text) => outln!("{}", grey(text, tty)),
                 // An attempt still running has no final message *yet*, and saying
                 // "(no final message captured)" over ten lines of live output reads
                 // as "nothing happened". Show its tail instead, and say it is live.
                 None if in_flight.as_deref() == Some(l.attempt_id.as_str()) => {
                     print_tail(&l.stdout, &l.stderr, tail_lines, tty);
                 }
-                None => println!("{}", grey("(no final message captured)", tty)),
+                None => outln!("{}", grey("(no final message captured)", tty)),
             }
         }
         // A `command` node writes every byte into its numbered step dirs and
@@ -1531,7 +1572,7 @@ fn cmd_logs(
         // final message would otherwise render as one blank line); the captured
         // bytes under `--full`, which is the flag that means "all of it".
         for step in &l.steps {
-            println!("   · {}", step.label);
+            outln!("   · {}", step.label);
             if full {
                 print_captured(&step.stdout, tty);
                 print_captured(&step.stderr, tty);
@@ -1545,23 +1586,23 @@ fn cmd_logs(
 /// codex writes everything to stderr and nothing to stdout, so either alone is
 /// silent for one of the two agents.
 fn print_tail(stdout: &str, stderr: &str, lines: usize, tty: bool) {
-    let combined: Vec<&str> = stdout
+    let combined: Vec<String> = stdout
         .lines()
         .chain(stderr.lines())
-        .filter(|l| !l.trim().is_empty())
+        .filter_map(agent_stream::humanize)
         .collect();
     if combined.is_empty() {
-        println!("{}", grey("(running; nothing captured yet)", tty));
+        outln!("{}", grey("(running; nothing captured yet)", tty));
         return;
     }
     let start = combined.len().saturating_sub(lines);
     if start > 0 {
-        println!("{}", grey(&format!("… {start} earlier line(s)"), tty));
+        outln!("{}", grey(&format!("… {start} earlier line(s)"), tty));
     }
     for line in &combined[start..] {
-        println!("{}", grey(line, tty));
+        outln!("{}", grey(line, tty));
     }
-    println!("{}", grey("(still running)", tty));
+    outln!("{}", grey("(still running)", tty));
 }
 
 /// Print one captured stream, dimmed, skipping it when it holds nothing worth a
@@ -1571,9 +1612,9 @@ fn print_captured(text: &str, tty: bool) {
     if text.trim().is_empty() {
         return;
     }
-    print!("{}", grey(text, tty));
+    out!("{}", grey(text, tty));
     if !text.ends_with('\n') {
-        println!();
+        outln!();
     }
 }
 
@@ -1623,11 +1664,11 @@ fn cmd_cancel(run_id: &str, json: bool) -> Result<ExitCode, String> {
             "cancelled": !requested,
             "requested": requested,
         });
-        println!("{v}");
+        outln!("{v}");
     } else if requested {
-        println!("cancel queued for {run_id} (a live driver will stop at its next boundary)");
+        outln!("cancel queued for {run_id} (a live driver will stop at its next boundary)");
     } else {
-        println!("cancelled {run_id}");
+        outln!("cancelled {run_id}");
     }
     Ok(ExitCode::SUCCESS)
 }

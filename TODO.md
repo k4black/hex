@@ -879,8 +879,11 @@ adding surface. (Split out from the old mega "Phase 2"; UX/authoring is Phase 3.
 Make hex pleasant to drive and to author for. All build on the hardened
 Phase-2 kernel; none change kernel semantics.
 
-- [ ] Verbs: `pause`, `capabilities`; `graph --format mermaid|dot` (ascii
-      shipped in Phase 1).
+- [~] Verbs: `pause`, `capabilities`; `graph --format mermaid|dot` (ascii
+      shipped in Phase 1). **`pause` shipped with the control inbox**, and
+      **`graph --format text|json|mermaid|dot` shipped 2026-08-01**
+      (`hex-cli/src/graph_export.rs`; `--json` is an alias for `--format json`).
+      **Remaining:** `capabilities`.
 - [~] Polished CLI UX. **Shipped 2026-07-20 with the `clap` migration:** one
       unified help (bare `hex` renders the same clap help as `--help`, to stderr
       / exit 2), every command + argument documented, a global `--json` flag,
@@ -893,7 +896,8 @@ Phase-2 kernel; none change kernel semantics.
       source spans.
 - [ ] Proper ASCII graph rendering for `hex graph`: a real laid-out diagram
       (boxes + arrows, cycles visible), not today's flat node/edge list; keep
-      `--format ascii|mermaid|dot` so the same IR renders to each.
+      `--format text|json|mermaid|dot` so the same IR renders to each (the
+      mermaid and DOT arms already do, off the same `Topology`).
 - [x] Live agent-output preview during a run (shipped 2026-07-21): a sticky
       footer (ratatui inline viewport) tails the in-flight attempt's stdout and
       stderr (interleaved best-effort — per-stream order exact, cross-stream is

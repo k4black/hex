@@ -576,4 +576,26 @@ sign-off, confirmation.
    nothing, which reads as a hex bug rather than a typo. **Untested end-to-end**:
    no fake worker reports usage, so enforcement is covered by kernel unit tests
    only (TODO.md).
-44. _add new gotchas here as they are discovered_
+44. **A diagram export must survive its renderer's syntax, not just hex's.**
+   `hex graph --format mermaid|dot` (`hex-cli/src/graph_export.rs`) reads the same
+   `Topology` the text renderer does, so the three renderings cannot disagree —
+   but each target has a constraint the IR knows nothing about. Mermaid: node ids
+   are unvalidated YAML map keys, so one can legally be `end` (a keyword that
+   breaks the parser) or hold a dash or a space — every id is emitted as
+   `n_<sanitized>` with the real id kept in the label, and a sanitizing clash
+   takes a numeric suffix rather than silently merging two nodes into one box.
+   Only the **classic** bracket delimiters (`[]`/`[[]]`/`{{}}`/`([])`) are used:
+   GitHub's mermaid lags upstream and the `A@{ shape: … }` form needs 11.3+. A
+   quote in a label is `#quot;`, since mermaid has no backslash escape. DOT: back
+   edges and the `accept.on_unmet` reroute carry **`constraint=false`** — without
+   it graphviz ranks the loop too and the happy-path spine bends around it.
+   **A reroute is not always a back edge**, so both renderers ask `is_reroute()`
+   *before* the edge class: the DFS classifies it `Forward` whenever its target is
+   first discovered through the terminal it leaves (`done → fix`, `fix → implement`),
+   and keying on `EdgeClass::Back` alone drew that reroute as an ordinary forward
+   step. Gate-ness is derived once in `Graph::is_gate`; edge class once in
+   `Topology` — but what a transition *means* still has to be read from the
+   transition, not from where the traversal met it.
+   Escaping is per *line*, before joining: escaping a DOT label's `\n` as data
+   prints a literal backslash instead of breaking the line.
+45. _add new gotchas here as they are discovered_

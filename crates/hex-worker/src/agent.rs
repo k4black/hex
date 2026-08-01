@@ -48,9 +48,12 @@ pub enum ResultCapture {
     /// The worker wrote its final message to the `{result}` file /
     /// `HEX_RESULT_FILE` (e.g. codex `--output-last-message`); read that file.
     File,
-    /// stdout is a single JSON object with `result`/`is_error` (e.g. claude
-    /// `--output-format json`); take `.result`, and fail on `.is_error`.
+    /// stdout is a single JSON object with `result`/`is_error`; take `.result`,
+    /// and fail on `.is_error`.
     JsonResult,
+    /// stdout is JSONL whose last `type == "result"` line carries `result` /
+    /// `is_error` (claude `--output-format stream-json`).
+    JsonlResult,
     /// stdout is JSONL; take the `part.text` of the last `type == "text"` line
     /// (e.g. opencode `run --format json`).
     JsonlLastText,
@@ -252,8 +255,16 @@ impl ClaudeWorker {
             "claude",
             "-p",
             "{prompt}",
+            // Streamed, not buffered. `--output-format json` emits one object at
+            // the very end, so a claude attempt wrote nothing to its log until it
+            // finished and `hex logs --follow` showed "(nothing captured yet)" for
+            // ten minutes. `stream-json` emits each message as it happens and its
+            // final `type: "result"` line carries exactly the same fields, so
+            // result capture and usage accounting are unchanged. `--verbose` is
+            // required to use it with `-p`.
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
             "--permission-mode",
             "acceptEdits",
             "--allowedTools",
@@ -297,7 +308,7 @@ impl Worker for ClaudeWorker {
         run_agent(
             "claude",
             &self.command(request.resume_session.as_deref()),
-            Some(ResultCapture::JsonResult),
+            Some(ResultCapture::JsonlResult),
             Some(UsageSource::ClaudeJson),
             // claude reports its own model per entry, so no hint is needed.
             None,
@@ -550,6 +561,37 @@ fn run_agent(
     }
 }
 
+/// `.result` from a claude result object, failing closed on `.is_error`.
+fn result_field(v: &serde_json::Value) -> Result<Option<String>, String> {
+    if v.get("is_error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        let msg = v
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("agent reported an error");
+        return Err(format!("agent reported an error: {msg}"));
+    }
+    Ok(v.get("result")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned))
+}
+
+/// The last `type == "result"` line of a claude stream.
+///
+/// The last one, not the first match: the stream also carries `system`,
+/// `assistant` and `rate_limit_event` lines, and only the final result object
+/// has the run's totals. A truncated stream (a killed attempt) simply has none.
+fn last_result_line(path: &Path) -> Result<Option<serde_json::Value>, String> {
+    let text = read_capped(path, MAX_STREAM_BYTES)
+        .map_err(|e| format!("cannot read agent output: {e}"))?;
+    Ok(text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .rfind(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("result")))
+}
+
 /// Read what the agent reported about the attempt from its structured output.
 ///
 /// Never fails: usage is an observation, not evidence. If the stream is missing,
@@ -638,10 +680,7 @@ fn codex_report(path: &Path, model_hint: Option<&str>) -> AttemptReport {
 
 /// Parse `claude -p --output-format json`'s single object.
 fn claude_report(path: &Path) -> AttemptReport {
-    let Ok(text) = read_capped(path, MAX_STREAM_BYTES) else {
-        return AttemptReport::default();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+    let Ok(Some(v)) = last_result_line(path) else {
         return AttemptReport::default();
     };
     let mut report = AttemptReport {
@@ -760,6 +799,12 @@ fn capture_result(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("cannot read result file: {e}")),
         },
+        Some(ResultCapture::JsonlResult) => {
+            let Some(v) = last_result_line(&attempt_dir.join("stdout.log"))? else {
+                return Ok(None);
+            };
+            result_field(&v)?
+        }
         Some(ResultCapture::JsonResult) => {
             // A single JSON document must be intact to be meaningful, so read it
             // whole with strict UTF-8 and explicit truncation detection (an
@@ -768,19 +813,7 @@ fn capture_result(
             let out = read_bounded_utf8(&attempt_dir.join("stdout.log"), MAX_STREAM_BYTES)?;
             let v: serde_json::Value = serde_json::from_str(out.trim())
                 .map_err(|e| format!("agent output is not JSON: {e}"))?;
-            if v.get("is_error")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            {
-                let msg = v
-                    .get("result")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("agent reported an error");
-                return Err(format!("agent reported an error: {msg}"));
-            }
-            v.get("result")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
+            result_field(&v)?
         }
         Some(ResultCapture::JsonlLastText) => {
             // Stream to EOF (bounded per line) so the *final* text event is never
@@ -1165,6 +1198,33 @@ mod tests {
         );
     }
 
+    /// The streamed form: the same fields, on the last `result` line of a JSONL
+    /// stream rather than alone in the file. Switching to it is what lets an
+    /// operator watch a claude attempt work instead of staring at an empty log.
+    #[test]
+    fn claude_report_reads_the_result_line_of_a_stream() {
+        let r = claude_report(&fixture("claude-stream-json.jsonl"));
+        assert!(r.session_id.is_some(), "session id from the result line");
+        assert!(r.cost_micro_usd.is_some(), "cost from the result line");
+        assert!(!r.models.is_empty(), "per-model usage from the result line");
+    }
+
+    /// A stream cut off mid-flight (a killed attempt) has no result line, and
+    /// must read as "nothing reported" rather than as an error.
+    #[test]
+    fn a_truncated_claude_stream_reports_nothing() {
+        let dir = temp_dir("claude-torn");
+        let whole = fs::read_to_string(fixture("claude-stream-json.jsonl")).expect("fixture");
+        let torn: String = whole.lines().take(3).collect::<Vec<_>>().join("\n");
+        let path = dir.join("stdout.log");
+        fs::write(&path, torn).expect("write");
+        assert!(claude_report(&path).is_empty());
+        assert_eq!(
+            capture_result(Some(ResultCapture::JsonlResult), &dir, &path).expect("no error"),
+            None
+        );
+    }
+
     #[test]
     fn claude_report_reads_per_model_usage_and_exact_cost() {
         let r = claude_report(&fixture("claude-p-json.json"));
@@ -1498,7 +1558,10 @@ mod tests {
     #[test]
     fn claude_and_opencode_argv_shapes() {
         let c = ClaudeWorker::new(None).command(None).join(" ");
-        assert!(c.contains("claude -p {prompt} --output-format json"), "{c}");
+        assert!(
+            c.contains("claude -p {prompt} --output-format stream-json --verbose"),
+            "streamed so a live attempt is watchable: {c}"
+        );
         let o = OpencodeWorker::new(None).command().join(" ");
         assert!(
             o.contains("opencode run {prompt} --auto --format json"),

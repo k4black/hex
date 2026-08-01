@@ -374,6 +374,8 @@ hex list                 list runnable graphs (project > user > built-in)
 hex doctor               are `hex`, the configured workers and checks usable?
 hex validate <graph>     schema, references, bounded cycles, a reachable success
 hex graph <graph>        render a graph as text
+                         [--format text|json|mermaid|dot] paste it into a
+                         GitHub comment, or pipe it to `dot -Tsvg`
 hex run [<graph>]        start a NEW run (no graph → list what's runnable)
                          [--detach] return a run id immediately
                          [--no-preview] disable the live in-flight pane
@@ -398,8 +400,7 @@ hex emit <event>         worker→runtime, scoped-token control
 parsing output: `0` succeeded · `1` failed · `2` usage error · `3` timed out ·
 `4` budget exhausted · `5` cancelled · `6` paused.
 
-Still unbuilt: `interactive` sessions, stall detection, and
-`graph --format mermaid|dot`.
+Still unbuilt: `interactive` sessions and stall detection.
 
 ### What a run reports when it ends
 

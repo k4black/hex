@@ -1,0 +1,81 @@
+version: 1
+name: implement-review
+description: "Implement a task, prove it green, then have a different model review it — loop until approved"
+example: "add --format mermaid|dot to hex graph"
+
+# hex implementing its own features. The shape the README calls the flagship,
+# with hex's real gate wired in: nothing reaches the reviewer until fmt, clippy
+# and the whole test suite pass, so a review is never spent on a broken tree.
+#
+# Bounded on generation tokens as well as attempts: a review of this repo reads
+# ~5M tokens of context to produce ~20k, so an attempt bound in *total* tokens
+# would be tuned to context size rather than to work done.
+
+defaults:
+  role: implementer
+  budget:
+    attempts: 10
+    elapsed: 90m
+    attempt: 25m
+    output_tokens: 200000
+
+entry: implement
+
+nodes:
+  implement:
+    agent:
+      # Revisited every round, so it keeps what it already worked out rather
+      # than re-deriving the task and the codebase on each attempt.
+      context: continue
+      prompt: |
+        {{prompt}}
+
+        If a reviewer sent this back, address their feedback (empty on the
+        first pass):
+        {{review.result}}
+
+        When the change compiles, is formatted, passes clippy with zero
+        warnings and passes the whole test suite, finish. Do not run
+        `hex emit`; finishing cleanly is the signal.
+    on:
+      done: verify
+
+  verify:
+    command:
+      check: [fmt, clippy, test]
+      mode: parallel
+    on:
+      passed: review
+      failed: implement
+
+  review:
+    agent:
+      role: reviewer
+      # Fresh every round on purpose: a reviewer continuing its own session
+      # carries its earlier verdict forward and talks itself into approving.
+      prompt: |
+        Review the working-tree changes against this task: {{prompt}}
+
+        Run `git status` and `git diff`. fmt, clippy and the full test suite
+        already pass, so do not spend the review on those — look for logic that
+        is wrong, output that does not match the specification in the task, and
+        violations of the invariants in AGENTS.md. Review only; do not edit.
+
+        If the change is correct and complete, run:
+          hex emit approved
+        Otherwise put concrete findings in your final message, most serious
+        first, each naming file:line and a failure scenario. Then run:
+          hex emit changes_requested
+      may_propose: [approved, changes_requested]
+    budget:
+      visits: 3
+    on:
+      approved: done
+      changes_requested: implement
+
+  done:
+    terminal: succeeded
+
+accept:
+  require: [review.approved, verify.passed]
+  on_unmet: implement
