@@ -623,7 +623,10 @@ fn cmd_graph(reference: &str, format: GraphFormat, json: bool) -> Result<ExitCod
     // Source is the one format that must work on a graph that does not compile:
     // you reach for it precisely to fix one.
     if matches!(format, GraphFormat::Source) && !json {
-        out!("{}", runtime.graph_source(reference).map_err(|e| e.to_string())?);
+        out!(
+            "{}",
+            runtime.graph_source(reference).map_err(|e| e.to_string())?
+        );
         return Ok(ExitCode::SUCCESS);
     }
     let graph = runtime.validate(reference).map_err(|e| e.to_string())?;
