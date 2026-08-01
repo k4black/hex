@@ -409,7 +409,7 @@ fixed. **Fix before trusting `on_unmet` or `human` nodes in an unattended run.**
       `hex status` renders the per-node/per-model breakdown — both off the same
       projection, so a third surface would only be somewhere for them to disagree.
       **`watch --follow` landed 2026-07-31** in the live-observability pass below,
-      together with `logs --follow`. Still open: `config show`, `graph --source`.
+      together with `logs --follow`. Still open: `config show`, `graph --format source`.
 
 **(d) Presets & remaining cleanups**
 

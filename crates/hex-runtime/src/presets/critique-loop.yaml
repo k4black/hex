@@ -11,7 +11,7 @@ example: "add retry with exponential backoff to the HTTP client"
 # Deliberately gate-free, so it runs in any repo with no setup. To add real test
 # backpressure, declare a check and copy this graph:
 #
-#   hex graph critique-loop --source > .hex/graphs/critique-loop.yaml
+#   hex graph critique-loop --format source > .hex/graphs/critique-loop.yaml
 #   # .hex/config.yaml:  checks: { test: [pytest, -q] }
 #   # then add:
 #   #   test:

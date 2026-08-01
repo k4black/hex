@@ -946,6 +946,18 @@ impl Runtime {
         Ok(logs)
     }
 
+    /// A graph's YAML exactly as written, resolved through the same
+    /// project > user > built-in layers a run uses.
+    ///
+    /// Deliberately does not compile it: the reason to read a graph's source is
+    /// usually that you are about to change it, or that it failed to compile.
+    ///
+    /// # Errors
+    /// Fails if no graph resolves under `reference`.
+    pub fn graph_source(&self, reference: &str) -> Result<String> {
+        Ok(preset::resolve(reference, &self.root)?.source)
+    }
+
     /// Registry name → the program each entry actually spawns.
     ///
     /// A graph names a *role*; which CLI that lands on comes from config and is

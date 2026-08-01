@@ -10,7 +10,7 @@ example: "refactor the auth module to use middleware"
 # Run it with:  hex run plan-build-review -p "…"
 #
 # Gate-free so it runs anywhere. To gate on your tests, declare
-# `checks: { test: [...] }` and copy this graph (`hex graph … --source`), adding a
+# `checks: { test: [...] }` and copy this graph (`hex graph … --format source`), adding a
 # `command: { check: test }` node between implement and review.
 
 defaults:

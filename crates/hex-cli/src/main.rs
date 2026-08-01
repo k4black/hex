@@ -220,6 +220,9 @@ enum GraphFormat {
     Mermaid,
     /// A graphviz `digraph`, for `dot -Tsvg`.
     Dot,
+    /// The graph's YAML verbatim — the copy-and-customise path two shipped
+    /// presets already tell you to use.
+    Source,
 }
 
 fn main() -> ExitCode {
@@ -617,6 +620,12 @@ fn cmd_validate(reference: &str, json: bool) -> Result<ExitCode, String> {
 
 fn cmd_graph(reference: &str, format: GraphFormat, json: bool) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
+    // Source is the one format that must work on a graph that does not compile:
+    // you reach for it precisely to fix one.
+    if matches!(format, GraphFormat::Source) && !json {
+        out!("{}", runtime.graph_source(reference).map_err(|e| e.to_string())?);
+        return Ok(ExitCode::SUCCESS);
+    }
     let graph = runtime.validate(reference).map_err(|e| e.to_string())?;
     let topo = hex_runtime::Topology::of(&graph);
     // The global `--json` is an alias for `--format json` rather than a conflict:
@@ -627,6 +636,8 @@ fn cmd_graph(reference: &str, format: GraphFormat, json: bool) -> Result<ExitCod
         GraphFormat::Json => outln!("{}", graph_view::to_json(&graph, &topo, reference)),
         GraphFormat::Mermaid => out!("{}", graph_export::to_mermaid(&graph, &topo)),
         GraphFormat::Dot => out!("{}", graph_export::to_dot(&graph, &topo)),
+        // Handled above, before compilation.
+        GraphFormat::Source => unreachable!("source returns before the graph is compiled"),
         GraphFormat::Text => {
             let glyphs = crate::glyphs::Charset::resolve(None).glyphs();
             out!(

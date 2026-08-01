@@ -671,7 +671,7 @@ would catch it are serialized, so **"parallel runs grow the pool" is currently a
 untested claim.**
 
 **Not built** (designed, decided, not yet shipped): stall detection, `hex config
-show`, `graph --source`, `interactive` sessions, `templates:`/`extends:`,
+show`, `graph --format source`, `interactive` sessions, `templates:`/`extends:`,
 capability matching beyond the `context: continue` check, and the MCP client.
 The followers poll at 400ms rather than watching the filesystem, and there is no
 `hex logs --json --follow` (streaming NDJSON) yet. `hex-mcp` / `hex-dashboard` are

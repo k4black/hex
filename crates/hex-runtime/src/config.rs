@@ -49,7 +49,12 @@ pub struct Config {
 /// output parsing, and permission policy — config only overrides its `model`.
 /// The default `command` kind is the generic escape hatch: an explicit argv
 /// template (`{prompt}`/`{result}` tokens) plus how to capture its result.
+// `deny_unknown_fields` like `Config` and `RoleSpec`: without it a typo such as
+// `argv:` for `command:` parsed cleanly, `hex doctor` called the worker "ok",
+// and the mistake only surfaced as a failed first attempt reading
+// "worker `x` has an empty command".
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerSpec {
     /// Which adapter drives this worker.
     #[serde(default)]
