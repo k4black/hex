@@ -76,6 +76,7 @@ mod tests {
             deadline_ms: None,
             read_only: false,
             extra_writable_dir: None,
+            resume_session: None,
         }
     }
 

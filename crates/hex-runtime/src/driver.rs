@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use std::collections::BTreeMap;
 
-use hex_kernel::graph::{CommandMode, CommandStep, NodeKind, NodeSpec};
+use hex_kernel::graph::{CommandMode, CommandStep, Context, NodeKind, NodeSpec};
 use hex_kernel::validate::DONE_SIGNAL;
 use hex_kernel::{Effect, Graph, RunState, Status, reduce, schedule};
 use hex_proto::{Actor, Command, Disposition, EventBody};
@@ -478,7 +478,7 @@ impl<'a> Session<'a> {
             prompt,
             may_propose,
             read_only,
-            ..
+            context,
         } = &node.spec
         else {
             return self.fail_attempt(
@@ -490,6 +490,24 @@ impl<'a> Session<'a> {
         };
         let worker_name = worker.clone();
         let read_only = *read_only;
+        // `context: continue` resumes *this node's* last session. `None` on the
+        // first visit, and after a crash it comes from the journal like everything
+        // else, so a resumed run continues the conversation rather than restarting
+        // it. A node whose worker never reported a session id simply runs fresh.
+        // A role's worker is resolved from *live* config every time the graph is
+        // compiled, so a `hex resume` after an edit to `roles.<name>.worker` can
+        // land on a different adapter than the one that opened the session. Only
+        // resume a handle its own worker recorded — otherwise run fresh, rather
+        // than handing a codex thread id to `claude --resume`.
+        let resume_session = match context {
+            Context::Continue => self
+                .state
+                .sessions
+                .get(node_id)
+                .filter(|h| h.worker == worker_name)
+                .map(|h| h.id.clone()),
+            Context::Fresh => None,
+        };
         // Capture before `record` (its `&mut self`) ends the `node` borrow.
         let kind = node.spec.kind();
         // One pass over the author template resolves both `{{prompt}}` (operator
@@ -569,15 +587,36 @@ impl<'a> Session<'a> {
             // The control channel lives under run_dir (main `.hex`), outside the
             // worktree workspace — a path-sandboxed worker must keep it writable.
             extra_writable_dir: self.worktree.as_ref().map(|_| self.run_dir.clone()),
+            resume_session,
         };
         let WorkOutcome {
             signal,
             result,
             error,
             timed_out,
+            report,
         } = adapter.run(&request);
 
-        // Record the captured result first (correlated to the in-flight attempt),
+        // What the agent spent goes down first, because everything after this can
+        // end the attempt: a report written after the routing signal would no
+        // longer correlate to an in-flight attempt and would be dropped. It is
+        // recorded on failure paths too — an attempt that burned tokens and then
+        // timed out is the one whose cost matters most.
+        if let Some(report) = report {
+            self.record(
+                Some(node_id),
+                Some(attempt_id),
+                Actor::agent(worker_name.clone()),
+                EventBody::AttemptReported {
+                    session_id: report.session_id,
+                    models: report.models,
+                    cost_micro_usd: report.cost_micro_usd,
+                    duration_ms: report.duration_ms,
+                },
+            )?;
+        }
+
+        // Record the captured result next (correlated to the in-flight attempt),
         // so it's in the projection before the routing signal fires.
         if let Some(text) = result {
             self.record(
@@ -743,6 +782,17 @@ impl<'a> Session<'a> {
                 reason: reason.to_owned(),
                 disposition,
             },
+        )?;
+        // `AttemptFailed` already carries the disposition, so this is redundant
+        // as a *fact* — it is here so every run ends with the same event whatever
+        // path it took. Before it, a timed-out run's journal simply stopped, and
+        // anything tailing for `run_finished` never saw the run end.
+        // `check_journal` requires the two to agree.
+        self.record(
+            None,
+            None,
+            Actor::runtime(),
+            EventBody::RunFinished { disposition },
         )
     }
 
@@ -924,7 +974,17 @@ fn run_process(
         .spawn()
         .map_err(|e| ProcFail::infra(format!("spawn command failed: {e}")))?;
     match hex_worker::wait_bounded(&mut child, deadline_ms) {
-        Ok(Some(status)) => Ok(status.success()),
+        Ok(Some(status)) => {
+            // Record the status beside the step's logs. Nothing else remembers
+            // it — the journal keeps the *attempt's* verdict and the names of the
+            // failed steps, so without this a reader of one step directory cannot
+            // tell whether that step is the one that failed.
+            let code = status
+                .code()
+                .map_or_else(|| "signal".to_owned(), |c| c.to_string());
+            let _ = std::fs::write(attempt_dir.join("exit"), code);
+            Ok(status.success())
+        }
         Ok(None) => Err(ProcFail {
             timed_out: true,
             reason: "command exceeded its time budget (killed)".to_owned(),
@@ -1038,22 +1098,128 @@ pub fn graph_hash(source: &str) -> String {
     out
 }
 
-/// Ensure every agent node references a worker present in the registry.
+/// Ensure every agent node references a worker present in the registry, and that
+/// a node asking to continue a session is bound to a worker that can.
+///
+/// The capability half lives here rather than in the kernel validator because
+/// only the runtime knows the registry — the kernel must never see a worker
+/// adapter (core rule 1). It runs at compile time, so an unsupported policy is
+/// refused before the run starts instead of quietly degrading to a fresh session
+/// on every round, which is exactly the cost `context: continue` exists to avoid.
 ///
 /// # Errors
-/// Returns the first missing worker reference.
+/// Returns the first missing worker reference, or the first node whose worker
+/// cannot resume a session.
 pub fn check_workers(graph: &Graph, workers: &Workers) -> Result<()> {
     for node in graph.nodes.values() {
-        if let NodeSpec::Agent { worker, .. } = &node.spec
-            && workers.get(worker).is_none()
+        if let NodeSpec::Agent {
+            worker, context, ..
+        } = &node.spec
         {
-            return Err(HexError::new(format!(
-                "node `{}` references unknown worker `{worker}`",
-                node.id
-            )));
+            let Some(adapter) = workers.get(worker) else {
+                return Err(HexError::new(format!(
+                    "node `{}` references unknown worker `{worker}`",
+                    node.id
+                )));
+            };
+            if *context == Context::Continue
+                && !adapter
+                    .capabilities()
+                    .supports(hex_proto::Capability::SessionResume)
+            {
+                return Err(HexError::new(format!(
+                    "node `{}` asks for `context: continue`, but worker `{worker}` cannot resume a \
+                     session — use `context: fresh`, or bind the node to a role backed by codex or \
+                     claude",
+                    node.id
+                )));
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod check_workers_tests {
+    use super::check_workers;
+    use crate::workers::Workers;
+    use hex_kernel::graph::{Context, Graph, Node, NodeSpec};
+    use hex_proto::Disposition;
+    use hex_worker::{CodexWorker, CommandWorker};
+
+    /// One agent node, with the context policy under test.
+    fn graph(context: Context) -> Graph {
+        let mut g = Graph::builder("t", "a")
+            .agent("a", "w", "p", &["go"])
+            .terminal("fin", Disposition::Succeeded)
+            .edge("a", "go", "fin")
+            .build();
+        let NodeSpec::Agent {
+            worker,
+            prompt,
+            may_propose,
+            read_only,
+            ..
+        } = g.nodes["a"].spec.clone()
+        else {
+            unreachable!("built as an agent")
+        };
+        g.nodes.insert(
+            "a".to_owned(),
+            Node::new(
+                "a",
+                NodeSpec::Agent {
+                    worker,
+                    prompt,
+                    may_propose,
+                    read_only,
+                    context,
+                },
+            ),
+        );
+        g
+    }
+
+    fn registry(worker: Box<dyn hex_worker::Worker>) -> Workers {
+        let mut w = Workers::default();
+        w.insert("w".to_owned(), worker);
+        w
+    }
+
+    /// Refused at compile time rather than degrading to a fresh session every
+    /// round — a silent degrade would cost exactly what `continue` is for.
+    #[test]
+    fn continue_on_a_worker_that_cannot_resume_is_refused() {
+        let err = check_workers(
+            &graph(Context::Continue),
+            &registry(Box::new(CommandWorker::new("w", vec!["true".to_owned()]))),
+        )
+        .expect_err("refused");
+        assert!(err.to_string().contains("cannot resume a session"), "{err}");
+    }
+
+    #[test]
+    fn continue_on_a_resumable_worker_is_accepted() {
+        assert!(
+            check_workers(
+                &graph(Context::Continue),
+                &registry(Box::new(CodexWorker::default()))
+            )
+            .is_ok()
+        );
+    }
+
+    /// The default policy asks nothing of the worker.
+    #[test]
+    fn fresh_is_accepted_on_any_worker() {
+        assert!(
+            check_workers(
+                &graph(Context::Fresh),
+                &registry(Box::new(CommandWorker::new("w", vec!["true".to_owned()])))
+            )
+            .is_ok()
+        );
+    }
 }
 
 #[cfg(test)]

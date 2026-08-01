@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use hex_proto::Capability;
+use hex_proto::{Capability, ModelUsage};
 
 pub mod agent;
 pub mod mock;
@@ -54,6 +54,42 @@ pub struct WorkRequest {
     /// Only path-sandboxed workers (codex) act on it. This is a stopgap for the
     /// absent non-workspace control transport (a socket/MCP hook would retire it).
     pub extra_writable_dir: Option<PathBuf>,
+    /// The agent session to continue, for a node declaring `context: continue`.
+    /// `None` runs a fresh session — the default, and always the case on a
+    /// node's first visit. Only a worker declaring
+    /// [`hex_proto::Capability::SessionResume`] ever receives one.
+    pub resume_session: Option<String>,
+}
+
+/// What the agent itself reported about an attempt: its session handle and what
+/// it spent. Parsed from the agent's own structured output, so hex never
+/// estimates — an agent that reports no money yields `cost_micro_usd: None`
+/// rather than a guess.
+///
+/// The runtime journals this as `EventBody::AttemptReported`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AttemptReport {
+    /// The agent's session id, where it exposes one — the resume handle for a
+    /// node declaring `context: continue`.
+    pub session_id: Option<String>,
+    /// Per-model usage; a list because one claude attempt bills several models.
+    pub models: Vec<ModelUsage>,
+    /// Attempt total in micro-USD, when the agent reports money.
+    pub cost_micro_usd: Option<u64>,
+    /// Wall time the agent reported.
+    pub duration_ms: Option<u64>,
+}
+
+impl AttemptReport {
+    /// Whether the agent reported anything worth journaling. A report with no
+    /// session and no usage is silence, and silence should not become an event.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.session_id.is_none()
+            && self.models.is_empty()
+            && self.cost_micro_usd.is_none()
+            && self.duration_ms.is_none()
+    }
 }
 
 /// What a worker reports after one attempt. On success `signal` is the routing
@@ -72,6 +108,10 @@ pub struct WorkOutcome {
     /// Whether the failure was specifically a per-attempt timeout, so the
     /// runtime can record the `TimedOut` disposition rather than plain `Failed`.
     pub timed_out: bool,
+    /// What the agent reported about this attempt — present on **every**
+    /// outcome, including a timeout. An attempt that spent tokens and then died
+    /// is precisely the one whose cost you need to see.
+    pub report: Option<AttemptReport>,
 }
 
 impl WorkOutcome {
@@ -107,6 +147,13 @@ impl WorkOutcome {
     #[must_use]
     pub fn with_result(mut self, result: Option<String>) -> Self {
         self.result = result;
+        self
+    }
+
+    /// Attach what the agent reported, dropping a report that says nothing.
+    #[must_use]
+    pub fn with_report(mut self, report: Option<AttemptReport>) -> Self {
+        self.report = report.filter(|r| !r.is_empty());
         self
     }
 }

@@ -219,6 +219,30 @@ time rather than silently running unsandboxed or breaking the emit channel.
   idempotence.
 - Regression: the four pre-change journals in `.hex/runs/` still read.
 
+## As built — where it differed from this design
+
+Four deviations, all found during implementation:
+
+1. **Money is `cost_micro_usd: Option<u64>`, not `f64`.** `Event`/`EventBody`
+   derive `Eq`, which a float breaks, and stripping `Eq` would ripple through the
+   kernel and its tests. Integer micro-USD is also simply correct for an
+   append-only journal: a float cost can come back a different number.
+2. **codex has no `token_count` event.** The real shape is one
+   `turn.completed.usage` per exec, and the JSONL carries **no model name and no
+   cost** — only `thread.started.thread_id`. Confirmed against a tool-calling run
+   too. The design's guessed event name would have produced a parser that passed
+   its tests and reported nothing; the captured fixture is what caught it.
+3. **`codex exec resume` needed no refusal.** The design planned to refuse
+   `context: continue` together with `--worktree` if the writable-roots config key
+   could not be verified. Both `sandbox_mode` and
+   `sandbox_workspace_write.writable_roots` were confirmed against the CLI via
+   `--strict-config`, which rejects an unknown field before contacting the model,
+   so the combination is supported and the refusal was dropped.
+4. **`StepLog.exit` is a recorded string, not a typed status.** Nothing recorded a
+   per-step exit status at all, so the driver now writes one to an `exit` file
+   beside each step's logs (`"0"`, `"101"`, `"signal"`). Typing it would mean a
+   typed journal record for something only a human reads.
+
 ## Consequences for the audit's kill list
 
 `context: continue` gives the capability manifest a real consumer, so

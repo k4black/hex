@@ -26,6 +26,9 @@ entry: spec
 nodes:
   spec:
     agent:
+      # Revisited when `red` shows the new test did NOT fail, so continuing the
+      # session lets it see what it already wrote instead of starting over.
+      context: continue
       prompt: |
         Write a failing test that captures this task, before any implementation.
 
@@ -49,6 +52,12 @@ nodes:
 
   implement:
     agent:
+      # Revisited each round (the gate sends it back), so it continues its own
+      # agent session rather than re-deriving the task and the codebase every
+      # attempt. Needs a worker that can resume — codex and claude can; rebinding
+      # the role to a `kind: command` worker makes the run refuse at compile time
+      # naming this node, and `context: fresh` is the fix there.
+      context: continue
       prompt: |
         Make the failing test pass with the smallest change.
 

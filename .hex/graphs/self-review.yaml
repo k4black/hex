@@ -43,6 +43,13 @@ nodes:
 
   review:
     agent:
+      # A second visit continues the first's session rather than re-reading a
+      # 5k-line diff cold — that cold re-read is what made a 15m attempt bound
+      # too tight here (see the budget note above). Note this graph does not
+      # currently *reach* a second visit: `changes_requested` routes straight to
+      # the failed terminal, so this only takes effect via `accept.on_unmet`
+      # coming back through `verify`, or if the topology grows an implementer.
+      context: continue
       prompt: |
         Review the current working-tree changes in this repository.
 

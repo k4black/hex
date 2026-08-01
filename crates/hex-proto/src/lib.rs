@@ -253,6 +253,32 @@ pub enum EventBody {
         /// The captured result text (treated as untrusted data downstream).
         text: String,
     },
+    /// What the worker reported about a finished attempt: the agent's own
+    /// accounting, never ours. Recorded before the attempt's terminal event
+    /// (routing signal or [`EventBody::AttemptFailed`]), so it correlates to the
+    /// attempt still in flight.
+    ///
+    /// Written on *every* outcome, including a timeout — an attempt that spent
+    /// tokens and then died is exactly the one whose cost you need.
+    AttemptReported {
+        /// The agent session this attempt ran, when the agent exposes one. The
+        /// resume handle for a node declaring `context: continue`; taken from
+        /// the journal, so it survives a crash.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Per-model usage. A list rather than one model per event because a
+        /// single claude attempt genuinely bills several models (its
+        /// `modelUsage` map); codex yields one entry.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        models: Vec<ModelUsage>,
+        /// Attempt total in micro-USD, when the agent reports money at all
+        /// (claude does; codex reports tokens only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_micro_usd: Option<u64>,
+        /// Wall time the agent itself reported, where it does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
     /// An attempt failed to execute (worker crashed, timed out, emitted nothing
     /// valid). This is a *terminal* event: it carries the run's resulting
     /// disposition so a failure is one atomic durable fact — there is no window
@@ -276,6 +302,46 @@ pub enum EventBody {
         /// The note text.
         text: String,
     },
+}
+
+/// One model's share of an attempt's usage, as the agent reported it.
+///
+/// Money is integer **micro-USD**, not `f64`: an [`Event`] is `Eq` (the journal
+/// compares and deduplicates facts), floats are not, and a currency amount that
+/// round-trips through JSON as a float is a fact that can change value on
+/// replay. `0.1778 USD` is `177_800`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    /// Model identifier the agent reported, else the role's configured model,
+    /// else the worker kind — never empty, because it is an aggregation key.
+    pub model: String,
+    /// Fresh (uncached) input tokens.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Generated tokens.
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Input tokens served from cache.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Input tokens written to cache.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    /// Reasoning tokens, where the agent separates them (codex does; claude
+    /// folds them into `output_tokens`).
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// This model's cost in micro-USD, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micro_usd: Option<u64>,
+}
+
+impl ModelUsage {
+    /// Every token this model consumed, however the agent classified it.
+    #[must_use]
+    pub fn tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
 }
 
 /// An operator command issued over the shared control protocol. A human at a
@@ -427,6 +493,50 @@ mod tests {
             json.contains("\"kind\":\"human\""),
             "actor recorded: {json}"
         );
+        let back: Event = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, ev);
+    }
+
+    /// Usage is journaled, so its wire shape is a compatibility surface — and a
+    /// cost recorded as a float could come back a different number. Micro-USD
+    /// keeps the fact exact and the event `Eq`.
+    #[test]
+    fn attempt_report_roundtrips_with_exact_money() {
+        let ev = event(EventBody::AttemptReported {
+            session_id: Some("cf95788d".to_owned()),
+            models: vec![ModelUsage {
+                model: "claude-opus-5".to_owned(),
+                input_tokens: 2,
+                output_tokens: 4,
+                cache_read_tokens: 0,
+                cache_write_tokens: 17_769,
+                reasoning_tokens: 0,
+                cost_micro_usd: Some(177_800),
+            }],
+            cost_micro_usd: Some(177_800),
+            duration_ms: Some(2611),
+        });
+        let json = serde_json::to_string(&ev).expect("serializes");
+        assert!(json.contains("\"kind\":\"attempt_reported\""), "{json}");
+        assert!(json.contains("\"cost_micro_usd\":177800"), "{json}");
+        let back: Event = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, ev, "exact after a round trip");
+    }
+
+    /// A token-only agent (codex reports no money) must not be forced to invent
+    /// a cost, and an older journal without the field must still read.
+    #[test]
+    fn attempt_report_omits_absent_cost_and_session() {
+        let ev = event(EventBody::AttemptReported {
+            session_id: None,
+            models: vec![],
+            cost_micro_usd: None,
+            duration_ms: None,
+        });
+        let json = serde_json::to_string(&ev).expect("serializes");
+        assert!(!json.contains("cost_micro_usd"), "{json}");
+        assert!(!json.contains("session_id"), "{json}");
+        assert!(!json.contains("models"), "{json}");
         let back: Event = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back, ev);
     }

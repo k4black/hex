@@ -125,6 +125,39 @@ impl Inbox {
         }
     }
 
+    /// Commands sitting in the inbox that no driver has claimed yet, in arrival
+    /// order. **Read-only** — nothing is moved to `done/`, so this cannot consume a
+    /// command the way [`claim_next`](Self::claim_next) does.
+    ///
+    /// This is the difference between "queued" and "pending": a `steer` lives here
+    /// until the driver reaches an attempt boundary, and only then becomes a
+    /// journaled `Steered` that the projection knows about. Without a read of this
+    /// directory, `hex status` could not tell an operator whether the steer they
+    /// just sent had been picked up or was simply lost.
+    ///
+    /// # Errors
+    /// Fails if the inbox directory cannot be read.
+    pub fn queued(&self) -> Result<Vec<Envelope>> {
+        let queue = self.queue();
+        let entries = match std::fs::read_dir(&queue) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".json"))
+            .collect();
+        // Names are millis-first, so lexical order is arrival order.
+        names.sort_unstable();
+        Ok(names
+            .iter()
+            .filter_map(|n| std::fs::read_to_string(queue.join(n)).ok())
+            .filter_map(|raw| serde_json::from_str::<Envelope>(&raw).ok())
+            .collect())
+    }
+
     /// The lexicographically first queued file name — arrival order, since names
     /// are millis-first.
     fn oldest_queued(&self) -> Result<Option<String>> {
@@ -342,6 +375,46 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
+    }
+
+    /// `queued` is what lets `hex status` distinguish "sent, nobody has looked at
+    /// it" from "lost". It must be strictly read-only: if it consumed anything, an
+    /// operator checking on a steer would delete it.
+    #[test]
+    fn queued_lists_unclaimed_commands_in_order_without_consuming_them() {
+        let dir = temp_run_dir("queued");
+        let inbox = Inbox::new(&dir);
+        assert!(
+            inbox
+                .queued()
+                .expect("empty inbox is not an error")
+                .is_empty()
+        );
+        for text in ["first", "second"] {
+            inbox
+                .send(
+                    &Actor::human("kc"),
+                    &Command::Steer {
+                        text: text.to_owned(),
+                    },
+                )
+                .expect("send");
+        }
+        let names: Vec<String> = inbox
+            .queued()
+            .expect("queued")
+            .into_iter()
+            .map(|e| match e.command {
+                Command::Steer { text } => text,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["first", "second"], "arrival order");
+        // Twice, to prove the read did not move anything into `done/`.
+        assert_eq!(inbox.queued().expect("queued").len(), 2);
+        // And the driver can still claim them afterwards.
+        assert!(inbox.claim_next().expect("claim").is_some());
+        assert_eq!(inbox.queued().expect("queued").len(), 1);
     }
 
     #[test]

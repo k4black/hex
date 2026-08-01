@@ -56,6 +56,28 @@ accept: { require: [] }
 "#,
     )
     .expect("prompt graph");
+    // A graph whose gate runs two steps, each writing to both streams — the only
+    // shape that exercises the numbered per-step capture dirs.
+    std::fs::write(
+        p.join(".hex").join("graphs").join("stepdemo.yaml"),
+        r#"
+version: 1
+name: stepdemo
+entry: build
+defaults: { budget: { attempts: 4 } }
+nodes:
+  build: { agent: { worker: builder, prompt: "x", may_propose: [ready] }, on: { ready: verify } }
+  verify:
+    command:
+      run:
+        - [sh, -c, "echo STEP-ONE-OUT; echo STEP-ONE-ERR >&2"]
+        - [sh, -c, "echo STEP-TWO-OUT"]
+    on: { passed: done, failed: build }
+  done:  { terminal: succeeded }
+accept: { require: [verify.passed] }
+"#,
+    )
+    .expect("step graph");
     // A graph slow enough to still be running when `--detach` returns.
     std::fs::write(
         p.join(".hex").join("graphs").join("slowdemo.yaml"),
@@ -295,6 +317,342 @@ fn logs_show_final_message_by_default_and_full_output_with_flag() {
     let only = hex(dir.path(), &["logs", run_id, "--node", "build"]);
     assert!(stdout(&only).contains("FINAL-SUMMARY"));
     assert!(!stdout(&only).contains("[test]"), "filtered to build only");
+}
+
+/// `hex logs --full > out.txt` used to capture almost nothing: the captured
+/// stderr went through `eprint!` and straight back out of the pipe. It is the
+/// *requested data* of this verb, so it belongs on stdout.
+#[test]
+fn logs_full_puts_the_captured_stderr_on_stdout() {
+    let dir = project();
+    std::fs::write(
+        dir.path().join(".hex").join("config.yaml"),
+        "workers:\n  builder:\n    command: [sh, -c, 'echo HELLO-FROM-AGENT; echo AGENT-DIAGNOSTIC >&2; printf ready > \"$HEX_EMIT_FILE\"']\n",
+    )
+    .expect("config");
+    let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
+
+    let full = hex(dir.path(), &["logs", &run_id, "--node", "build", "--full"]);
+    assert!(full.status.success(), "stderr: {}", stderr(&full));
+    let out = stdout(&full);
+    assert!(out.contains("HELLO-FROM-AGENT"), "captured stdout: {out}");
+    assert!(out.contains("AGENT-DIAGNOSTIC"), "captured stderr: {out}");
+    assert!(
+        !stderr(&full).contains("AGENT-DIAGNOSTIC"),
+        "nothing requested may leak to stderr: {}",
+        stderr(&full)
+    );
+}
+
+/// A `command` node writes every byte into `attempts/<id>/<n>-<label>/`, so
+/// before `AttemptLog::steps` a failing check's output was on disk and reachable
+/// from no CLI surface at all.
+#[test]
+fn logs_reach_command_step_output() {
+    let dir = project();
+    let run_id = run_id_of(&hex(dir.path(), &["run", "stepdemo", "--json"]));
+
+    let full = hex(dir.path(), &["logs", &run_id, "--node", "verify", "--full"]);
+    assert!(full.status.success(), "stderr: {}", stderr(&full));
+    let out = stdout(&full);
+    for marker in ["STEP-ONE-OUT", "STEP-ONE-ERR", "STEP-TWO-OUT"] {
+        assert!(out.contains(marker), "{marker} shown by --full: {out}");
+    }
+    // Declared order, not finish order and not lexical order.
+    assert!(
+        out.find("STEP-ONE-OUT") < out.find("STEP-TWO-OUT"),
+        "steps read in declared order: {out}"
+    );
+
+    let json = hex(dir.path(), &["logs", &run_id, "--node", "verify", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(stdout(&json).trim()).expect("logs json");
+    let steps = v["attempts"][0]["steps"].as_array().expect("steps array");
+    assert_eq!(steps.len(), 2, "one entry per declared step: {v}");
+    assert_eq!(steps[0]["label"], "1-sh");
+    assert!(
+        steps[0]["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("STEP-ONE-ERR"),
+        "each stream is kept apart: {v}"
+    );
+}
+
+/// `hex status` must say what the run spent. No fake shell "agent" reports usage,
+/// and the journal is the authority — so the stimulus is the very event a real
+/// worker writes, appended to a real run's journal.
+#[test]
+fn status_reports_what_the_run_spent() {
+    let dir = project();
+    let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
+    inject_usage(dir.path(), &run_id);
+
+    let out = hex(dir.path(), &["status", &run_id]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let s = stdout(&out);
+    assert!(s.contains("NODE"), "a per-node table: {s}");
+    assert!(s.contains("build"), "the node that spent it: {s}");
+    assert!(s.contains("test-model"), "a per-model row: {s}");
+    assert!(s.contains("total"), "a total row: {s}");
+    // 1000 + 200 tokens, $0.123456 — money is exact micro-USD, shown to 4 places.
+    assert!(s.contains("1200"), "tokens summed: {s}");
+    assert!(s.contains("$0.1234"), "cost rendered: {s}");
+
+    let json = hex(dir.path(), &["status", &run_id, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(stdout(&json).trim()).expect("status json");
+    assert_eq!(v["usage"]["total"]["tokens"], 1200);
+    assert_eq!(v["usage"]["total"]["cost_micro_usd"], 123_456);
+    assert_eq!(v["usage"]["by_node"]["build"]["attempts"], 1);
+    assert_eq!(v["usage"]["by_model"]["test-model"]["output_tokens"], 200);
+}
+
+/// A run nothing reported usage for must not grow a table of zeroes: that reads
+/// like a run that was free rather than one that never said.
+#[test]
+fn status_omits_the_usage_table_when_nothing_reported_any() {
+    let dir = project();
+    let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
+
+    let out = hex(dir.path(), &["status", &run_id]);
+    assert!(!stdout(&out).contains("TOKENS"), "{}", stdout(&out));
+
+    let json = hex(dir.path(), &["status", &run_id, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(stdout(&json).trim()).expect("status json");
+    // `--json` keeps the shape regardless, so a consumer never branches on absence.
+    assert_eq!(v["usage"]["total"]["tokens"], 0);
+    assert!(v["usage"]["by_node"].as_object().unwrap().is_empty(), "{v}");
+}
+
+/// Splice in the `AttemptReported` a usage-reporting worker writes, correlated to
+/// the `build` attempt — the kernel accepts it only while that attempt is in
+/// flight, so it goes directly after its `attempt_started`. `seq` is contiguous
+/// per run, so every following event is renumbered.
+fn inject_usage(dir: &Path, run_id: &str) {
+    let path = dir
+        .join(".hex")
+        .join("runs")
+        .join(run_id)
+        .join("events.jsonl");
+    let journal = std::fs::read_to_string(&path).expect("journal");
+    let mut events: Vec<serde_json::Value> = journal
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("journal line"))
+        .collect();
+    let at = events
+        .iter()
+        .position(|e| e["kind"] == "attempt_started" && e["node_id"] == "build")
+        .expect("the build attempt is in the journal");
+    events.insert(
+        at + 1,
+        serde_json::json!({
+            "schema_version": 1,
+            "seq": 0,
+            "at_ms": events[at]["at_ms"],
+            "run_id": run_id,
+            "node_id": "build",
+            "attempt_id": events[at]["attempt_id"],
+            "actor": { "kind": "agent", "id": "builder" },
+            "kind": "attempt_reported",
+            "models": [{
+                "model": "test-model",
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0,
+                "cost_micro_usd": 123_456,
+            }],
+            "cost_micro_usd": 123_456,
+        }),
+    );
+    let mut out = String::new();
+    for (seq, mut event) in events.into_iter().enumerate() {
+        event["seq"] = seq.into();
+        out.push_str(&event.to_string());
+        out.push('\n');
+    }
+    std::fs::write(&path, out).expect("rewrite journal");
+}
+
+/// `hex init` is the first command run in a new repo, so it must be safe to run
+/// twice — and must not silently glue its `.gitignore` entry onto a last line that
+/// had no terminator, which ignores both patterns.
+#[test]
+fn init_sets_up_a_bare_repo_and_is_idempotent() {
+    let root = TempDir::new().expect("tempdir");
+    let p = root.path();
+    std::fs::write(p.join(".gitignore"), "target/").expect("gitignore");
+
+    let first = hex(p, &["init", "--json"]);
+    assert!(first.status.success(), "stderr: {}", stderr(&first));
+    let v: serde_json::Value = serde_json::from_str(stdout(&first).trim()).expect("init json");
+    let created: Vec<&str> = v["created"]
+        .as_array()
+        .expect("created array")
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        created,
+        [
+            ".hex/",
+            ".hex/graphs/",
+            ".hex/config.yaml",
+            ".gitignore:.hex/runs/",
+            ".gitignore:.hex/worktrees/",
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join(".gitignore")).expect("gitignore"),
+        "target/\n.hex/runs/\n.hex/worktrees/\n"
+    );
+
+    // What "green" means is the operator's call, so the checks map ships empty
+    // with its examples commented out — never autodetected.
+    let config = std::fs::read_to_string(p.join(".hex").join("config.yaml")).expect("config");
+    assert!(config.contains("checks: {}"), "{config}");
+    assert!(config.contains("#     test: [cargo, test"), "{config}");
+
+    let second = hex(p, &["init", "--json"]);
+    assert!(second.status.success(), "stderr: {}", stderr(&second));
+    let v: serde_json::Value = serde_json::from_str(stdout(&second).trim()).expect("init json");
+    assert!(
+        v["created"].as_array().unwrap().is_empty(),
+        "the second run creates nothing: {v}"
+    );
+    assert_eq!(v["existed"].as_array().unwrap().len(), 5, "{v}");
+    assert_eq!(
+        std::fs::read_to_string(p.join(".gitignore")).expect("gitignore"),
+        "target/\n.hex/runs/\n.hex/worktrees/\n",
+        "no duplicated entries"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join(".hex").join("config.yaml")).expect("config"),
+        config
+    );
+}
+
+/// The one file `init` must never touch: an operator's checks and role overrides
+/// are exactly what a re-run would lose.
+#[test]
+fn init_never_overwrites_an_existing_config() {
+    let dir = project();
+    let path = dir.path().join(".hex").join("config.yaml");
+    let before = std::fs::read_to_string(&path).expect("config");
+
+    let out = hex(dir.path(), &["init"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("exists   .hex/config.yaml"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("config"), before);
+}
+
+/// `--follow` must *end* when the run does. A follower that hangs on a finished
+/// run is worse than no follower, because it looks like the run is still going.
+#[test]
+fn follow_returns_immediately_on_an_already_finished_run() {
+    let dir = project();
+    let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
+
+    for verb in [
+        vec!["logs", &run_id, "--follow"],
+        vec!["watch", &run_id, "--follow"],
+    ] {
+        let out = hex(dir.path(), &verb);
+        assert!(out.status.success(), "{verb:?}: {}", stderr(&out));
+        assert!(
+            stdout(&out).contains("succeeded"),
+            "{verb:?} closes by saying how the run ended: {}",
+            stdout(&out)
+        );
+    }
+}
+
+/// The live fields exist on a finished run too, as empty/absent rather than
+/// missing keys — a machine consumer polling a run should not have to special-case
+/// the shape by lifecycle stage.
+#[test]
+fn status_json_carries_the_live_fields() {
+    let dir = project();
+    let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
+
+    let out = hex(dir.path(), &["status", &run_id, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("json");
+    assert!(v["in_flight"].is_null(), "nothing runs on a finished run");
+    assert_eq!(v["queued"].as_array().expect("queued").len(), 0);
+    assert_eq!(v["pending_steer"].as_array().expect("steer").len(), 0);
+    assert!(v["waiting_for_human"].is_null());
+}
+
+/// A `.gitignore` hex cannot *read* must never be replaced by one it writes.
+/// Mapping every read failure to "empty" truncated a real file to two lines —
+/// found by hex reviewing this change.
+#[test]
+fn init_preserves_a_gitignore_it_cannot_read_as_utf8() {
+    let dir = project();
+    let path = dir.path().join(".gitignore");
+    // A latin-1 comment: valid in a .gitignore, not valid UTF-8.
+    let original: Vec<u8> = b"# caf\xe9 build output\ntarget/\n".to_vec();
+    std::fs::write(&path, &original).expect("write");
+
+    let out = hex(dir.path(), &["init"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    let after = std::fs::read(&path).expect("gitignore");
+    assert!(
+        after.starts_with(&original),
+        "the original bytes survive verbatim: {after:?}"
+    );
+    let tail = String::from_utf8_lossy(&after);
+    assert!(tail.contains(".hex/runs/"), "{tail}");
+    assert!(tail.contains(".hex/worktrees/"), "{tail}");
+}
+
+/// The agent's `hex emit` channel is a plain PATH lookup in the agent's own
+/// shell, so `hex` missing from PATH is a real defect — reported like any missing
+/// worker, not as a note.
+#[test]
+fn doctor_probes_hex_itself() {
+    let dir = project();
+    let bin = assert_cmd::cargo::cargo_bin("hex");
+
+    let without = Command::cargo_bin("hex")
+        .expect("locate hex binary")
+        .args(["doctor", "--json"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("PATH", "/nonexistent-for-this-test")
+        .output()
+        .expect("spawn hex");
+    let v: serde_json::Value = serde_json::from_str(stdout(&without).trim()).expect("doctor json");
+    let row = &v["findings"][0];
+    assert_eq!(
+        (row["kind"].as_str(), row["name"].as_str()),
+        (Some("self"), Some("hex"))
+    );
+    assert_eq!(row["ok"], false, "{v}");
+    assert!(
+        row["detail"]
+            .as_str()
+            .unwrap()
+            .contains("put the hex binary on PATH"),
+        "the message says what to do: {v}"
+    );
+    assert_eq!(without.status.code(), Some(1), "a real finding, so exit 1");
+
+    let with = Command::cargo_bin("hex")
+        .expect("locate hex binary")
+        .args(["doctor", "--json"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("PATH", bin.parent().expect("bin dir"))
+        .output()
+        .expect("spawn hex");
+    let v: serde_json::Value = serde_json::from_str(stdout(&with).trim()).expect("doctor json");
+    assert_eq!(v["findings"][0]["ok"], true, "{v}");
 }
 
 /// The point of `--detach`: the launcher prints an id and exits, and the run

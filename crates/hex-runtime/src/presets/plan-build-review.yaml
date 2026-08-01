@@ -39,6 +39,12 @@ nodes:
 
   implement:
     agent:
+      # Revisited each round (the gate sends it back), so it continues its own
+      # agent session rather than re-deriving the task and the codebase every
+      # attempt. Needs a worker that can resume — codex and claude can; rebinding
+      # the role to a `kind: command` worker makes the run refuse at compile time
+      # naming this node, and `context: fresh` is the fix there.
+      context: continue
       prompt: |
         Implement the task by following the plan.
 

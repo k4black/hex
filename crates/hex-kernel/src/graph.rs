@@ -48,13 +48,14 @@ impl std::fmt::Display for NodeKind {
 }
 
 /// Per-node context policy: whether each attempt gets a fresh worker session.
-/// (The slim MVP only implements `Fresh`.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Context {
     /// A new worker session per attempt (the default).
     #[default]
     Fresh,
-    /// Resume the prior worker session.
+    /// Resume the prior worker session for this node, so a loop's later rounds
+    /// keep what the earlier ones established instead of re-deriving it. Requires
+    /// the bound worker to declare [`hex_proto::Capability::SessionResume`].
     Continue,
 }
 

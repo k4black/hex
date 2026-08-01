@@ -4,8 +4,8 @@
 //! [`hex_runtime::RuntimeClient`]. A human at a TTY and an agent (via injected
 //! `hex emit`) share the same control protocol; every action becomes an event.
 //!
-//! Verbs: `validate` · `graph` · `run` · `resume` · `runs` · `status` · `watch` ·
-//! `wait` · `logs` · `pause` · `steer` · `respond` · `cancel`, plus the
+//! Verbs: `init` · `validate` · `graph` · `run` · `resume` · `runs` · `status` ·
+//! `watch` · `wait` · `logs` · `pause` · `steer` · `respond` · `cancel`, plus the
 //! worker-side `emit`. Redoing work is a new `run`; there is no
 //! `retry`/`replay`. The mid-run verbs are all thin writes to the run's control
 //! inbox — the same transport a human and an agent use.
@@ -25,6 +25,7 @@ mod test_support;
 /// Worked examples, shown under `hex --help`.
 const EXAMPLES: &str = "\
 Examples:
+  hex init                             set this repository up for hex
   hex list                             list runnable graphs
   hex validate critique-loop           check a graph before running it
   hex run critique-loop -p \"fix bug\"   start a run with an inline prompt
@@ -68,6 +69,8 @@ struct Cli {
 /// The operator/worker verbs. Names are stable public surface.
 #[derive(Subcommand)]
 enum Command {
+    /// Set this repository up for hex: `.hex/`, a starter config, `.gitignore`
+    Init,
     /// List runnable graphs (project, then user, then built-in)
     #[command(visible_alias = "ls")]
     List,
@@ -137,6 +140,9 @@ enum Command {
     Watch {
         /// Run id, as printed by `hex run`
         run_id: String,
+        /// Keep printing new events until the run finishes
+        #[arg(long)]
+        follow: bool,
     },
     /// Show each attempt's final message (`--full` for full stdout/stderr)
     Logs {
@@ -148,6 +154,12 @@ enum Command {
         /// Show full captured stdout/stderr, not just each attempt's final message
         #[arg(long)]
         full: bool,
+        /// Last N lines of an attempt still running (default 20)
+        #[arg(long, value_name = "N")]
+        tail: Option<usize>,
+        /// Stream the in-flight attempt's output until the run finishes
+        #[arg(long)]
+        follow: bool,
     },
     /// Block until a run finishes, exiting with its disposition code
     Wait {
@@ -214,6 +226,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
     };
 
     match command {
+        Command::Init => cmd_init(json),
         Command::List => cmd_list(json),
         Command::Doctor => cmd_doctor(json),
         Command::Validate { graph } => cmd_validate(&graph, json),
@@ -243,8 +256,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Command::Resume { run_id } => cmd_resume(&run_id, json, no_preview),
         Command::Runs => cmd_runs(json),
         Command::Status { run_id } => cmd_status(&run_id, json),
-        Command::Watch { run_id } => cmd_watch(&run_id, json),
-        Command::Logs { run_id, node, full } => cmd_logs(&run_id, node.as_deref(), full, json),
+        Command::Watch { run_id, follow } => cmd_watch(&run_id, follow, json),
+        Command::Logs {
+            run_id,
+            node,
+            full,
+            tail,
+            follow,
+        } => cmd_logs(&run_id, node.as_deref(), full, tail, follow, json),
         Command::Wait { run_id } => cmd_wait(&run_id, json),
         Command::Pause { run_id } => cmd_control(&run_id, &ControlCommand::Pause, json),
         Command::Steer { run_id, text } => {
@@ -301,6 +320,162 @@ pub(crate) fn event_line(e: &hex_runtime::Event) -> String {
         .as_deref()
         .map_or(String::new(), |n| format!(" {n}"));
     format!("#{}{} {}", e.seq, node, event_summary(&e.body))
+}
+
+/// The starter `.hex/config.yaml`. Every key is commented out: the built-in layer
+/// (`hex-runtime/src/defaults.yaml`) already supplies working workers and roles,
+/// so an uncommented copy of them here would freeze this machine's defaults into
+/// the repository and stop deep-merge doing its job.
+const CONFIG_TEMPLATE: &str = "\
+# hex project configuration.
+#
+# This is the last of three layers: the built-in defaults (embedded in the `hex`
+# binary), then `~/.config/hex/config.yaml`, then this file. Layers deep-merge per
+# key, so setting `roles.reviewer.model` here keeps the built-in worker, effort,
+# read_only and prompt. Run `hex doctor` to see what the merged result resolves to.
+
+# Project checks: name → argv. **Deliberately empty.**
+#
+# What \"green\" means is your decision, so hex autodetects nothing and ships no
+# commands. Declare a check here and a graph can gate on it as
+# `command: { check: test }`; naming an undeclared check is refused before the run
+# starts, rather than passing silently. Two built-in presets (`tdd`,
+# `implement-until-green`) are a gate, so they need `test` declared.
+#
+#   checks:
+#     test: [cargo, test, --workspace]
+#     lint: [cargo, clippy, --workspace, --all-targets]
+checks: {}
+
+# Roles are what a graph names (`role: reviewer`). Each binds a worker CLI to a
+# model, a reasoning effort, a read-only policy, and a prompt preamble. Override
+# only what should differ from the built-in layer; `prompt_append` extends the
+# inherited preamble, `prompt` replaces it.
+#
+#   roles:
+#     reviewer:
+#       prompt_append: |
+#         This repository's invariants are in AGENTS.md — read it before judging a
+#         design choice.
+
+# Workers are the CLI adapters behind a role — internal plumbing a graph never
+# names directly. `kind` picks the adapter: codex | claude | opencode | command.
+#
+#   workers:
+#     codex:
+#       kind: codex
+";
+
+/// Lines `hex init` adds to `.gitignore`: a run's journal and a worktree slot are
+/// machine-local working state, not source.
+const GITIGNORE_LINES: [&str; 2] = [".hex/runs/", ".hex/worktrees/"];
+
+/// Set the current repository up for hex.
+///
+/// Idempotent by construction: every step reports `created` or `exists` and an
+/// existing `.hex/config.yaml` is never rewritten — the operator's checks and role
+/// overrides are exactly the content a second `hex init` must not be able to lose.
+fn cmd_init(json: bool) -> Result<ExitCode, String> {
+    let root = hex_runtime::project_root().map_err(|e| e.to_string())?;
+    let mut created: Vec<String> = Vec::new();
+    let mut existed: Vec<String> = Vec::new();
+
+    for dir in [root.join(".hex"), root.join(".hex").join("graphs")] {
+        let name = format!("{}/", relative(&root, &dir));
+        if dir.is_dir() {
+            existed.push(name);
+        } else {
+            std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {name}: {e}"))?;
+            created.push(name);
+        }
+    }
+
+    let config = root.join(".hex").join("config.yaml");
+    let config_name = relative(&root, &config);
+    if config.exists() {
+        existed.push(config_name.clone());
+    } else {
+        std::fs::write(&config, CONFIG_TEMPLATE)
+            .map_err(|e| format!("cannot write {config_name}: {e}"))?;
+        created.push(config_name);
+    }
+
+    let gitignore = root.join(".gitignore");
+    // Bytes, not a `String`, and a read failure is fatal rather than "empty".
+    // Treating an unreadable file as empty and then writing our two lines over it
+    // deletes whatever it held — a `.gitignore` with one non-UTF-8 byte in a
+    // comment, or one we lack permission to read, was silently truncated to two
+    // lines. Appending raw bytes also preserves the original exactly.
+    let mut current = match std::fs::read(&gitignore) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            return Err(format!("cannot read {}: {e}", relative(&root, &gitignore)));
+        }
+    };
+    // Decide what is missing before mutating, so the comparison view and the
+    // buffer are never borrowed at once.
+    let needed: Vec<&str> = {
+        let existing = String::from_utf8_lossy(&current);
+        GITIGNORE_LINES
+            .iter()
+            .copied()
+            .filter(|line| {
+                let present = existing.lines().any(|l| l.trim() == *line);
+                if present {
+                    existed.push(format!(".gitignore:{line}"));
+                }
+                !present
+            })
+            .collect()
+    };
+    let appended = !needed.is_empty();
+    for line in needed {
+        // A file whose last line has no terminator would otherwise get our entry
+        // glued onto it, silently ignoring both patterns.
+        if !current.is_empty() && !current.ends_with(b"\n") {
+            current.push(b'\n');
+        }
+        current.extend_from_slice(line.as_bytes());
+        current.push(b'\n');
+        created.push(format!(".gitignore:{line}"));
+    }
+    // Only touch the file when we have something to add: a second `hex init` must
+    // leave the tree byte-for-byte, mtime included, as it found it.
+    if appended {
+        std::fs::write(&gitignore, &current)
+            .map_err(|e| format!("cannot write .gitignore: {e}"))?;
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "root": root.display().to_string(),
+                "created": created,
+                "existed": existed,
+            })
+        );
+    } else {
+        for name in &created {
+            println!("created  {name}");
+        }
+        for name in &existed {
+            println!("exists   {name}");
+        }
+        println!(
+            "\ndeclare your checks in .hex/config.yaml, then `hex list` to see what you can run"
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A path as written relative to the project root, for reporting what was made.
+fn relative(root: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 fn cmd_list(json: bool) -> Result<ExitCode, String> {
@@ -495,8 +670,7 @@ fn cmd_run(
         None => runtime.start(reference, prompt.as_deref(), name, &isolation),
     }
     .map_err(|e| e.to_string())?;
-    print_outcome(&report, json, "run");
-    Ok(exit_for_report(&report))
+    print_outcome(&runtime, &report, json, "run")
 }
 
 /// Launch a run in the background and return its id immediately.
@@ -586,27 +760,145 @@ fn spawn_detached(_argv: &[String], _run_dir: &std::path::Path) -> Result<(), St
 fn cmd_resume(run_id: &str, json: bool, no_preview: bool) -> Result<ExitCode, String> {
     let runtime = open_runtime_streaming(json, no_preview)?;
     let report = runtime.resume(run_id).map_err(|e| e.to_string())?;
-    print_outcome(&report, json, "resumed");
-    Ok(exit_for_report(&report))
+    print_outcome(&runtime, &report, json, "resumed")
 }
 
 /// Render the end of a `run`/`resume`. A paused run has no disposition — saying
 /// `succeeded` (or nothing) would misreport a run that is merely suspended.
-fn print_outcome(report: &hex_runtime::RunReport, json: bool, verb: &str) {
+fn print_outcome(
+    runtime: &Runtime,
+    report: &hex_runtime::RunReport,
+    json: bool,
+    verb: &str,
+) -> Result<ExitCode, String> {
     let disposition = disposition_label(report.disposition, "paused");
+    let payoff = Payoff::of(runtime, &report.run_id);
     if json {
         let v = serde_json::json!({
             "run_id": report.run_id,
             "origin": report.origin,
             "disposition": disposition,
             "paused": report.disposition.is_none(),
+            "why": payoff.why,
+            "result": payoff.result,
+            "failed_steps": payoff.failed_steps.iter().map(|s| &s.label).collect::<Vec<_>>(),
+            "usage": payoff.usage.as_ref().map(totals_json),
         });
         println!("{v}");
     } else {
         println!("{verb} {} ({})", report.run_id, report.origin);
         println!("disposition: {disposition}");
+        payoff.print();
         if report.disposition.is_none() {
             eprintln!("paused; continue with `hex resume {}`", report.run_id);
+        }
+    }
+    Ok(exit_for_report(report))
+}
+
+/// How many lines of a failed check's output the end-of-run summary shows. Enough
+/// to carry a test failure and its assertion; `hex logs --node <id> --full` has
+/// the rest.
+const FAILED_STEP_TAIL_LINES: usize = 40;
+
+/// What a finished run actually produced — the part an operator came for.
+///
+/// This exists because `run` used to end at `disposition: failed` and stop. Every
+/// artefact of a four-minute cross-model review was on disk and named by no
+/// output: the reviewer's findings, the reason the kernel stopped, and which check
+/// went red. A run that reports only its verdict makes you go digging to learn
+/// anything, which is the same as not having run it.
+struct Payoff {
+    /// The last result captured in the run — an agent's final message, or a
+    /// human's answer.
+    result: Option<String>,
+    /// The kernel's reason for stopping, when it recorded one.
+    why: Option<String>,
+    /// Steps whose recorded exit status says they failed.
+    failed_steps: Vec<hex_runtime::StepLog>,
+    /// What the run spent, when anything reported it.
+    usage: Option<hex_runtime::Totals>,
+}
+
+impl Payoff {
+    /// Project it from the journal. Every field is best-effort: a run that ends
+    /// badly enough to be unreadable must still print its disposition, so a
+    /// failure here degrades to silence rather than replacing the outcome with an
+    /// error about fetching the outcome.
+    fn of(runtime: &Runtime, run_id: &str) -> Self {
+        let logs = runtime.logs(run_id).unwrap_or_default();
+        // The *last* attempt to capture anything: for a review loop that is the
+        // review, and for a partial it is the salvaged tail.
+        let result = logs.iter().rev().find_map(|a| a.result.clone());
+        let failed_steps = logs
+            .last()
+            .map(|a| a.steps.iter().filter(|s| s.failed()).cloned().collect())
+            .unwrap_or_default();
+        let events = runtime.events(run_id).unwrap_or_default();
+        // `RecordTerminal` journals its reason as a `Note` immediately before the
+        // terminal, so only the *terminal cluster* counts. Scanning the whole
+        // journal for the last note instead would surface a stale one: a run whose
+        // check failed on round one and passed on round two would end `succeeded`
+        // while printing "1 of 3 steps failed" as its reason.
+        let why = events
+            .iter()
+            .rev()
+            .take_while(|e| {
+                matches!(
+                    e.body,
+                    hex_runtime::EventBody::Note { .. }
+                        | hex_runtime::EventBody::RunFinished { .. }
+                        | hex_runtime::EventBody::AttemptFailed { .. }
+                )
+            })
+            .find_map(|e| match &e.body {
+                hex_runtime::EventBody::Note { text } => Some(text.clone()),
+                hex_runtime::EventBody::AttemptFailed { reason, .. } => Some(reason.clone()),
+                _ => None,
+            });
+        let usage = runtime
+            .status(run_id)
+            .ok()
+            .map(|s| s.usage.total)
+            .filter(|t| t.tokens() > 0);
+        Self {
+            result,
+            why,
+            failed_steps,
+            usage,
+        }
+    }
+
+    fn print(&self) {
+        let tty = std::io::stdout().is_terminal();
+        if let Some(why) = &self.why {
+            println!("why: {why}");
+        }
+        if let Some(usage) = &self.usage {
+            let cost = if usage.cost_micro_usd > 0 {
+                format!(", {}", usd(usage.cost_micro_usd))
+            } else {
+                String::new()
+            };
+            println!("spent: {} tokens{cost}", tokens(usage.tokens()));
+        }
+        for step in &self.failed_steps {
+            let code = step.exit.as_deref().unwrap_or("?");
+            println!("\n── {} failed (exit {code}) ──", step.label);
+            // A check's diagnosis is at the end of its output, not the start.
+            let combined = format!("{}{}", step.stdout, step.stderr);
+            let lines: Vec<&str> = combined.lines().collect();
+            let start = lines.len().saturating_sub(FAILED_STEP_TAIL_LINES);
+            if start > 0 {
+                println!("{}", grey(&format!("… {start} earlier line(s)"), tty));
+            }
+            for line in &lines[start..] {
+                println!("{}", grey(line, tty));
+            }
+        }
+        if let Some(result) = &self.result {
+            println!("\n── final message ──");
+            println!("{}", grey(result.trim_end(), tty));
         }
     }
 }
@@ -638,28 +930,59 @@ fn cmd_runs(json: bool) -> Result<ExitCode, String> {
         println!("no runs yet (start one with `hex run <graph> -p \"…\"`)");
         return Ok(ExitCode::SUCCESS);
     }
-    println!(
-        "{:<34} {:<12} {:<10} {:<14} PROCESS",
-        "RUN", "STATE", "AGE", "NODE"
-    );
-    for r in &runs {
-        let state = r
-            .status
-            .as_ref()
-            .map_or("unreadable".to_owned(), ToString::to_string);
-        println!(
-            "{:<34} {:<12} {:<10} {:<14} {}",
-            r.run_id,
-            state,
-            age(r.updated_at_ms),
-            r.current.as_deref().unwrap_or("-"),
-            r.liveness,
-        );
+    // Widths from the data, not constants: `finished:budget_exhausted` is 25
+    // characters and a legacy `run_1784…` id is 46, so fixed columns ran the
+    // fields together in exactly the listing a new user sees first.
+    let rows: Vec<[String; 5]> = runs
+        .iter()
+        .map(|r| {
+            [
+                r.run_id.clone(),
+                r.status
+                    .as_ref()
+                    .map_or("unreadable".to_owned(), ToString::to_string),
+                age(r.updated_at_ms),
+                r.current.clone().unwrap_or_else(|| "-".to_owned()),
+                r.liveness.to_string(),
+            ]
+        })
+        .collect();
+    let headers = ["RUN", "STATE", "AGE", "NODE", "PROCESS"];
+    // The last column is never padded, so it needs no width.
+    let widths: Vec<usize> = (0..4)
+        .map(|c| {
+            rows.iter()
+                .map(|r| r[c].chars().count())
+                .chain(std::iter::once(headers[c].len()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let line = |cells: &[String; 5]| {
+        let mut out = String::new();
+        for (c, cell) in cells.iter().enumerate() {
+            if c == cells.len() - 1 {
+                out.push_str(cell);
+            } else {
+                out.push_str(&format!("{cell:<width$} ", width = widths[c]));
+            }
+        }
+        out
+    };
+    println!("{}", line(&headers.map(ToOwned::to_owned)));
+    for (r, cells) in runs.iter().zip(&rows) {
+        println!("{}", line(cells));
         if let Some(err) = &r.error {
             eprintln!("  {}: {err}", r.run_id);
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Milliseconds since `at_ms`, floored at zero — clocks and journals disagree by
+/// a few ms, and a negative "elapsed" is worse than a zero one.
+fn elapsed_ms(at_ms: u64) -> u64 {
+    hex_runtime::journal::now_ms().saturating_sub(at_ms)
 }
 
 /// A compact "how long ago" for a listing (`3m`, `2h`, `4d`).
@@ -746,6 +1069,19 @@ fn cmd_control(run_id: &str, command: &ControlCommand, json: bool) -> Result<Exi
         // Queued, not applied: the driver picks it up at its next attempt
         // boundary, and the journal is where the effect shows up.
         println!("queued {} for {run_id}", command.as_str());
+        // Say *when* it lands. A steer is drained at the next attempt boundary, so
+        // an attempt already in flight will not see it — without that sentence the
+        // operator reasonably expects the running agent to change course, and reads
+        // the unchanged output as the steer having been lost.
+        if matches!(command, ControlCommand::Steer { .. })
+            && let Ok(s) = runtime.status(run_id)
+            && let Some(f) = s.in_flight
+        {
+            eprintln!(
+                "note: {} is mid-attempt ({} on {}); the steer applies to the NEXT attempt",
+                run_id, f.attempt_id, f.node_id
+            );
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -754,12 +1090,46 @@ fn cmd_status(run_id: &str, json: bool) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     let s = runtime.status(run_id).map_err(|e| e.to_string())?;
     if json {
+        let by_node: serde_json::Map<_, _> = s
+            .usage
+            .by_node
+            .iter()
+            .map(|(node, t)| {
+                let mut v = totals_json(t);
+                // Spend per node only means something next to how many attempts
+                // produced it, and `visits` is where the projection keeps that.
+                v["attempts"] = s.visits.get(node).copied().unwrap_or(0).into();
+                (node.clone(), v)
+            })
+            .collect();
+        let by_model: serde_json::Map<_, _> = s
+            .usage
+            .by_model
+            .iter()
+            .map(|(model, t)| (model.clone(), totals_json(t)))
+            .collect();
         let v = serde_json::json!({
             "run_id": s.run_id,
             "status": s.status.to_string(),
             "current": s.current,
             "attempts": s.attempts,
             "disposition": disposition_json(s.disposition),
+            "in_flight": s.in_flight.as_ref().map(|f| serde_json::json!({
+                "attempt_id": f.attempt_id,
+                "node_id": f.node_id,
+                "worker": f.worker,
+                "started_at_ms": f.started_at_ms,
+                "elapsed_ms": elapsed_ms(f.started_at_ms),
+            })),
+            "queued": s.queued.iter().map(ControlCommand::as_str).collect::<Vec<_>>(),
+            "pending_steer": s.pending_steer,
+            "waiting_for_human": s.asked,
+            "question": s.question,
+            "usage": {
+                "by_node": by_node,
+                "by_model": by_model,
+                "total": totals_json(&s.usage.total),
+            },
         });
         println!("{v}");
     } else {
@@ -769,30 +1139,351 @@ fn cmd_status(run_id: &str, json: bool) -> Result<ExitCode, String> {
             println!("current: {c}");
         }
         println!("attempts: {}", s.attempts);
+        // The live picture, before the spend table: an operator checking on a
+        // running loop wants "what is happening now", and a bare `running` sent
+        // them to `hex watch` to find out.
+        if let Some(f) = &s.in_flight {
+            let via = f
+                .worker
+                .as_deref()
+                .map_or(String::new(), |w| format!(" via {w}"));
+            println!(
+                "in flight: {} on {}{via}, running {}",
+                f.attempt_id,
+                f.node_id,
+                age(f.started_at_ms)
+            );
+        }
+        if let Some(node) = &s.asked {
+            println!("waiting for you: `hex respond {} \"…\"` ({node})", s.run_id);
+            if let Some(q) = &s.question {
+                println!("{}", grey(q.trim_end(), std::io::stdout().is_terminal()));
+            }
+        }
+        // Two stages of "sent but not applied", and conflating them is how a steer
+        // looks lost: `queued` is still in the inbox, `pending_steer` has been
+        // journaled and is waiting for an agent attempt to read it.
+        for command in &s.queued {
+            match command {
+                ControlCommand::Steer { text } => {
+                    println!("queued steer (not yet picked up): {text}");
+                }
+                other => println!("queued {} (not yet picked up)", other.as_str()),
+            }
+        }
+        for text in &s.pending_steer {
+            println!("steer accepted (applies to the next agent attempt): {text}");
+        }
+        print_usage(&s.usage, &s.visits);
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_watch(run_id: &str, json: bool) -> Result<ExitCode, String> {
-    // Foreground MVP: runs finish synchronously, so `watch` prints the recorded
-    // event stream. Live tailing arrives with the background controller.
+/// Render what the run spent: per node, then per model, then the total.
+///
+/// Silent when nothing reported usage — a `command`-only graph, or an agent whose
+/// CLI reports no accounting, would otherwise grow a table of zeroes that reads
+/// like a run that cost nothing rather than one that never said.
+fn print_usage(usage: &hex_runtime::Usage, visits: &std::collections::BTreeMap<String, u32>) {
+    if usage.total.tokens() == 0 {
+        return;
+    }
+    // A row's left column is a node id in one block and a model name in the next,
+    // which is only readable if each block says which — hence two headers.
+    let row = |left: &str, visits: String, t: &hex_runtime::Totals| {
+        println!(
+            "{left:<24} {visits:>8} {:>10} {:>11}",
+            tokens(t.tokens()),
+            // Zero cost means *nothing reported one* — codex reports tokens only —
+            // so printing `$0.0000` would claim the work was free. An em dash says
+            // "unknown", which is the truth.
+            money(t.cost_micro_usd)
+        );
+    };
+    // `VISITS`, not `ATTEMPTS`: this is the projection's per-node visit count, and
+    // a crash between `AttemptReported` and the attempt's terminal leaves two
+    // reports against one visit. Calling it attempts would be a number that
+    // occasionally disagrees with itself.
+    println!(
+        "\n{:<24} {:>8} {:>10} {:>11}",
+        "NODE", "VISITS", "TOKENS", "COST"
+    );
+    for (node, t) in &usage.by_node {
+        row(node, visits.get(node).copied().unwrap_or(0).to_string(), t);
+    }
+    println!("MODEL");
+    for (model, t) in &usage.by_model {
+        row(model, String::new(), t);
+    }
+    // The attempts that produced this spend, not the run's total: a `command` node
+    // spends no tokens, so counting its attempts here would explain nothing.
+    let attempts: u32 = usage
+        .by_node
+        .keys()
+        .filter_map(|n| visits.get(n))
+        .sum::<u32>();
+    row("total", attempts.to_string(), &usage.total);
+}
+
+/// One [`hex_runtime::Totals`] as JSON: every token class the agents distinguish,
+/// plus the summed `tokens` a one-line summary uses, plus money as integer
+/// micro-USD (a float would make the recorded cost inexact).
+fn totals_json(t: &hex_runtime::Totals) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": t.input_tokens,
+        "output_tokens": t.output_tokens,
+        "cache_read_tokens": t.cache_read_tokens,
+        "cache_write_tokens": t.cache_write_tokens,
+        "reasoning_tokens": t.reasoning_tokens,
+        "tokens": t.tokens(),
+        "cost_micro_usd": t.cost_micro_usd,
+    })
+}
+
+/// How often a follower re-reads a run. Fast enough that a loop's transitions
+/// feel live, slow enough that watching one costs nothing — the same polled shape
+/// the control inbox uses, for the same reason: there is no daemon to push.
+const FOLLOW_POLL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How long a follower waits for a just-reserved run's journal to appear.
+///
+/// `--detach` reserves the run directory a moment before the driver writes its
+/// first event, so `hex logs --follow "$(hex run … --detach)"` — the obvious thing
+/// to type — would otherwise fail instantly with "no journal yet". A follower's
+/// whole job is to wait.
+const JOURNAL_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Block until `run_id` has a readable journal. Distinguishes "not started yet"
+/// from "does not exist" via `summary`, which succeeds for a reserved run and
+/// fails for a missing one — so a typo still fails fast.
+fn wait_for_journal(runtime: &Runtime, run_id: &str) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + JOURNAL_WAIT;
+    loop {
+        let summary = runtime.summary(run_id).map_err(|e| e.to_string())?;
+        if summary.status.is_some() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(summary.error.unwrap_or_else(|| {
+                format!("run `{run_id}` still has no journal after {JOURNAL_WAIT:?}")
+            }));
+        }
+        std::thread::sleep(FOLLOW_POLL);
+    }
+}
+
+fn cmd_watch(run_id: &str, follow: bool, json: bool) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
+    if follow {
+        wait_for_journal(&runtime, run_id)?;
+    }
+    let print_from = |events: &[hex_runtime::Event], from: usize| -> Result<(), String> {
+        for event in &events[from..] {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(event).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("{}", event_line(event));
+            }
+        }
+        Ok(())
+    };
     let events = runtime.events(run_id).map_err(|e| e.to_string())?;
-    for event in &events {
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string(event).map_err(|e| e.to_string())?
-            );
-        } else {
-            println!("{}", event_line(event));
+    print_from(&events, 0)?;
+    if !follow {
+        return Ok(ExitCode::SUCCESS);
+    }
+    // Poll by event count. The journal is append-only, so "how many have I already
+    // printed" is the whole cursor — no offsets to keep and nothing to miss.
+    let mut printed = events.len();
+    loop {
+        if let Ok(summary) = runtime.summary(run_id)
+            && summary
+                .status
+                .as_ref()
+                .is_some_and(hex_runtime::Status::is_finished)
+        {
+            // Drain whatever the terminal write added before stopping.
+            if let Ok(events) = runtime.events(run_id) {
+                print_from(&events, printed.min(events.len()))?;
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        std::thread::sleep(FOLLOW_POLL);
+        if let Ok(events) = runtime.events(run_id)
+            && events.len() > printed
+        {
+            print_from(&events, printed)?;
+            printed = events.len();
         }
     }
-    Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_logs(run_id: &str, node: Option<&str>, full: bool, json: bool) -> Result<ExitCode, String> {
+/// Stream the in-flight attempt's captured output until the run ends.
+///
+/// This is the "what is the agent doing right now" view. Before it, the bytes were
+/// already on disk and the only way to see them was `hex logs --full` re-run by
+/// hand, or a shell loop.
+fn follow_logs(runtime: &Runtime, run_id: &str, tail_lines: usize) -> Result<ExitCode, String> {
+    wait_for_journal(runtime, run_id)?;
+    let tty = std::io::stdout().is_terminal();
+    // Which attempt we are attached to, and how far into each of its streams we
+    // have read. A map rather than two counters because the set of streams grows
+    // during a `command` attempt: each step's directory appears as it starts.
+    let mut attached: Option<(String, std::path::PathBuf)> = None;
+    let mut offsets: std::collections::BTreeMap<std::path::PathBuf, u64> =
+        std::collections::BTreeMap::new();
+    loop {
+        let status = runtime.status(run_id).map_err(|e| e.to_string())?;
+        let current = status.in_flight.as_ref().map(|f| f.attempt_id.clone());
+        // An attempt stops being in-flight the moment it terminates, so its final
+        // bytes — a check's failure line, an agent's last word — land *after* the
+        // last poll that could still see it. Drain before letting go, or the most
+        // interesting line of the attempt is the one you never get.
+        if let Some((id, dir)) = &attached
+            && current.as_ref() != Some(id)
+        {
+            drain_streams(dir, &mut offsets, tail_lines, false, tty);
+            attached = None;
+            offsets.clear();
+        }
+        if let Some(f) = &status.in_flight {
+            let attaching = attached.is_none();
+            if attaching {
+                let via = f
+                    .worker
+                    .as_deref()
+                    .map_or(String::new(), |w| format!(" via {w}"));
+                println!(
+                    "\u{2500}\u{2500} {} [{}]{via} \u{2500}\u{2500}",
+                    f.attempt_id, f.node_id
+                );
+                let dir = runtime
+                    .attempt_dir(run_id, &f.attempt_id)
+                    .map_err(|e| e.to_string())?;
+                attached = Some((f.attempt_id.clone(), dir));
+                offsets.clear();
+            }
+            if let Some((_, dir)) = &attached {
+                drain_streams(dir, &mut offsets, tail_lines, attaching, tty);
+            }
+        }
+        if status.status.is_finished() {
+            println!(
+                "── {} ──",
+                disposition_label(status.disposition, "finished")
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        std::thread::sleep(FOLLOW_POLL);
+    }
+}
+
+/// Print whatever is new in every stream of `dir`, advancing `offsets`.
+///
+/// `attaching` starts each stream at its *tail* rather than its head: joining a
+/// long attempt should show what it is doing now, not replay everything it said.
+fn drain_streams(
+    dir: &std::path::Path,
+    offsets: &mut std::collections::BTreeMap<std::path::PathBuf, u64>,
+    tail_lines: usize,
+    attaching: bool,
+    tty: bool,
+) {
+    for path in attempt_streams(dir) {
+        let known = offsets.contains_key(&path);
+        let offset = offsets.entry(path.clone()).or_insert(0);
+        if attaching || !known {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let lines: Vec<&str> = text.lines().collect();
+                let start = lines.len().saturating_sub(tail_lines);
+                for line in &lines[start..] {
+                    println!("{}", grey(line, tty));
+                }
+                *offset = text.len() as u64;
+            }
+        } else if let Some(new) = read_from(&path, offset) {
+            for line in new.lines() {
+                println!("{}", grey(line, tty));
+            }
+        }
+    }
+}
+
+/// Every captured stream an attempt owns: its own two, plus both of each numbered
+/// step directory a `command` node writes. Without the step files, following a
+/// gate showed a header and nothing else — and a gate is exactly the thing you
+/// wait on (`cargo test` is the slow part of a loop).
+fn attempt_streams(attempt_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = vec![
+        attempt_dir.join("stdout.log"),
+        attempt_dir.join("stderr.log"),
+    ];
+    let Ok(entries) = std::fs::read_dir(attempt_dir) else {
+        return files;
+    };
+    let mut steps: Vec<(u32, std::path::PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            // Declared position, so `10-x` follows `9-x` rather than preceding it.
+            let position = name.split_once('-')?.0.parse().ok()?;
+            Some((position, e.path()))
+        })
+        .collect();
+    steps.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, dir) in steps {
+        files.push(dir.join("stdout.log"));
+        files.push(dir.join("stderr.log"));
+    }
+    files
+}
+
+/// Bytes appended to `path` since `offset`, advancing it. `None` when there is
+/// nothing new (or the file is not there yet).
+fn read_from(path: &std::path::Path, offset: &mut u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    // A truncated file (a re-run attempt clears its logs) would otherwise leave the
+    // cursor past the end and go permanently silent.
+    if len < *offset {
+        *offset = 0;
+    }
+    if len == *offset {
+        return None;
+    }
+    file.seek(SeekFrom::Start(*offset)).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+    *offset = len;
+    Some(buf)
+}
+
+/// Lines of a still-running attempt shown by default. Enough to see what the
+/// agent is doing without replaying its whole transcript.
+const DEFAULT_TAIL_LINES: usize = 20;
+
+fn cmd_logs(
+    run_id: &str,
+    node: Option<&str>,
+    full: bool,
+    tail: Option<usize>,
+    follow: bool,
+    json: bool,
+) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
+    let tail_lines = tail.unwrap_or(DEFAULT_TAIL_LINES);
+    if follow {
+        return follow_logs(&runtime, run_id, tail_lines);
+    }
+    let in_flight = runtime
+        .status(run_id)
+        .ok()
+        .and_then(|s| s.in_flight.map(|f| f.attempt_id));
     let logs = runtime.logs(run_id).map_err(|e| e.to_string())?;
     let logs: Vec<_> = logs
         .into_iter()
@@ -803,6 +1494,22 @@ fn cmd_logs(run_id: &str, node: Option<&str>, full: bool, json: bool) -> Result<
         let items: Vec<_> = logs
             .iter()
             .map(|l| {
+                let steps: Vec<_> = l
+                    .steps
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "label": s.label,
+                            "stdout": s.stdout,
+                            "stderr": s.stderr,
+                            // Without these a machine consumer can see every
+                            // step's output but not which one went red — the
+                            // question a driving agent is actually asking.
+                            "exit": s.exit,
+                            "failed": s.failed(),
+                        })
+                    })
+                    .collect();
                 serde_json::json!({
                     "attempt_id": l.attempt_id,
                     "node_id": l.node_id,
@@ -810,6 +1517,7 @@ fn cmd_logs(run_id: &str, node: Option<&str>, full: bool, json: bool) -> Result<
                     "result": l.result,
                     "stdout": l.stdout,
                     "stderr": l.stderr,
+                    "steps": steps,
                 })
             })
             .collect();
@@ -817,6 +1525,11 @@ fn cmd_logs(run_id: &str, node: Option<&str>, full: bool, json: bool) -> Result<
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Captured output is the *requested data* of this verb, so all of it goes to
+    // stdout — including the stderr half, which `eprint!` used to send back out of
+    // the pipe (`hex logs --full > out.txt` captured almost nothing). One target
+    // stream, so one TTY decides the colouring.
+    let tty = std::io::stdout().is_terminal();
     for l in &logs {
         let node = l.node_id.as_deref().unwrap_or("?");
         let via = l
@@ -824,29 +1537,105 @@ fn cmd_logs(run_id: &str, node: Option<&str>, full: bool, json: bool) -> Result<
             .as_deref()
             .map_or(String::new(), |w| format!(" via {w}"));
         println!("── {} [{node}]{via} ──", l.attempt_id);
-        let out_tty = std::io::stdout().is_terminal();
-        let err_tty = std::io::stderr().is_terminal();
         if full {
-            // Full captured output, dimmed. Each stream is colored by its OWN
-            // TTY, so redirecting one doesn't leak ANSI into the other.
-            if !l.stdout.trim().is_empty() {
-                print!("{}", grey(&l.stdout, out_tty));
-                if !l.stdout.ends_with('\n') {
-                    println!();
-                }
-            }
-            if !l.stderr.trim().is_empty() {
-                eprint!("{}", grey(&l.stderr, err_tty));
-            }
+            print_captured(&l.stdout, tty);
+            print_captured(&l.stderr, tty);
         } else {
-            // Default: just the attempt's final message, dimmed (on stdout).
+            // Default: just the attempt's final message, dimmed.
             match &l.result {
-                Some(text) => println!("{}", grey(text, out_tty)),
-                None => println!("{}", grey("(no final message captured)", out_tty)),
+                Some(text) => println!("{}", grey(text, tty)),
+                // An attempt still running has no final message *yet*, and saying
+                // "(no final message captured)" over ten lines of live output reads
+                // as "nothing happened". Show its tail instead, and say it is live.
+                None if in_flight.as_deref() == Some(l.attempt_id.as_str()) => {
+                    print_tail(&l.stdout, &l.stderr, tail_lines, tty);
+                }
+                None => println!("{}", grey("(no final message captured)", tty)),
+            }
+        }
+        // A `command` node writes every byte into its numbered step dirs and
+        // nothing to the attempt dir, so a check's output was reachable from no
+        // surface at all. Labels always (they say what ran, and an attempt with no
+        // final message would otherwise render as one blank line); the captured
+        // bytes under `--full`, which is the flag that means "all of it".
+        for step in &l.steps {
+            println!("   · {}", step.label);
+            if full {
+                print_captured(&step.stdout, tty);
+                print_captured(&step.stderr, tty);
             }
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The last `lines` lines of a live attempt's output, across both streams —
+/// codex writes everything to stderr and nothing to stdout, so either alone is
+/// silent for one of the two agents.
+fn print_tail(stdout: &str, stderr: &str, lines: usize, tty: bool) {
+    let combined: Vec<&str> = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if combined.is_empty() {
+        println!("{}", grey("(running; nothing captured yet)", tty));
+        return;
+    }
+    let start = combined.len().saturating_sub(lines);
+    if start > 0 {
+        println!("{}", grey(&format!("… {start} earlier line(s)"), tty));
+    }
+    for line in &combined[start..] {
+        println!("{}", grey(line, tty));
+    }
+    println!("{}", grey("(still running)", tty));
+}
+
+/// Print one captured stream, dimmed, skipping it when it holds nothing worth a
+/// blank line. A capture that does not end in a newline gets one, so the next
+/// header starts at column zero.
+fn print_captured(text: &str, tty: bool) {
+    if text.trim().is_empty() {
+        return;
+    }
+    print!("{}", grey(text, tty));
+    if !text.ends_with('\n') {
+        println!();
+    }
+}
+
+/// Micro-USD as dollars, to four decimals — a single cheap attempt costs
+/// fractions of a cent, and two decimals would print `$0.00` for real money.
+fn usd(micro_usd: u64) -> String {
+    format!(
+        "${}.{:04}",
+        micro_usd / 1_000_000,
+        (micro_usd % 1_000_000) / 100
+    )
+}
+
+/// Money for a table cell: an em dash when nothing reported a cost, because
+/// `$0.0000` reads as "this was free" rather than "the agent does not say".
+fn money(micro_usd: u64) -> String {
+    if micro_usd == 0 {
+        "—".to_owned()
+    } else {
+        usd(micro_usd)
+    }
+}
+
+/// A token count at a glance: exact when small, else `34.8k` / `1.2M`.
+fn tokens(n: u64) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "display only; f64 is exact well past any real token count"
+    )]
+    match n {
+        n if n < 10_000 => n.to_string(),
+        n if n < 1_000_000 => format!("{:.1}k", n as f64 / 1_000.0),
+        n => format!("{:.2}M", n as f64 / 1_000_000.0),
+    }
 }
 
 /// Dim `s` to grey when its target stream `is_tty` (and NO_COLOR is unset).
@@ -1008,6 +1797,28 @@ fn event_summary(body: &hex_runtime::EventBody) -> String {
             reason,
             disposition,
         } => format!("attempt_failed [{disposition}]: {reason}"),
+        B::AttemptReported {
+            models,
+            cost_micro_usd,
+            ..
+        } => {
+            let spent = cost_micro_usd
+                .or_else(|| {
+                    let per_model: u64 = models.iter().filter_map(|m| m.cost_micro_usd).sum();
+                    (per_model > 0).then_some(per_model)
+                })
+                .map_or(String::new(), |c| format!(", {}", usd(c)));
+            let names: Vec<&str> = models.iter().map(|m| m.model.as_str()).collect();
+            format!(
+                "usage {} tokens{spent}{}",
+                tokens(models.iter().map(hex_runtime::ModelUsage::tokens).sum()),
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", names.join(", "))
+                }
+            )
+        }
         B::RunFinished { disposition } => format!("run_finished: {disposition}"),
         B::Note { text } => format!("note: {text}"),
     }
@@ -1106,7 +1917,10 @@ mod tests {
     fn logs_flags_parse() {
         let cli = parse(&["logs", "run_1", "--node", "build", "--full", "--json"]).unwrap();
         assert!(cli.json);
-        let Some(Command::Logs { run_id, node, full }) = cli.command else {
+        let Some(Command::Logs {
+            run_id, node, full, ..
+        }) = cli.command
+        else {
             panic!("expected logs command");
         };
         assert_eq!(run_id, "run_1");

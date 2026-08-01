@@ -389,6 +389,9 @@ pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<crate::RunState,
     // `RunState::default()` is indistinguishable from post-`run_created`, so the
     // "nothing yet" phase needs its own flag.
     let mut created = false;
+    // At most one `RunFinished` per journal, whichever path recorded the
+    // terminal — see the `is_finished` arm below.
+    let mut run_finished_seen = false;
 
     for (i, e) in events.iter().enumerate() {
         if e.schema_version != PROTOCOL_VERSION {
@@ -398,9 +401,32 @@ pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<crate::RunState,
             ));
         }
         if state.is_finished() {
-            // Only inert diagnostics may trail a terminal.
-            if !matches!(e.body, EventBody::Note { .. }) {
-                return Err(bad(i, "event after the run finished"));
+            match &e.body {
+                // Inert diagnostics may always trail a terminal.
+                EventBody::Note { .. } => {}
+                // `AttemptFailed` is self-terminating, which used to mean a
+                // failed run had no `run_finished` at all and anything tailing
+                // the journal for one never saw the run end. The driver now
+                // appends it on every path, so exactly one may trail — and it
+                // must *agree* with the disposition already on record, or the
+                // journal would state the outcome twice, differently. Absence
+                // stays legal, so journals written before this still read.
+                EventBody::RunFinished { disposition } if !run_finished_seen => {
+                    if Some(*disposition) != state.disposition() {
+                        return Err(bad(
+                            i,
+                            format!(
+                                "run_finished says `{disposition}` but the run already finished as \
+                                 `{}`",
+                                state
+                                    .disposition()
+                                    .map_or_else(|| "?".to_owned(), |d| d.to_string())
+                            ),
+                        ));
+                    }
+                    run_finished_seen = true;
+                }
+                _ => return Err(bad(i, "event after the run finished")),
             }
             continue;
         }
@@ -482,6 +508,7 @@ pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<crate::RunState,
                 if state.awaiting() {
                     return Err(bad(i, "run_finished while an attempt is still in flight"));
                 }
+                run_finished_seen = true;
             }
             // Pause/resume bracket a suspension. Both are recorded at attempt
             // boundaries, so an in-flight attempt makes them impossible.
@@ -539,6 +566,19 @@ pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<crate::RunState,
                         &state,
                         "node_result does not match an in-flight agent attempt that has not \
                          already recorded one",
+                    ));
+                }
+            }
+            // Usage rides inside its attempt like a result, and at most once —
+            // it is summed into the projection, so a duplicate inflates the
+            // bill rather than overwriting a value.
+            EventBody::AttemptReported { .. } => {
+                if !lifecycle::attempt_report_ok(graph, &state, e) {
+                    return Err(bad_at(
+                        i,
+                        &state,
+                        "attempt_reported does not match an in-flight agent attempt that has not \
+                         already reported",
                     ));
                 }
             }
@@ -1216,6 +1256,73 @@ mod tests {
             "{:?}",
             check_journal(&g, &events)
         );
+    }
+
+    /// A failed attempt journal, optionally followed by a `RunFinished` — the
+    /// shape the driver now writes on every path.
+    fn failed_journal(trailing: Option<Disposition>) -> (Graph, Vec<Event>) {
+        let g = cyclic(Budget {
+            attempts: Some(8),
+            ..Budget::default()
+        });
+        let mut events = started_journal();
+        events.push(ev(
+            3,
+            Some("implement"),
+            Some("att_1"),
+            EventBody::AttemptFailed {
+                reason: "attempt exceeded its time budget (killed)".to_owned(),
+                disposition: Disposition::TimedOut,
+            },
+        ));
+        if let Some(disposition) = trailing {
+            events.push(ev(4, None, None, EventBody::RunFinished { disposition }));
+        }
+        (g, events)
+    }
+
+    /// `AttemptFailed` is self-terminating, so a `RunFinished` after it is
+    /// redundant — but it is what gives every run one terminator to tail for.
+    #[test]
+    fn run_finished_may_trail_a_failed_attempt_when_it_agrees() {
+        let (g, events) = failed_journal(Some(Disposition::TimedOut));
+        let state = check_journal(&g, &events).expect("accepted");
+        assert_eq!(state.disposition(), Some(Disposition::TimedOut));
+    }
+
+    /// The whole risk of recording the outcome twice: the two records disagreeing.
+    #[test]
+    fn run_finished_contradicting_the_recorded_disposition_is_rejected() {
+        let (g, events) = failed_journal(Some(Disposition::Succeeded));
+        let issue = check_journal(&g, &events).expect_err("rejected");
+        assert!(
+            issue.message.contains("already finished as"),
+            "{}",
+            issue.message
+        );
+    }
+
+    /// Journals written before the uniform terminator must keep reading — four
+    /// real ones in `.hex/runs/` end at `attempt_failed`.
+    #[test]
+    fn a_failed_run_without_a_trailing_run_finished_still_reads() {
+        let (g, events) = failed_journal(None);
+        let state = check_journal(&g, &events).expect("accepted");
+        assert_eq!(state.disposition(), Some(Disposition::TimedOut));
+    }
+
+    #[test]
+    fn a_second_run_finished_is_rejected() {
+        let (g, mut events) = failed_journal(Some(Disposition::TimedOut));
+        events.push(ev(
+            5,
+            None,
+            None,
+            EventBody::RunFinished {
+                disposition: Disposition::TimedOut,
+            },
+        ));
+        assert!(check_journal(&g, &events).is_err());
     }
 
     #[test]

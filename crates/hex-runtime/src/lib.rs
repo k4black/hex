@@ -27,8 +27,8 @@ pub use doctor::Report as DoctorReport;
 pub use driver::{AttemptView, ProgressSink};
 pub use error::{HexError, Result};
 pub use hex_kernel::graph::NodeKind;
-pub use hex_kernel::{Graph, RunState, Status};
-pub use hex_proto::{Actor, Command, Disposition, Event, EventBody, PROTOCOL_VERSION};
+pub use hex_kernel::{Graph, RunState, Status, Totals, Usage};
+pub use hex_proto::{Actor, Command, Disposition, Event, EventBody, ModelUsage, PROTOCOL_VERSION};
 pub use preset::Entry as GraphEntry;
 pub use workers::Workers;
 pub use worktree::Isolation;
@@ -109,6 +109,43 @@ pub struct StatusReport {
     pub attempts: u32,
     /// Terminal disposition, if finished.
     pub disposition: Option<Disposition>,
+    /// Times each node was entered — the per-node attempt count a spend
+    /// breakdown is read against ("12 attempts on `implement`" is the number
+    /// that explains the bill).
+    pub visits: BTreeMap<String, u32>,
+    /// What the run spent, as the kernel folded it from `AttemptReported`.
+    pub usage: Usage,
+    /// The attempt executing right now, if any — what an operator watching a live
+    /// loop is actually asking about.
+    pub in_flight: Option<InFlight>,
+    /// Control commands sitting in the inbox that no driver has claimed yet.
+    /// Distinct from [`Self::pending_steer`], which has already been journaled:
+    /// between `hex steer` and the driver's next attempt boundary a command is
+    /// real but invisible to the projection, and an operator asking "did that
+    /// land?" needs to see it.
+    pub queued: Vec<Command>,
+    /// Operator guidance already journaled and awaiting the next *agent* attempt.
+    /// Visible because a steer that lands at the next attempt boundary is
+    /// otherwise indistinguishable from one that was dropped.
+    pub pending_steer: Vec<String>,
+    /// The `human` node blocking the run, if any.
+    pub asked: Option<String>,
+    /// That node's question, so the thing you have to answer is on screen with the
+    /// fact that you have to answer it.
+    pub question: Option<String>,
+}
+
+/// The attempt currently executing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlight {
+    /// Its id.
+    pub attempt_id: String,
+    /// The node it is running.
+    pub node_id: String,
+    /// The worker running it (agent attempts only).
+    pub worker: Option<String>,
+    /// When it started (Unix epoch ms), for an elapsed clock.
+    pub started_at_ms: u64,
 }
 
 /// The captured output of one attempt (an agent's or gate's stdout/stderr).
@@ -126,6 +163,41 @@ pub struct AttemptLog {
     pub stdout: String,
     /// Captured stderr.
     pub stderr: String,
+    /// One entry per step of a `command` node, in declared order. Empty for an
+    /// agent attempt, which writes its capture to the attempt dir itself.
+    pub steps: Vec<StepLog>,
+}
+
+/// The captured output of one step of a `command` attempt.
+///
+/// A multi-step command node writes nothing to the attempt dir — every byte
+/// lands in a numbered per-step directory — so without this a failing check's
+/// output was on disk and reachable from no CLI surface at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepLog {
+    /// The step's directory name (`3-test`), which carries its declared position.
+    pub label: String,
+    /// Captured stdout.
+    pub stdout: String,
+    /// Captured stderr.
+    pub stderr: String,
+    /// The step's exit status as the driver recorded it beside its logs (`"0"`,
+    /// `"101"`, or `"signal"`). `None` for a step from before this was recorded,
+    /// or one whose process never produced a status.
+    ///
+    /// This is what lets a reader point at *the* failing check: the journal names
+    /// the failed steps for the attempt, but a step directory alone could not say
+    /// whether it was the culprit.
+    pub exit: Option<String>,
+}
+
+impl StepLog {
+    /// Whether this step failed, as far as its recorded status can say. An
+    /// unrecorded status is not treated as a failure — silence is not evidence.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.exit.as_deref().is_some_and(|code| code != "0")
+    }
 }
 
 /// The in-process runtime: owns config + the worker registry and executes runs
@@ -676,13 +748,70 @@ impl Runtime {
             ))
         })?;
         let (_, state) = self.verify_and_fold(run_id, &events)?;
+        // What is happening *right now*, which is what an operator watching a live
+        // loop is asking. The projection knows an attempt is in flight; only the
+        // journal knows when it started, so the elapsed clock comes from the
+        // `AttemptStarted` event rather than being tracked anywhere.
+        let in_flight = state.current_attempt.as_ref().and_then(|attempt| {
+            let started = events.iter().rev().find(|e| {
+                e.attempt_id.as_ref() == Some(attempt)
+                    && matches!(e.body, EventBody::AttemptStarted { .. })
+            })?;
+            Some(InFlight {
+                attempt_id: attempt.clone(),
+                node_id: started.node_id.clone().unwrap_or_default(),
+                worker: match &started.body {
+                    EventBody::AttemptStarted { worker, .. } => worker.clone(),
+                    _ => None,
+                },
+                started_at_ms: started.at_ms,
+            })
+        });
+        // A run parked on a `human` node is *waiting on you*, and used to report a
+        // bare `running` with the question visible only through `hex watch`.
+        let question = state.asked.as_ref().and_then(|node| {
+            events.iter().rev().find_map(|e| match &e.body {
+                EventBody::HumanRequested { prompt } if e.node_id.as_ref() == Some(node) => {
+                    Some(prompt.clone())
+                }
+                _ => None,
+            })
+        });
         Ok(StatusReport {
             run_id: run_id.to_owned(),
             status: state.status.clone(),
             current: state.current.clone(),
             attempts: state.attempts_total,
             disposition: state.disposition(),
+            visits: state.visits.clone(),
+            usage: state.usage.clone(),
+            in_flight,
+            // Two different "not yet applied" states, and an operator needs both:
+            // `queued` is in the control inbox and no driver has looked at it,
+            // `pending_steer` has been journaled and awaits the next agent attempt.
+            queued: Inbox::new(&run_dir)
+                .queued()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| e.command)
+                .collect(),
+            pending_steer: state.pending_steer.clone(),
+            asked: state.asked.clone(),
+            question,
         })
+    }
+
+    /// Where one attempt's captured streams live, so a client can *tail* them
+    /// while the attempt is still running. The layout stays the runtime's
+    /// knowledge; a follower needs the path, not the rules for building it.
+    ///
+    /// # Errors
+    /// Fails if the run id is not a safe grammar or the run does not exist.
+    pub fn attempt_dir(&self, run_id: &str, attempt_id: &str) -> Result<PathBuf> {
+        // The attempt id comes from the journal, never from an operator, but it
+        // still ends up in a path — so it gets the same grammar check as a run id.
+        validate_run_id(attempt_id)?;
+        Ok(self.run_dir(run_id)?.join("attempts").join(attempt_id))
     }
 
     /// Read every event of a run (for `watch`).
@@ -698,7 +827,8 @@ impl Runtime {
     }
 
     /// The captured per-attempt output of a run, in attempt order — each
-    /// attempt's `stdout.log`/`stderr.log`, mapped to its node via the journal.
+    /// attempt's `stdout.log`/`stderr.log` plus any per-step captures, mapped to
+    /// its node via the journal.
     ///
     /// # Errors
     /// Fails if the run does not exist.
@@ -732,6 +862,7 @@ impl Runtime {
                     result: results.get(attempt_id).cloned(),
                     stdout: read(dir.join("stdout.log")),
                     stderr: read(dir.join("stderr.log")),
+                    steps: step_logs(&dir),
                 });
             }
         }
@@ -1189,6 +1320,41 @@ impl RuntimeClient for Runtime {
     }
 }
 
+/// Read the per-step captures under one attempt directory, in declared order.
+///
+/// The driver names each step dir `<position>-<slug>`, so the position is
+/// recovered by parsing the numeric prefix rather than sorting the names: `10-x`
+/// sorts before `9-x` lexically, which would reorder the evidence of any node
+/// with ten or more steps.
+fn step_logs(attempt_dir: &Path) -> Vec<StepLog> {
+    let Ok(entries) = std::fs::read_dir(attempt_dir) else {
+        return Vec::new();
+    };
+    let mut steps: Vec<(u32, StepLog)> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let label = e.file_name().to_string_lossy().into_owned();
+            let position = label.split_once('-')?.0.parse().ok()?;
+            Some((
+                position,
+                StepLog {
+                    stdout: std::fs::read_to_string(e.path().join("stdout.log"))
+                        .unwrap_or_default(),
+                    stderr: std::fs::read_to_string(e.path().join("stderr.log"))
+                        .unwrap_or_default(),
+                    exit: std::fs::read_to_string(e.path().join("exit"))
+                        .ok()
+                        .map(|s| s.trim().to_owned()),
+                    label,
+                },
+            ))
+        })
+        .collect();
+    steps.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.label.cmp(&b.1.label)));
+    steps.into_iter().map(|(_, s)| s).collect()
+}
+
 /// The project root for a runtime: the current working directory.
 ///
 /// # Errors
@@ -1225,6 +1391,29 @@ mod tests {
         assert!(validate_run_id("a/b").is_err());
         assert!(validate_run_id("a.b").is_err());
         assert!(validate_run_id("").is_err());
+    }
+
+    /// Ten steps is where a lexical sort silently reorders the evidence, so that
+    /// is the case worth pinning: `10-x` must follow `9-x`.
+    #[test]
+    fn step_logs_are_ordered_by_declared_position_not_by_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "hex-steplogs-{}-{}",
+            std::process::id(),
+            test_support::unique()
+        ));
+        for (i, label) in ["9-clippy", "10-test", "1-fmt"].iter().enumerate() {
+            let step = dir.join(label);
+            std::fs::create_dir_all(&step).expect("mkdir");
+            std::fs::write(step.join("stdout.log"), format!("out{i}")).expect("stdout");
+        }
+        // Not a step dir: it must not become a phantom step.
+        std::fs::create_dir_all(dir.join("scratch")).expect("mkdir");
+
+        let labels: Vec<String> = step_logs(&dir).iter().map(|s| s.label.clone()).collect();
+        assert_eq!(labels, ["1-fmt", "9-clippy", "10-test"]);
+        assert_eq!(step_logs(&dir)[1].stdout, "out0");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The advisory lock is real (a no-op would let the second acquire succeed)

@@ -178,6 +178,29 @@ review cycle at 3 rounds without also capping a cheap lint cycle.
 run that reached a success terminal without the required evidence back to earn it;
 without it the run fails, but the reason names the remedy.
 
+**Context** is per node. Each attempt gets a fresh agent session by default;
+`context: continue` resumes *that node's* last one, so a reviewer's second round
+keeps what the first established instead of re-reading a 5k-line diff cold (codex
+`exec resume <id>`, claude `--resume <id>`). The handle comes from the journal, so
+it survives a crash and a `hex resume`. It is scoped per node deliberately: a
+reviewer resuming the implementer's session would inherit its reasoning and stop
+being an independent judge. A node asking for it on a worker that cannot resume is
+refused at **compile** time rather than silently degrading to a fresh session every
+round — the exact cost `continue` exists to avoid; codex and claude can resume,
+opencode and the generic `command` adapter cannot.
+
+The shipped presets apply that per node, and the asymmetry is the point:
+`implement` continues its own session in `critique-loop`, `implement-until-green`,
+`plan-build-review` and `tdd` (plus `tdd`'s `spec`, which `red` sends back when the
+new test did not actually fail), so a revisited node keeps what it already worked
+out instead of re-deriving the task every round; `review` stays `fresh`, because a
+reviewer continuing its own session carries its earlier verdict into the next one,
+which is how a critic talks itself into approving what it already argued about.
+`autoresearch` keeps every attempt fresh on purpose — its continuity is on disk in
+`.hex/research-notes.md`. The trade is the compile-time refusal above: rebind the
+`implementer` role to a `kind: command` worker and those presets refuse to start
+until you set `context: fresh` on the named node, which the error says.
+
 ## Config & presets
 
 Layered config, project wins: `~/.config/hex/config.yaml` (user) ←
@@ -220,6 +243,14 @@ Four roles ship: `implementer`, `reviewer`, `planner`, `researcher`. There is
 deliberately **no orchestrator role** — routing is structural (the graph's edges),
 never a token-spending agent.
 
+`hex init` writes the project layer: `.hex/` + `.hex/graphs/`, a commented starter
+`.hex/config.yaml` with every key inert (the built-in layer already supplies
+working workers and roles, and an uncommented copy here would freeze this
+machine's defaults into the repository), and `.hex/runs/` + `.hex/worktrees/`
+appended to `.gitignore` when they are absent. Its `checks:` is empty with the
+examples commented out — hex autodetects nothing, because what "green" means is
+your call. It never overwrites an existing config, so running it twice is safe.
+
 ### Checks: the gate is yours, and there is none by default
 
 A graph names a check (`command: { check: test }`); your project supplies the
@@ -255,9 +286,19 @@ and `hex run` refuses to start when the graph needs an agent CLI that is not on
 
 ```bash
 hex doctor
+#   ok      self    hex      /Users/me/.cargo/bin/hex
 #   ok      worker  codex    /opt/homebrew/bin/codex
 #   MISSING check   lint     `ruff` not found on PATH
 ```
+
+The `self` row probes `hex` itself, and a missing one makes `doctor` exit 1: the
+agent's `hex emit` channel is a plain `PATH` lookup in the agent's *own* shell and
+hex deliberately injects no `PATH` (installing the binary is the operator's job),
+so its absence leaves every node with more than one outcome unroutable — which
+broke 3 of 3 real agent runs and showed up as a 15-minute timeout. It is
+deliberately *not* part of the start-time preflight: a single-outcome node
+completes implicitly without ever calling `hex`, so refusing every run would block
+work that would have succeeded.
 
 A **preset** is a named graph resolved through three layers: `.hex/graphs/`
 (project) > `~/.config/hex/graphs/` (user) > built-in. The built-in library
@@ -306,8 +347,9 @@ The same verbs work from the CLI, MCP, and dashboard; all support `--json` /
 NDJSON, stable exit codes, and `capabilities` introspection.
 
 ```text
+hex init                 scaffold `.hex/` + a starter config in this repo
 hex list                 list runnable graphs (project > user > built-in)
-hex doctor               are the configured workers and checks usable?
+hex doctor               are `hex`, the configured workers and checks usable?
 hex validate <graph>     schema, references, bounded cycles, a reachable success
 hex graph <graph>        render a graph as text
 hex run [<graph>]        start a NEW run (no graph → list what's runnable)
@@ -315,10 +357,12 @@ hex run [<graph>]        start a NEW run (no graph → list what's runnable)
                          [--no-preview] disable the live in-flight pane
 hex resume <run>         continue the SAME run (after a pause or a crash)
 hex runs                 list runs, newest activity first
-hex status <run>         projected run status
+hex status <run>         projected run status + what the run spent
 hex wait <run>           block until it finishes; exit with its disposition
-hex watch <run>          print the recorded event stream
-hex logs <run> [--node <id>] [--full]   per-attempt final message
+hex watch <run>          print the event stream ([--follow] until the run ends)
+hex logs <run> [--node <id>] [--full] [--tail N] [--follow]
+                         each attempt's final message + every check's output; a
+                         still-running attempt's tail, streamed with --follow
 hex pause <run>          pause at the next attempt boundary
 hex steer <run> <text>   add operator guidance to the next attempt
 hex respond <run> <text> answer a blocking `human` node
@@ -330,9 +374,58 @@ hex emit <event>         worker→runtime, scoped-token control
 parsing output: `0` succeeded · `1` failed · `2` usage error · `3` timed out ·
 `4` budget exhausted · `5` cancelled · `6` paused.
 
-Still unbuilt: `interactive` sessions, `context: continue` (a reviewer with memory
-across rounds), cost/token accounting, stall detection, a run digest,
-`watch --follow`, and `graph --format mermaid|dot`.
+Still unbuilt: `interactive` sessions, stall detection, and
+`graph --format mermaid|dot`.
+
+### What a run reports when it ends
+
+`hex run`/`hex resume` finish by printing what the run *produced*, not only its
+verdict: the kernel's reason for stopping (`why:`), what it spent, each failed
+check's label with its exit code and a 40-line tail of its output, and the final
+message. `--json` carries the same fields (`why`, `result`, `failed_steps`,
+`usage`). Before this the end of a run was two lines, so a four-minute
+cross-model review reported `disposition: failed` and left its findings on disk,
+named by no output at all.
+
+`hex logs` reaches a `command` node's step output at all now. A multi-step node
+writes every byte into `attempts/<id>/<n>-<label>/` (plus a recorded `exit` file),
+listed with its attempt in **declared** order — numerically, so `10-` follows
+`9-`. `--full` prints both captured streams, and it writes to **stdout**, because
+a transcript is requested data rather than a diagnostic: `hex logs <id> --full >
+out.txt` now captures it.
+
+An attempt that timed out or exited nonzero no longer throws away what the agent
+already wrote. Capture always runs, and with no final message the bounded **tail**
+(8 KB, from stdout *and* stderr — codex writes everything to stderr) becomes the
+node's result, prefixed `[partial output — …]` because a downstream
+`{{node.result}}` can interpolate it. A timed-out attempt also takes its whole
+process group down (`SIGTERM`, 2s grace, `SIGKILL`); before that, grandchildren —
+the `cargo test` the agent shelled out to — were reparented to pid 1 and survived
+every timeout.
+
+### What a run spent
+
+Every number comes from the agent's own structured output and nowhere else. codex
+runs `codex exec --json` and yields tokens only — its stream names no model and no
+cost, so the per-model split is labelled with the role's configured model; claude
+reports `modelUsage` per model with `costUSD`, plus `total_cost_usd`,
+`duration_ms` and a `session_id`. hex never estimates and ships **no price
+table**: an agent that reports no money shows no money, because a made-up cost is
+worse than an absent one.
+
+Money is integer **micro-USD** end to end. An `Event` is `Eq` and the journal
+compares facts, so a currency amount that round-trips through JSON as an `f64` is
+a fact that can change value on replay.
+
+Each attempt journals an `AttemptReported` — on *every* outcome, including a
+timeout, because an attempt that burned tokens and then died is exactly the one
+whose cost you need — and `reduce` sums them into `RunState.usage`
+(`by_node` · `by_model` · `total`). It is a projection like every other read
+model, so `hex status`, the end-of-run line and any later client read one set of
+numbers computed one way. `hex status` shows per-node rows against the attempts
+that produced them, then per-model rows, then the total, in text and in `--json`;
+it prints nothing when nothing reported usage, since a table of zeroes reads like
+a free run rather than a silent one.
 
 ### Driving hex from another agent, or from a second terminal
 
@@ -345,6 +438,8 @@ authority scoped per actor.
 ```bash
 id=$(hex run critique-loop -p "fix the flaky auth test" --detach)
 hex runs                              # what's alive, hung, or abandoned
+hex status "$id"                      # in-flight attempt, elapsed, pending steers
+hex logs   "$id" --follow             # tail the agent until the run ends
 hex steer  "$id" "prefer the existing retry helper"
 hex pause  "$id"; hex resume "$id"
 hex respond "$id" "approved, but skip the cache part"
@@ -362,6 +457,55 @@ sticky footer that tails the in-flight attempt's output with a status line
 (node · worker · attempt N/budget · elapsed · deadline). It auto-disables for a
 non-TTY, `--json`, or `--no-preview`, falling back to plain event-line streaming.
 
+### Checking in on a live run, and steering it
+
+`hex status` answers *what is happening now*, not only "is it running":
+
+```text
+status: running
+current: work
+attempts: 3
+in flight: att_3 on work via implementer, running 12s
+queued steer (not yet picked up): prefer the existing retry helper
+steer accepted (applies to the next agent attempt): keep the diff small
+```
+
+The elapsed clock is read off the attempt's `AttemptStarted` event: the projection
+knows an attempt is in flight, but only the journal knows when it began. A run
+parked on a `human` node prints `waiting for you: hex respond <id> "…"` with the
+question itself, so the thing you have to answer is on screen next to the fact that
+you have to answer it. `--json` carries every one of these fields.
+
+**A steer has two stages, and conflating them is what made one look lost.**
+`queued` means the command is in the control inbox and no driver has claimed it;
+`steer accepted` means it is already journaled and waiting for the next *agent*
+attempt to read it. `hex steer` says which you are getting: with an attempt already
+running it adds, on stderr, `note: <id> is mid-attempt (att_1 on work); the steer
+applies to the NEXT attempt` — a steer is drained at an attempt boundary, and
+without that line an operator expects the running agent to change course and reads
+the unchanged output as a dropped command.
+
+`hex logs --follow` streams the in-flight attempt's output until the run ends, then
+closes with a `── succeeded ──` line. It follows *across* attempts, including a
+`command` node's numbered step directories — a gate is exactly the slow thing you
+wait on. It attaches at each stream's **tail**, so joining a long attempt shows what
+it is doing now rather than replaying an hour, and it drains an attempt's final
+bytes when that attempt stops being in flight, because the most interesting line —
+a check's failure, an agent's last word — is written after the last poll that could
+still see it. Without `--follow`, a still-running attempt shows its last `--tail N`
+lines (default 20) and `(still running)`, instead of the `(no final message
+captured)` it used to print over ten lines of live output. Both streams either way:
+codex writes everything to stderr and nothing to stdout, so one stream alone is
+silent for one of the two agents.
+
+`hex watch --follow` prints new events until the run finishes, cursored by event
+count — the journal is append-only, so "how many have I printed" is the whole
+cursor. Both followers wait up to 15s for a just-reserved run's journal, so
+`hex logs --follow "$(hex run … --detach)"` — the obvious thing to type — works
+instead of failing on a run directory that exists a moment before its first event;
+a typo still fails fast, because "not started yet" and "does not exist" are
+distinguished.
+
 ## Workspace isolation
 
 Owned by the runtime, opt-in per run: `hex run <graph> --worktree [<base>]`
@@ -377,9 +521,10 @@ worktrees, and a serialized integration queue arrive later.
 
 ## Status
 
-**Phase 1 works, plus three follow-up passes.** The critique loop runs end-to-end
+**Phase 1 works, plus five follow-up passes.** The critique loop runs end-to-end
 on real agent CLIs, records everything to a JSONL journal, enforces run *and*
-per-attempt budgets, resumes a killed run, and reports why it stopped.
+per-attempt budgets, resumes a killed run, and reports why it stopped, what it
+produced, and what it cost.
 
 Landed 2026-07-30 — operability: project-defined `checks:`, `hex doctor` +
 start-time preflight, disposition exit codes, terminal reasons in the journal, and
@@ -396,6 +541,36 @@ Landed 2026-07-31 — control & detach: the file-based control inbox
 (`cancel`/`pause`/`resume`/`steer`/`respond`), working `human` nodes, detached
 runs with heartbeat liveness, and `hex runs`/`wait`. hex now reviews its own
 diffs: see [`.hex/graphs/self-review.yaml`](.hex/graphs/self-review.yaml).
+
+Landed 2026-07-31 — output, partials, cost: driven by hex's own `self-review`
+runs, which produced real reviews and reported `disposition: failed` and nothing
+else. `run`/`resume` now print the run's payoff (terminal reason, spend, each
+failed check's tail, the final message); `hex logs` reaches command-step output and
+`--full` writes to stdout; a timed-out or crashed attempt keeps a bounded tail of
+what the agent wrote instead of discarding it, and takes its whole process group
+with it; per-attempt usage is journaled in micro-USD and folded into a
+`RunState.usage` projection that `hex status` renders per node and per model; every
+run now ends with a `RunFinished` whatever path it took; `context: continue`
+(per-node session resume, refused at compile time on a worker that cannot — hex's
+own `self-review` review node uses it); `hex init`; and a `doctor` row for `hex`
+itself, whose absence had broken the `hex emit` channel in 3 of 3 real agent runs.
+
+Landed 2026-07-31 — a live run you can see and steer: checking in on one used to
+tell you almost nothing, because `hex status` printed three lines with no clock,
+`hex logs` said `(no final message captured)` while ten lines of the agent's output
+sat in `stdout.log`, and a queued `hex steer` was invisible on every surface.
+`hex status` now reports the in-flight attempt with an elapsed clock, the blocking
+`human` question, and a steer's *two* stages (in the inbox vs journaled and waiting
+for the next agent attempt); `hex steer` says when it will land; `hex logs` tails a
+running attempt and `--follow` streams it across attempts and command steps;
+`hex watch --follow` tails the journal. Both followers wait for a `--detach`ed run's
+first event. Smaller honesty fixes in the same pass: `hex runs` sizes its columns
+from the data (`finished:budget_exhausted` used to run into the next field),
+`hex logs --json` reports each step's `exit`/`failed` so a driving agent can name
+the check that went red, a cost of zero renders as an em dash rather than claiming
+the work was free, and the spend column is labelled `VISITS` because that is what
+the projection counts. Also: the shipped presets now declare `context: continue` on
+the node a loop revisits and keep the reviewer `fresh`.
 
 ### Known broken
 
@@ -416,20 +591,23 @@ busy. Seen on both worktree-slot and run locks; its user-visible symptom is
 would catch it are serialized, so **"parallel runs grow the pool" is currently an
 untested claim.**
 
-**Not built** (designed, decided, not yet shipped): `context: continue` (a reviewer
-with memory across rounds), stall detection, cost/token accounting, a run digest,
-`hex config show`, `graph --source`, `watch --follow`, `interactive` sessions,
-`templates:`/`extends:`, capability matching, and the MCP client. `hex-mcp` /
-`hex-dashboard` are still stubs. A timed-out attempt also discards the agent's
-partial output, which is the wrong shape for a tool built on bounded runs.
-Roadmap and the locked decisions behind each: [`TODO.md`](TODO.md).
+**Not built** (designed, decided, not yet shipped): stall detection, `hex config
+show`, `graph --source`, `interactive` sessions, `templates:`/`extends:`,
+capability matching beyond the `context: continue` check, and the MCP client.
+The followers poll at 400ms rather than watching the filesystem, and there is no
+`hex logs --json --follow` (streaming NDJSON) yet. `hex-mcp` / `hex-dashboard` are
+still stubs. A **run digest** verb is off the list rather than pending: the end-of-run output and `hex status`
+already carry the breakdown from the same projection, and a third surface for it
+would only be somewhere for the three to disagree. Roadmap and the locked
+decisions behind each: [`TODO.md`](TODO.md).
 
 ```bash
 cargo build --workspace     # build everything
 cargo test  --workspace
 cargo clippy --workspace --all-targets
+hex init                    # .hex/ + a starter config (safe to re-run)
 hex list
-hex doctor                  # are codex/claude installed? are my checks runnable?
+hex doctor                  # is hex on PATH? codex/claude installed? checks runnable?
 hex validate critique-loop
 hex run critique-loop -p "fix the flaky auth test"
 ```

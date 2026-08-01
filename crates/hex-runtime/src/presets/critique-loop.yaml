@@ -31,6 +31,16 @@ entry: implement
 nodes:
   implement:
     agent:
+      # Revisited every round, so it continues its own agent session: the
+      # implementer keeps what it already worked out instead of re-deriving the
+      # task and the codebase on every attempt. The reviewer below deliberately
+      # stays `fresh` — a review has to be an independent judgement, not a
+      # continuation of the conversation that produced the code.
+      #
+      # Needs a worker that can resume (codex and claude can). If you rebind the
+      # `implementer` role to a `kind: command` worker, the run is refused at
+      # compile time naming this node — set `context: fresh` here in that case.
+      context: continue
       prompt: |
         Task: {{prompt}}
 
@@ -47,6 +57,10 @@ nodes:
   review:
     agent:
       role: reviewer
+      # Inherits `context: fresh`, and that is the point: every round is a fresh
+      # pair of eyes on the *current* diff. A reviewer continuing its own session
+      # would carry its earlier verdict into the next one, which is how a critic
+      # talks itself into approving what it already argued about.
       prompt: |
         Review the current working-tree changes against this task: {{prompt}}
 

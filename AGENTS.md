@@ -174,11 +174,11 @@ sign-off, confirmation.
 
 1. Binary is `hex`, package is `hex-cli` — use `cargo run --bin hex`, not `-p hex`.
 2. Phase 1 (slim MVP) is implemented and green; Phase 2+ items in TODO.md are
-   still stubs or unbuilt. Node kinds `agent`/`command`/`terminal` work;
-   All four node kinds now work, `human` included (answered with `hex respond`).
-   Still unbuilt: `interactive`, `context: continue` (session resume),
-   `templates:`/`extends:`, capability matching, cost/token accounting, stall
-   detection, and a run digest. `hex-mcp`/`hex-dashboard` are empty stubs.
+   still stubs or unbuilt. All four node kinds work, `human` included (answered
+   with `hex respond`), as do `context: continue` (gotcha 33) and token/cost
+   accounting (gotchas 27-29). Still unbuilt: `interactive`,
+   `templates:`/`extends:`, capability matching *for anything but session resume*,
+   and stall detection. `hex-mcp`/`hex-dashboard` are empty stubs.
 3. A node's routing token is an `EventBody::Signal { name }` — agent proposals
    *and* command verdicts (`passed`/`failed`) unify there; edges match on `name`.
    `reduce(graph, state, event)` owns routing (it takes the graph); `schedule`
@@ -344,9 +344,10 @@ sign-off, confirmation.
    `HumanResponded` stores the answer as the node's result so `{{node.result}}`
    works exactly like an agent's. `E-human-no-edge`/`E-human-multi-edge` keep the
    validator honest — an answer is text, not a signal, so >1 outgoing edge could
-   never be chosen between. **Known wart:** the answer is fenced downstream as
-   "untrusted agent output" because `interpolate` does not know node kinds — safe
-   default, factually wrong label.
+   never be chosen between. Downstream the answer is fenced as *operator input*,
+   not "untrusted agent output" (`driver.rs`, pinned by
+   `a_human_answer_is_labelled_operator_input_not_agent_output`) — an earlier
+   version of this gotcha claimed otherwise and was stale.
 23. **Detach re-execs, never forks.** `--detach` spawns `current_exe()` with a
    hidden `--reserved-run-id`, stdio to `detached.{out,err}`, and
    `process_group(0)`; the launcher exits without `wait()`ing. `fork()` is unsafe
@@ -382,4 +383,130 @@ sign-off, confirmation.
    It deliberately omits a `nodes.contains_key(to)` check because `schedule` never
    had one; target existence is enforced by `E-accept-unmet-node` and
    `lifecycle::unmet_reroute_ok`.
-27. _add new gotchas here as they are discovered_
+27. **Money is integer micro-USD, never `f64`.** `Event`/`EventBody` derive `Eq`,
+   which a float field would break, and a cost that round-trips through JSON as a
+   float is a recorded fact that can change value on replay. `$0.1778` is
+   `177_800`. `hex-proto`'s `ModelUsage.cost_micro_usd` and the kernel's
+   `Totals.cost_micro_usd` are the only spellings; the CLI's `usd()` renders them
+   to four decimals (two would print `$0.00` for a real cheap attempt).
+28. **hex never estimates a cost.** Usage comes from each agent's own structured
+   output, parsed by that agent's adapter: codex from `codex exec --json`
+   (`thread.started.thread_id`, `turn.completed.usage`), claude from the
+   `--output-format json` object it already parses (`modelUsage` per model,
+   `total_cost_usd`). codex reports **no model name and no cost**, so its rows are
+   tokens only, labelled with the role's configured model or `"codex"`. There is
+   deliberately no price table — prices drift, and a wrong number is worse than an
+   absent one. `cost_micro_usd` stays `Option` so one could be added later without
+   a schema change. Parsers are tested against **captured real output** in
+   `crates/hex-worker/tests/fixtures/`: the first draft of the codex parser looked
+   for a `token_count` event that does not exist, and only a real fixture caught it.
+28b. **codex's `input_tokens` includes its cached tokens; claude's does not.**
+   codex follows the OpenAI convention (`input_tokens` is the whole prompt,
+   `cached_input_tokens` the part that hit cache), so the fresh share is the
+   *difference* — adding both bills the cached tokens twice. Anthropic reports
+   `cacheReadInputTokens`/`cacheCreationInputTokens` *beside* `inputTokens`, so
+   nothing is subtracted there. `reasoning_tokens` is a subset of output on both
+   and is carried for information only, never added into `tokens()`.
+29. **`AttemptReported` is recorded before anything that can end the attempt**, and
+   at most once per attempt. `reduce` clears `current_attempt` when a signal
+   routes, so a report written after it fails `correlated` and is silently dropped.
+   The at-most-once guard (`lifecycle::attempt_report_ok` + `RunState
+   .reported_attempt`) exists because usage is *summed*, not overwritten: unlike a
+   duplicate `NodeResult`, a duplicate report inflates the bill rather than
+   replacing a value. Cost per node comes from the attempt's own total when the
+   agent reported one, else the sum of its per-model costs — never both, or claude
+   (which reports both) would be billed twice.
+30. **Every run ends with `RunFinished`, and `AttemptFailed` still carries the
+   disposition.** The duplication is deliberate: `AttemptFailed` stays
+   self-terminating (one atomic durable fact), and the trailing `RunFinished` gives
+   every consumer *one* terminator to tail for — before it, a timed-out run's
+   journal simply stopped. `check_journal` allows at most one trailing
+   `RunFinished` and only when its disposition **equals** the recorded one;
+   absence stays legal, which is what keeps pre-change journals readable.
+31. **A killed attempt takes its process group.** `logged_command` spawns with
+   `process_group(0)` and `wait_bounded`'s deadline path sends `killpg(SIGTERM)`,
+   waits 2s, then `SIGKILL`, through `nix`'s safe wrapper (the workspace forbids
+   `unsafe`, so `libc::killpg` is not an option). `child.kill()` alone reparented
+   an agent's grandchildren — a build, a test run, a dev server — to pid 1, and
+   they survived every timeout. Pinned by
+   `a_timed_out_attempt_kills_the_whole_process_group`, which was verified to fail
+   against the old behaviour before being kept.
+32. **A dead attempt's output is salvaged, not discarded.** `run_agent` captures
+   the result *and* the usage report before branching on the outcome; both failure
+   paths (timeout **and** nonzero exit) used to return above that point. With no
+   final message, the bounded 8 KB **tail** of stdout *and* stderr becomes the
+   node's result, prefixed `[partial output — …]`. The tail, not the head: an
+   agent's newest output is the informative part. It is a real `NodeResult`, so it
+   shows up in `hex logs` and the end-of-run output — but note it does **not**
+   reach a downstream `{{node.result}}` today, because the same paths call
+   `fail_attempt`, which is terminal. The marker earns its keep for the human
+   reading it; the "downstream handoff" justification an earlier version of this
+   gotcha gave was wrong, and would only apply if a failed attempt ever routed on.
+33. **`context: continue` resumes *that node's* session, and is refused at compile
+   time when the worker cannot.** The handle is `RunState.sessions[node]`, folded
+   from `AttemptReported.session_id`, so it survives a crash and a `hex resume`.
+   Per node on purpose: a reviewer resuming the implementer's session inherits its
+   reasoning and stops being an independent judge. `check_workers` (runtime, not
+   kernel — only the runtime may see a worker) rejects the node unless its worker
+   declares `Capability::SessionResume`, because silently degrading to a fresh
+   session costs exactly what the policy exists to avoid. This is the capability
+   manifest's **first real consumer**; before it, `Worker::capabilities()` had zero
+   callers workspace-wide.
+33b. **`codex exec resume` takes a smaller flag set than `codex exec`** — no
+   `--sandbox`, no `--add-dir`, no `--cd`. Those become `-c
+   sandbox_mode="workspace-write"` and
+   `-c sandbox_workspace_write.writable_roots=[…]`. Both key names were verified
+   against the CLI with `--strict-config`, which rejects an unknown field before
+   contacting the model (so it costs nothing to check).
+34. **A command step records its exit status to an `exit` file** beside its logs,
+   because nothing else remembers it: the journal keeps the *attempt's* verdict and
+   the names of the failed steps, so a reader of one step directory could not tell
+   whether that step was the culprit. It is the recorded string (`"0"`, `"101"`,
+   `"signal"`), not a typed status. `StepLog::failed()` treats an *unrecorded*
+   status as not-failed — silence is not evidence.
+35. **`hex doctor` probes `hex` itself, and nothing injects it into the agent's
+   `PATH`.** `hex emit` is a plain PATH lookup in the agent's own shell; it
+   returned 127 in 3 of 3 real agent runs, and two only survived because codex went
+   hunting for `target/debug/hex` on its own. Placing the binary on PATH is
+   deliberately the operator's job, so the fix is a `self` row that *reports* the
+   gap (exit 1) rather than a silent environment edit. It is **not** in
+   `preflight`: a single-outcome node completes implicitly without ever calling
+   `hex`, so refusing every run would block work that would have succeeded.
+36. **A steer has two "sent but not applied" states, and `Inbox::queued()` must stay
+   read-only.** A command sits in `control/inbox/` until the driver claims it at an
+   attempt boundary (`hex status`: `queued steer (not yet picked up)`), and only then
+   becomes a journaled `Steered` in `RunState.pending_steer` (`steer accepted
+   (applies to the next agent attempt)`). Conflating them is what made a steer look
+   dropped: the projection could not see the first state and the inbox no longer
+   holds the second. `Inbox::queued()` therefore reads the directory and moves
+   **nothing** into `done/` — a read that consumed a command would delete the very
+   steer the operator was checking on. `hex steer` also prints, on stderr, that an
+   in-flight attempt will not see it, since drain happens between attempts.
+37. **A follower must drain a stopped attempt, and must wait for a reserved run's
+   journal.** `follow_logs` polls `status().in_flight`; an attempt stops being
+   in-flight the instant it terminates, so its last bytes — a check's failure line,
+   an agent's final word — are written *after* the poll that could still see them.
+   Drain the streams before detaching (`drain_streams(..., false, ...)`), or the most
+   interesting line of the attempt is the one nobody sees. `attempt_streams` collects
+   the attempt's own two logs plus each numbered step dir's, in **declared** position
+   order (`10-` after `9-`), because a `command` node writes nothing to the attempt
+   dir and a gate is what you actually wait on. Attach at each stream's *tail*, not
+   its head. And both followers call `wait_for_journal` (15s, `FOLLOW_POLL` 400ms):
+   `--detach` reserves the run dir before the driver's first write, so
+   `hex logs --follow "$(hex run … --detach)"` would otherwise fail instantly —
+   "not started yet" vs "does not exist" is told apart via `summary`, so a typo still
+   fails fast. `Runtime::attempt_dir` hands out the path (`validate_run_id`'d, since
+   an attempt id ends up in one) so no client learns the on-disk layout.
+38. **Preset session policy: the implementer continues, the reviewer stays fresh.**
+   `context: continue` is declared on the node a loop revisits (`implement` in
+   `critique-loop`/`implement-until-green`/`plan-build-review`/`tdd`, plus `tdd`'s
+   `spec`, which `red` sends back), and deliberately *not* on `review` — a reviewer
+   continuing its own session carries its earlier verdict into the next round, which
+   is how a critic talks itself into approving what it already argued about.
+   `autoresearch` stays all-`fresh` because its continuity is on disk
+   (`.hex/research-notes.md`). Consequence to remember before rebinding a role:
+   `check_workers` **refuses at compile time** a `continue` node whose worker lacks
+   `Capability::SessionResume` (gotcha 33), so pointing `implementer` at a
+   `kind: command` worker makes these presets refuse to start until that node says
+   `context: fresh`. Preset comments say so at the point of use — keep them there.
+39. _add new gotchas here as they are discovered_

@@ -30,9 +30,11 @@
 //!
 //! Beyond those, `check_journal` also enforces *shape* facts that are not
 //! lifecycle rules at all and so have no predicate here: the protocol version,
-//! `run_created` appearing exactly once and first, only inert `Note`s trailing a
-//! terminal, and `attempt_started` carrying both ids (a clearer message for what
-//! [`attempt_start_ok`] would reject anyway).
+//! `run_created` appearing exactly once and first, what may trail a terminal
+//! (inert `Note`s, plus the single uniform `RunFinished` a self-terminating
+//! `AttemptFailed` may be followed by — it must *agree* with the disposition
+//! already recorded), and `attempt_started` carrying both ids (a clearer message
+//! for what [`attempt_start_ok`] would reject anyway).
 
 use hex_proto::{Disposition, Event};
 
@@ -106,6 +108,19 @@ pub(crate) fn node_result_ok(graph: &Graph, state: &RunState, event: &Event) -> 
             .current
             .as_deref()
             .is_some_and(|cur| !state.results.contains_key(cur))
+}
+
+/// Whether an `AttemptReported` may be recorded here: inside an in-flight
+/// *agent* attempt that has not already reported.
+///
+/// The "not already" clause is not symmetry with [`node_result_ok`] for its own
+/// sake — usage is *summed* into the projection, so a duplicate record does not
+/// overwrite a fact, it inflates one. A replayed report would bill the run
+/// twice, and a cost you cannot trust is worse than no cost at all.
+pub(crate) fn attempt_report_ok(graph: &Graph, state: &RunState, event: &Event) -> bool {
+    correlated(state, event)
+        && current_kind(graph, state) == Some(NodeKind::Agent)
+        && state.reported_attempt != state.current_attempt
 }
 
 /// Whether a `HumanRequested` may be recorded here: an idle running run parked

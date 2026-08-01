@@ -26,6 +26,10 @@ sha2 = "0.10"
 fs4 = { version = "1", features = ["sync"] }   # OS advisory file locks (maintained fs2 successor)
 uuid = { version = "1", features = ["v4"] }    # collision-resistant run-id suffixes
 humantime = "2"              # parse `30m`/`2h`/`500ms` budget durations
+# Safe wrappers for the POSIX signal calls; `killpg` is what lets a timed-out
+# attempt take its whole process group down instead of orphaning grandchildren.
+# A safe wrapper, so the workspace's `unsafe_code = "forbid"` still holds.
+nix = { version = "0.30", features = ["signal"] }
 thiserror = "2"              # derive Display/Error on the runtime error type
 # inline-viewport TUI for the live run preview; unstable-rendered-line-info
 # provides Paragraph::line_count for wrapping inserted lines.
