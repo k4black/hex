@@ -44,6 +44,17 @@ impl std::fmt::Display for Issue {
 pub fn validate(graph: &Graph) -> Result<(), Vec<Issue>> {
     let mut issues = Vec::new();
 
+    // A zero bound is spent before the first attempt, so the run would end
+    // `budget_exhausted` having done nothing. That reads as a hex bug rather than
+    // a typo, and hex's habit is to refuse before the run starts.
+    if graph.budget.output_tokens == Some(0) {
+        issues.push(Issue::new(
+            "E-budget-zero",
+            "`budget.output_tokens: 0` is spent before the first attempt — omit it \
+             for no bound, or give it a real ceiling",
+        ));
+    }
+
     if graph.nodes.is_empty() {
         issues.push(Issue::new("E-empty", "graph has no nodes"));
     }
@@ -373,7 +384,8 @@ fn check_signal_names(graph: &Graph, issues: &mut Vec<Issue>) {
 /// machine, and the two drifted — an `AcceptanceUnmet` moved `reduce`'s current
 /// node but not this one's, so a single legitimate `accept.on_unmet` reroute made
 /// every later `status`/`logs`/`resume` reject the journal as invalid, forever.
-/// Each rule is now one predicate in [`crate::lifecycle`], shared with `reduce`:
+/// Each rule is now one predicate in the private `lifecycle` module, shared
+/// with `reduce`:
 /// what `reduce` silently drops is exactly what this reports. Only *shape* facts
 /// outside the projection (has `run_created` been seen at all) are tracked here;
 /// the deliberate exceptions are enumerated in the `lifecycle` module doc.

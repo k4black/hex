@@ -88,6 +88,9 @@ struct RawBudget {
     /// [`DEFAULT_ATTEMPT_ELAPSED_MS`] so no attempt ever waits forever.
     attempt: Option<String>,
     cycle_visits: Option<u32>,
+    /// Run-wide bound on *generation* tokens (see [`Budget::output_tokens`]).
+    /// A plain count: unlike a duration there is no unit to spell.
+    output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -473,6 +476,7 @@ fn compile_budget(raw: Option<&RawBudget>) -> Result<Budget> {
                 .unwrap_or(DEFAULT_ATTEMPT_ELAPSED_MS),
         ),
         cycle_visits: raw.cycle_visits,
+        output_tokens: raw.output_tokens,
     })
 }
 

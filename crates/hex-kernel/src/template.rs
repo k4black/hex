@@ -1,10 +1,9 @@
 //! The shared grammar for node-prompt templates: `{{prompt}}` (the operator's
 //! prompt) and `{{<node>.result}}` (a handoff of another node's captured
-//! result). The kernel owns this parser so validation ([`check_result_refs`])
+//! result). The kernel owns this parser so validation (`check_result_refs`)
 //! and the runtime's attempt-start interpolation can never disagree on what a
 //! token *is* — a graph that validates renders exactly as validated.
 //!
-//! [`check_result_refs`]: crate::validate
 
 /// One span of a prompt template, yielded in source order by [`tokens`].
 #[derive(Debug, PartialEq, Eq)]

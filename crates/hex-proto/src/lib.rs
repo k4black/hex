@@ -266,6 +266,16 @@ pub enum EventBody {
         /// the journal, so it survives a crash.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+        /// The external program that owns `session_id` — `codex`, `claude`.
+        ///
+        /// Not the worker registry name: a graph names a *role*, and a role is
+        /// registered under its own alias, so `implementer` still equals
+        /// `implementer` after you rebind it from codex to claude. Comparing the
+        /// alias therefore permitted exactly the mistake it was added to prevent
+        /// (`claude --resume <codex-thread-id>`). The program owns the session, so
+        /// the program is the identity worth recording.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
         /// Per-model usage. A list rather than one model per event because a
         /// single claude attempt genuinely bills several models (its
         /// `modelUsage` map); codex yields one entry.
@@ -338,9 +348,17 @@ pub struct ModelUsage {
 
 impl ModelUsage {
     /// Every token this model consumed, however the agent classified it.
+    ///
+    /// Saturating: these are numbers an agent reported and a journal replayed, so
+    /// nothing here is trusted arithmetic. An unchecked sum would panic in debug
+    /// on a garbled value, and a projection recomputed on every read turns that
+    /// panic into a permanently unreadable run.
     #[must_use]
     pub fn tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
     }
 }
 
@@ -504,6 +522,7 @@ mod tests {
     fn attempt_report_roundtrips_with_exact_money() {
         let ev = event(EventBody::AttemptReported {
             session_id: Some("cf95788d".to_owned()),
+            agent: Some("claude".to_owned()),
             models: vec![ModelUsage {
                 model: "claude-opus-5".to_owned(),
                 input_tokens: 2,
@@ -529,6 +548,7 @@ mod tests {
     fn attempt_report_omits_absent_cost_and_session() {
         let ev = event(EventBody::AttemptReported {
             session_id: None,
+            agent: None,
             models: vec![],
             cost_micro_usd: None,
             duration_ms: None,

@@ -89,7 +89,7 @@ pub struct RunState {
     pub pending_steer: Vec<String>,
     /// The attempt that has already recorded an `AttemptReported`, so a second
     /// one cannot inflate the usage totals (see
-    /// [`lifecycle::attempt_report_ok`]). Cleared when the next attempt starts;
+    /// `lifecycle::attempt_report_ok`). Cleared when the next attempt starts;
     /// one field suffices because only one attempt is ever in flight.
     pub reported_attempt: Option<String>,
     /// Token and cost accounting, summed from `AttemptReported` and split by
@@ -102,9 +102,6 @@ pub struct RunState {
     /// session would inherit its reasoning and stop being an independent judge.
     /// From the journal, so it survives a crash and a `hex resume`.
     pub sessions: BTreeMap<String, SessionHandle>,
-    /// The worker named by the in-flight attempt, so a session can be recorded
-    /// against the adapter that actually produced it.
-    pub current_worker: Option<String>,
     /// The `human` node whose question is outstanding, if any.
     ///
     /// This is what makes a `HumanResponded` *correlatable*: a human node runs no
@@ -115,17 +112,20 @@ pub struct RunState {
     pub started_at_ms: u64,
 }
 
-/// A resumable agent session, and the worker that owns it.
+/// A resumable agent session, and the program that owns it.
 ///
-/// The worker is recorded because a role's binding is resolved from *live* config
-/// each time the graph is compiled, so a `hex resume` after an edit to
+/// Recorded because a role's binding is resolved from *live* config every time
+/// the graph is compiled, so a `hex resume` after an edit to
 /// `roles.reviewer.worker` can select a different adapter than the one that
-/// opened the session. Without this, hex would hand a codex thread id to
-/// `claude --resume`.
+/// opened the session — and hex would hand a codex thread id to
+/// `claude --resume`. The identity has to be the **program**, not the registry
+/// name: roles register under their own alias, so the alias is unchanged by
+/// exactly the rebind this guards against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionHandle {
-    /// Registry name of the worker that opened the session.
-    pub worker: String,
+    /// The external program that owns the session (`codex`, `claude`) — not the
+    /// worker registry name, which is a role alias and survives a rebind.
+    pub agent: String,
     /// The agent's own session/thread id.
     pub id: String,
 }
@@ -159,9 +159,16 @@ pub struct Totals {
     pub cache_write_tokens: u64,
     /// Reasoning tokens, where the agent separates them.
     pub reasoning_tokens: u64,
-    /// Cost in micro-USD. Zero means "nothing reported it", which is the honest
-    /// answer for a token-only agent — not "it was free".
+    /// Cost in micro-USD, summed only over attempts that actually reported money.
     pub cost_micro_usd: u64,
+    /// Attempts folded into these totals that reported **no** cost at all.
+    ///
+    /// This is what makes the money honest. codex reports tokens and no price, so
+    /// a run mixing it with claude produced a `cost_micro_usd` covering half the
+    /// work and presented it as the total. With this, a client renders `≥ $X` and
+    /// says how much is unaccounted for — hex never states a cost it cannot know,
+    /// and never states a complete-looking one it cannot back.
+    pub unpriced_reports: u32,
 }
 
 impl Totals {
@@ -184,12 +191,22 @@ impl Totals {
 
     /// Every token the attempt consumed, however the agent classified it — the
     /// one number worth putting in a one-line summary.
+    ///
+    /// Reasoning tokens are excluded because both vendors report them as a
+    /// *subset* of output, not in addition to it.
     #[must_use]
     pub fn tokens(&self) -> u64 {
         self.input_tokens
             .saturating_add(self.output_tokens)
             .saturating_add(self.cache_read_tokens)
             .saturating_add(self.cache_write_tokens)
+    }
+
+    /// Whether some of the work in these totals was never priced, so a caller
+    /// knows to render the cost as a lower bound.
+    #[must_use]
+    pub fn cost_is_partial(&self) -> bool {
+        self.unpriced_reports > 0
     }
 }
 
@@ -201,19 +218,26 @@ impl Usage {
     /// never both, or claude (which reports both an attempt total and the
     /// per-model costs that compose it) would be billed twice.
     fn add(&mut self, node: Option<&str>, models: &[hex_proto::ModelUsage], cost: Option<u64>) {
-        // Saturating for the same reason as `add_tokens`: an untrusted operand
-        // must not be able to panic a projection that is recomputed on every read.
+        // Saturating throughout: an untrusted operand must not be able to panic a
+        // projection that is recomputed on every read.
         let per_model_cost: u64 = models
             .iter()
             .filter_map(|m| m.cost_micro_usd)
             .fold(0u64, u64::saturating_add);
         let attempt_cost = cost.unwrap_or(per_model_cost);
-        let node_totals = node.map(|n| self.by_node.entry(n.to_owned()).or_default());
-        if let Some(t) = node_totals {
+        // Under-priced: no authoritative attempt total, and at least one model
+        // that named no price. This is the fact separating a total from a lower
+        // bound — and it must catch the *mixed* attempt too, where one model
+        // priced its share and another did not, because summing only the priced
+        // half and calling it the total is the misreport being fixed.
+        let unpriced =
+            u32::from(cost.is_none() && models.iter().any(|m| m.cost_micro_usd.is_none()));
+        if let Some(t) = node.map(|n| self.by_node.entry(n.to_owned()).or_default()) {
             for m in models {
                 t.add_tokens(m);
             }
             t.cost_micro_usd = t.cost_micro_usd.saturating_add(attempt_cost);
+            t.unpriced_reports = t.unpriced_reports.saturating_add(unpriced);
         }
         for m in models {
             let by_model = self.by_model.entry(m.model.clone()).or_default();
@@ -221,9 +245,13 @@ impl Usage {
             by_model.cost_micro_usd = by_model
                 .cost_micro_usd
                 .saturating_add(m.cost_micro_usd.unwrap_or(0));
+            by_model.unpriced_reports = by_model
+                .unpriced_reports
+                .saturating_add(u32::from(m.cost_micro_usd.is_none()));
             self.total.add_tokens(m);
         }
         self.total.cost_micro_usd = self.total.cost_micro_usd.saturating_add(attempt_cost);
+        self.total.unpriced_reports = self.total.unpriced_reports.saturating_add(unpriced);
     }
 }
 
@@ -318,8 +346,8 @@ pub enum Acceptance {
 /// single source of every state transition, **including routing**.
 ///
 /// Every "may this event apply here?" question is answered by a predicate in
-/// [`crate::lifecycle`], shared verbatim with
-/// [`check_journal`](crate::check_journal): what this function silently drops is
+/// the private `lifecycle` module, shared verbatim with
+/// [`check_journal`]: what this function silently drops is
 /// exactly what that one rejects. Keeping the two in agreement is not a
 /// convention here — it is one function per rule.
 #[must_use]
@@ -349,7 +377,7 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             state.current = Some(to.clone());
             *state.visits.entry(to.clone()).or_insert(0) += 1;
         }
-        EventBody::AttemptStarted { worker, .. } => {
+        EventBody::AttemptStarted { .. } => {
             // Fail closed on an attempt-start that could not have happened here:
             // ignore it rather than marking the wrong (or an anonymous) attempt
             // in flight, or letting an attempt exist on a `human`/`terminal` node.
@@ -361,7 +389,6 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             // A fresh attempt has not reported usage yet. Clearing here is what
             // lets one field stand in for "this attempt already reported".
             state.reported_attempt = None;
-            state.current_worker = worker.clone();
             // A fresh attempt starts with no result: clear any prior one for this
             // node so a re-visit that captures nothing can't hand downstream the
             // previous attempt's stale text.
@@ -432,6 +459,7 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             models,
             cost_micro_usd,
             session_id,
+            agent,
             ..
         } => {
             // Summed, not overwritten — so unlike a result, a duplicate would
@@ -444,15 +472,13 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             state
                 .usage
                 .add(state.current.as_deref(), models, *cost_micro_usd);
-            // Recorded against the worker that opened it, so a resume cannot hand
-            // it to a different adapter. A report with no worker on record is not
-            // resumable — better to run fresh than to guess the owner.
-            if let (Some(node), Some(id), Some(worker)) = (
-                state.current.clone(),
-                session_id.clone(),
-                state.current_worker.clone(),
-            ) {
-                state.sessions.insert(node, SessionHandle { worker, id });
+            // Recorded against the program that opened it, so a resume cannot hand
+            // it to a different one. A report naming no agent is not resumable —
+            // better to run fresh than to guess the owner.
+            if let (Some(node), Some(id), Some(agent)) =
+                (state.current.clone(), session_id.clone(), agent.clone())
+            {
+                state.sessions.insert(node, SessionHandle { agent, id });
             }
         }
         EventBody::NodeResult { text } => {
@@ -605,6 +631,17 @@ pub fn schedule(graph: &Graph, state: &RunState, now_ms: u64) -> Vec<Effect> {
             format!("node `{cur}` exceeded the run visit bound ({maxv} visits)"),
         )];
     }
+    if let Some(maxt) = graph.budget.output_tokens
+        && state.usage.total.output_tokens >= maxt
+    {
+        return vec![terminal_because(
+            Disposition::BudgetExhausted,
+            format!(
+                "generation budget spent ({} of {maxt} output tokens)",
+                state.usage.total.output_tokens
+            ),
+        )];
+    }
     if let Some(maxe) = graph.budget.elapsed_ms {
         // Fail closed on the time budget, and treat a backward clock (now before
         // the recorded start) conservatively as exhausted rather than granting a
@@ -698,6 +735,7 @@ mod tests {
                 elapsed_ms: None,
                 attempt_elapsed_ms: None,
                 cycle_visits: None,
+                output_tokens: None,
             })
             .require("test", "passed")
             .build()
@@ -752,6 +790,7 @@ mod tests {
     fn reported(models: Vec<hex_proto::ModelUsage>, cost: Option<u64>) -> EventBody {
         EventBody::AttemptReported {
             session_id: None,
+            agent: None,
             models,
             cost_micro_usd: cost,
             duration_ms: None,
@@ -870,6 +909,7 @@ mod tests {
                 },
                 EventBody::AttemptReported {
                     session_id: Some("019fb9a2".to_owned()),
+                    agent: Some("codex".to_owned()),
                     models: vec![],
                     cost_micro_usd: None,
                     duration_ms: None,
@@ -880,17 +920,93 @@ mod tests {
         assert_eq!(handle.id, "019fb9a2");
         // Recorded against the worker that opened it, so a resume after an edit to
         // `roles.<name>.worker` cannot hand a codex thread id to claude.
-        assert_eq!(handle.worker, "codex");
+        assert_eq!(handle.agent, "codex");
         assert!(
             !s.sessions.contains_key("test"),
             "a different node is a different conversation"
         );
     }
 
-    /// A report whose attempt named no worker is not resumable: guessing the owner
-    /// is how a session id reaches the wrong adapter.
+    /// A report naming no owning program is not resumable: guessing the owner is
+    /// how a codex thread id reaches `claude --resume`.
     #[test]
-    fn a_session_with_no_worker_on_record_is_not_stored() {
+    fn a_session_with_no_agent_on_record_is_not_stored() {
+        let g = loop_graph();
+        let s = drive_to(
+            &g,
+            &[
+                EventBody::RunStarted,
+                EventBody::AttemptStarted {
+                    idempotency_key: "k".to_owned(),
+                    worker: Some("implementer".to_owned()),
+                },
+                EventBody::AttemptReported {
+                    session_id: Some("019fb9a2".to_owned()),
+                    agent: None,
+                    models: vec![],
+                    cost_micro_usd: None,
+                    duration_ms: None,
+                },
+            ],
+        );
+        assert!(
+            s.sessions.is_empty(),
+            "the registry name on AttemptStarted is a role alias, not an owner"
+        );
+    }
+
+    /// Generation tokens bound the run; cached input, which dominates the raw
+    /// count, deliberately does not.
+    #[test]
+    fn a_generation_budget_ignores_cached_input_and_bites_on_output() {
+        let mut g = loop_graph();
+        g.budget.output_tokens = Some(1_000);
+        // Cache-heavy and generation-light: the shape of a real review attempt.
+        let cheap = hex_proto::ModelUsage {
+            model: "m".to_owned(),
+            input_tokens: 200_000,
+            output_tokens: 400,
+            cache_read_tokens: 3_000_000,
+            ..hex_proto::ModelUsage::default()
+        };
+        let mut state = drive_to(
+            &g,
+            &[
+                EventBody::RunStarted,
+                EventBody::AttemptStarted {
+                    idempotency_key: "k".to_owned(),
+                    worker: None,
+                },
+                reported(vec![cheap], None),
+                EventBody::Signal {
+                    name: "ready".to_owned(),
+                },
+            ],
+        );
+        assert_eq!(state.usage.total.tokens(), 3_200_400);
+        assert!(
+            !schedule(&g, &state, 0).is_empty(),
+            "3.2M tokens but only 400 generated: the bound is not near"
+        );
+
+        // Only the generated share moves the needle.
+        state.usage.total.output_tokens = 1_200;
+        assert!(
+            matches!(
+                schedule(&g, &state, 0).as_slice(),
+                [Effect::RecordTerminal {
+                    disposition: Disposition::BudgetExhausted,
+                    ..
+                }]
+            ),
+            "crossing the generation line ends the run"
+        );
+    }
+
+    /// A run mixing an agent that reports money with one that does not must not
+    /// present half the spend as the total.
+    #[test]
+    fn a_report_without_any_cost_marks_the_totals_partial() {
         let g = loop_graph();
         let s = drive_to(
             &g,
@@ -900,15 +1016,30 @@ mod tests {
                     idempotency_key: "k".to_owned(),
                     worker: None,
                 },
-                EventBody::AttemptReported {
-                    session_id: Some("019fb9a2".to_owned()),
-                    models: vec![],
-                    cost_micro_usd: None,
-                    duration_ms: None,
-                },
+                reported(vec![model("codex", 100, 10, None)], None),
             ],
         );
-        assert!(s.sessions.is_empty());
+        assert!(s.usage.total.cost_is_partial());
+        assert_eq!(s.usage.total.unpriced_reports, 1);
+        assert_eq!(s.usage.total.cost_micro_usd, 0);
+    }
+
+    #[test]
+    fn a_fully_priced_report_leaves_the_totals_exact() {
+        let g = loop_graph();
+        let s = drive_to(
+            &g,
+            &[
+                EventBody::RunStarted,
+                EventBody::AttemptStarted {
+                    idempotency_key: "k".to_owned(),
+                    worker: None,
+                },
+                reported(vec![model("claude", 2, 4, Some(177_800))], Some(177_800)),
+            ],
+        );
+        assert!(!s.usage.total.cost_is_partial());
+        assert_eq!(s.usage.total.cost_micro_usd, 177_800);
     }
 
     /// A projection is recomputed on every read, so an overflow panic here would

@@ -10,7 +10,7 @@
 //!   failure, so the loop routes `failed` back to the implementer and burns the
 //!   whole attempt budget on false evidence;
 //! - `hex` itself not being on `PATH`, which breaks the agent's `hex emit`
-//!   control channel — see [`probe_self`].
+//!   control channel — see the private `probe_self`.
 //!
 //! `hex doctor` reports all three, and [`preflight`] refuses to start a run whose
 //! workers are missing.

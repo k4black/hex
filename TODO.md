@@ -10,15 +10,19 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
 - [x] Crate shape: `hex-proto` / `hex-kernel` (pure: IR + journal +
       projections + reduce/schedule/accept) / `hex-worker` (adapter) /
       `hex-runtime` (owns the drive loop) / thin clients (cli, mcp,
-      dashboard) over `RuntimeClient`.
+      dashboard) over the runtime (via a `RuntimeClient` trait until
+      2026-08-01, now over `Runtime` itself).
 - [x] Definition syntax: **standard YAML**, single file, inline prompts,
       kind-as-key + co-located `on:` edges, `defaults:`/`templates:`/`extends:`,
       run-level `gates:` + `accept.require`. No custom mini-grammar.
 - [x] Routing: deterministic ordered edges **+** agent proposals validated
       against a per-node `may_propose` allow-list (agents choose among given
       options only).
-- [x] Process ownership: **A3 hybrid** — foreground `InProcess` now; per-run
-      background controller + `Remote` client later behind the same trait.
+- [x] Process ownership: **A3 hybrid** — foreground in-process now; per-run
+      background controller + a remote client later. (Amended 2026-08-01: the
+      `RuntimeClient` trait held open for that second implementation was deleted
+      — one impl, no callers. The decision stands; the seam gets re-derived when
+      there is something to derive it from.)
 - [x] Worker→runtime channel: one `Command` protocol, two transports —
       injected `hex emit` CLI (floor) + MCP tool hooks (`finish_session()`).
 - [x] Domain: 5 entities (Graph, Run, Event, Budget, Artifact); 5 node kinds;
@@ -68,8 +72,9 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
 - [x] `hex-worker`: `Worker` trait + capability manifest (`structured_events`,
       `live_steering`, `session_resume`, `graceful_cancel`, `cost_reporting`,
       …) + mock/subprocess adapter stubs.
-- [x] `hex-runtime`: `Runtime` API + `RuntimeClient` trait with an `InProcess`
-      impl; `hex-cli`/`hex-mcp`/`hex-dashboard` are thin clients on it (the
+- [x] `hex-runtime`: `Runtime` API + a `RuntimeClient` trait with an `InProcess`
+      impl (the trait was deleted 2026-08-01, unused);
+      `hex-cli`/`hex-mcp`/`hex-dashboard` are thin clients on it (the
       runtime re-exports `Event`/`Command`/`PROTOCOL_VERSION` as the narrow
       client surface).
 - [x] Placeholder types wiring the new inward graph; build/test/clippy/bench
@@ -243,7 +248,10 @@ Claude session, and the largest remaining piece.
       field survey (Cursor, Claude Code, aider, Cline, Roo).
 - [ ] `hex runs` (list), `hex wait <id>`, `hex cancel` on a live run.
 - [ ] A shipped SKILL.md teaching an agent to drive the CLI, and `hex-mcp` as a
-      second thin client over the same `RuntimeClient` (kept for this reason).
+      second thin client over the same runtime. (The `RuntimeClient` trait was
+      kept for this reason and deleted 2026-08-01 having never gained a second
+      implementation; `hex-mcp` binds to `Runtime` and re-derives a trait if it
+      ever needs one.)
 
 ## Control & detach pass — landed 2026-07-31
 
@@ -308,9 +316,10 @@ Phase (b) of the agreed sequence, implemented as specified.
       just-released slot 0. The safety invariant (no two live leases share a slot)
       is intact either way, so the cost is a needless extra slot, never
       corruption.
-- [ ] `RunReport.disposition` is now `Option<Disposition>` and `RuntimeClient`
+- [ ] `RunReport.disposition` is now `Option<Disposition>`, and the client surface
       gained `list_runs`/`control` with a new `cancel` signature — `hex-mcp` will
-      inherit these when it is built.
+      inherit these when it is built. (They lived on `RuntimeClient` until it was
+      deleted 2026-08-01; they are `Runtime` methods now.)
 
 ### Quality pass — landed 2026-07-31 (`/simplify`, 4 parallel review angles)
 
@@ -421,8 +430,9 @@ fixed. **Fix before trusting `on_unmet` or `human` nodes in an unattended run.**
       worktree lease out of `RunCreated.inputs` into a typed event (it stores an
       absolute path next to the operator prompt today). `supports()` and
       `Status::Paused` are **kept** — session resume and pause give them consumers.
-      Decided to keep: all 8 crates, `RuntimeClient` (MCP will use it), and the
-      three worker adapter structs.
+      Decided to keep: all 8 crates and the three worker adapter structs.
+      `RuntimeClient` was kept here ("MCP will use it") and **deleted 2026-08-01**:
+      an unbuilt crate is not a caller.
 - [ ] Re-test the reviewer/implementer asymmetry: a published experiment found
       Claude reviewing Codex lifts pass rate 71.6%→89.7% while the reverse shows
       no gain or a regression. `defaults.yaml` now pairs codex-implements with
@@ -478,7 +488,8 @@ fixed. **Fix before trusting `on_unmet` or `human` nodes in an unattended run.**
       shows no gain or a regression, i.e. the presets may have the asymmetry
       backwards. Worth one deliberate A/B before flipping on one paper.
 - [ ] **Structural cleanups an audit priced but that need a decision**: delete
-      the zero-call-site `RuntimeClient` trait (−71 lines); collapse the three
+      the zero-call-site `RuntimeClient` trait (−71 lines; **done 2026-08-01**,
+      ~90 lines by then); collapse the three
       near-identical typed workers into one table-driven adapter (−90, contradicts
       gotcha 5c); delete the 6 never-advertised `Capability` variants and
       `supports()`; delete `EventBody::BudgetExhausted` (never constructed);
@@ -582,13 +593,16 @@ nothing else — the evidence was on disk and no CLI surface reached it. 257 tes
 - [ ] **codex reports no model name**, so its per-model split is labelled with
       the role's configured model, else the literal `"codex"`. Two codex roles
       that both leave `model` unset therefore merge into one `by_model` row.
-- [ ] **No price table, so a token-only agent shows no money.** codex's
+- [~] **No price table, so a token-only agent shows no money.** codex's
       `cost_micro_usd` stays `None` and its cost cell renders `—`, meaning
       "nothing reported it" rather than "free" — honest, but not the answer an
       operator wants from a 12-attempt loop. A `prices:` config layer could
       populate it without a schema change; the event shape already allows it.
-      Deliberately out of scope for this pass, because a table of prices in-tree
-      is wrong the week a vendor changes one.
+      Deliberately out of scope, because a table of prices in-tree is wrong the
+      week a vendor changes one. **Half-addressed 2026-08-01**: the decision to
+      ship no prices stands, but a *total* mixing a priced and an unpriced agent
+      now renders `≥ $X` with a lower-bound line instead of passing half the spend
+      off as the whole.
 - [ ] `StepLog.exit` is the string the driver wrote (`"0"` / `"101"` /
       `"signal"`), not a typed exit status.
 
@@ -661,7 +675,9 @@ snapshot. 263 tests (was 257), clippy + fmt clean.
       each stream's **tail**, not its head, and **drains a stopped attempt** before
       detaching: an attempt stops being in-flight the instant it terminates, so its
       most interesting line (a check's failure, an agent's last word) is written
-      after the last poll that could still see it.
+      after the last poll that could still see it. (Attach mechanism superseded
+      2026-08-01: sampling `in_flight` missed any attempt that fitted between two
+      polls, so the follower is journal-driven now.)
 - [x] **`hex watch --follow`** prints new events until the run finishes, cursored by
       event count — the journal is append-only, so "how many have I printed" is the
       whole cursor.
@@ -714,7 +730,101 @@ snapshot. 263 tests (was 257), clippy + fmt clean.
 - [ ] **No `hex logs --json --follow`** — `--follow` renders human lines only, so a
       driving agent streaming a live attempt has to poll `logs --json` /
       `status --json` instead of reading NDJSON. Needs a per-line event shape decided
-      first (attempt header, stream, text), not just a flag.
+      first (attempt header, stream, text), not just a flag. Since 2026-08-01 the
+      combination is *rejected* by clap rather than silently ignored, so the gap is
+      at least visible from the CLI.
+
+## Spend honesty, generation budget & one fewer seam — landed 2026-08-01
+
+Four decisions taken with the owner, then the findings of a second review round
+(hex reviewing its own previous commit). 271 tests (was 263), clippy + fmt clean.
+
+- [x] **`hex status` reports every token category** — `IN / OUT / CACHE R /
+      CACHE W / REASON` instead of one collapsed number. They are not
+      interchangeable: a cached read costs a fraction of a fresh input and
+      dominates the volume — a real run of this repo measured 4.84M cache-read
+      against 209k fresh input and 20.5k generated. `REASON` is a *subset* of
+      `OUT`, carried for information and never added into a total.
+- [x] **A partly priced total says so** — `Totals.unpriced_reports` +
+      `cost_is_partial()`. An attempt is under-priced when it reports no
+      authoritative attempt total **and** at least one of its models named no
+      price; the `and` deliberately catches the *mixed* attempt, because summing
+      only the priced half and calling it the total is the misreport being fixed.
+      Renders `—` when nothing was priced, `≥ $X` when part was, plain `$X` when
+      all was, plus `cost is a lower bound: N attempt(s) reported tokens but no
+      price`; `--json` carries `cost_is_partial`/`unpriced_reports`. This repo's
+      own config makes the mixed run the normal case (reviewer→codex, tokens only;
+      implementer→claude, money). **Still no price table** — see the wart below.
+- [x] **Run-wide `budget: { output_tokens: N }`**, counting **generation** tokens
+      only. A bound over every reported token is dominated by cache (numbers
+      above), so it would be tuned to context size rather than to work done, and
+      `context: continue` would silently move it. Checked in the kernel at the
+      attempt boundary, ending `budget_exhausted` (exit 4 — no new disposition);
+      worst-case overshoot is one attempt, itself bounded by `budget.attempt`.
+      `output_tokens: 0` is a validation error (`E-budget-zero`): spent before the
+      first attempt, it would end a run that did nothing.
+- [x] **`RuntimeClient` deleted** (~90 lines: nine signatures, one implementation,
+      zero callers). What core rule 8 protects — one `Command` protocol, no
+      parallel implementations — is delivered by the concrete `Runtime`; a trait
+      is cheaper to re-derive from a second implementation than to keep honest
+      without one. Reverses the "kept, MCP will use it" line in the deletion batch
+      above. Stream access moved *into* the runtime as `Runtime::read_streams(run,
+      attempt, &mut StreamCursor) -> Vec<StreamChunk>` (+ `StreamCursor::at_end`),
+      so the CLI no longer walks `.hex/` directories: it renders only.
+
+### Round-2 review fixes (hex reviewing the previous commit)
+
+- [x] **A session was resumable by the wrong agent.** The previous pass compared
+      the *worker registry name*, but a role registers under its own alias, so
+      `"implementer" == "implementer"` still held after rebinding
+      `roles.implementer.worker` from codex to claude — waving through `claude
+      --resume <codex-thread-id>`, the exact bug the check was added for.
+      `AttemptReported` now carries `agent` (the owning program, from
+      `Worker::program()`, stamped by the shared plumbing from the argv actually
+      spawned); `SessionHandle { agent, id }`; the comparison is the testable
+      `driver::resumable_id`. A mismatch runs fresh rather than failing; a report
+      naming no agent is not resumable at all.
+- [x] **`hex logs --follow` missed attempts that started and finished between
+      polls.** It sampled the `in_flight` projection every 400ms, so a fast check
+      wrote its failure and exited unseen — a disposition printed with none of the
+      evidence for it. It is now driven by the **journal**: every `AttemptStarted`
+      is seen exactly once whenever it lands, the attempt in flight at attach time
+      is joined at its tail, later ones stream from their first byte, and the open
+      attempt is drained before switching away (its final bytes land after the last
+      poll that could see it running).
+- [x] **Saturating arithmetic completed** on the same untrusted data:
+      `ModelUsage::tokens`, codex's multi-turn accumulator, and both folds in the
+      CLI's `event_summary` still used unchecked `+`/`.sum()`, so a garbled or
+      forged value panicked in debug and wrapped in release.
+- [x] **A cursor reads exactly the bytes it accounts for.** The old follower
+      sampled a file's length, read to EOF, then stored the sampled length —
+      anything a writer appended in between was printed and then printed again on
+      the next poll.
+- [x] **`--follow` no longer ignores flags it accepts** — `--node` is honoured
+      (attach only to that node), `--json --follow` is rejected by clap rather than
+      silently emitting human text, and `--full` is documented as redundant under
+      follow (which streams every captured byte).
+- [x] **An unreadable control inbox is an error, not "nothing queued"** — `status`
+      propagates the scan failure instead of `unwrap_or_default()`.
+
+### Found by this round, deliberately not fixed
+
+- [ ] **`queued()` has a claim window.** `status` folds the journal and then scans
+      the inbox, so a command the driver claims between those two reads shows as
+      neither queued (gone from `inbox/`) nor pending (not yet journaled). Harmless
+      for a steer — the next `status` shows it accepted — but it is a real hole in
+      the two-stage story gotcha 36 tells. A fold-after-scan ordering would trade
+      it for a double-report, which is the better failure but needs a decision.
+- [ ] **The token budget has no end-to-end test**, because **no fake worker reports
+      usage**: the mock never writes an `AttemptReported`, so every usage test
+      either injects the event into a journal by hand (CLI tests) or drives
+      `reduce`/`schedule` directly (kernel tests). Enforcement of
+      `budget.output_tokens` is therefore covered by kernel unit tests only — no
+      integration run has ever been stopped by it. A mock that emits a scripted
+      report would close this and the projection's other end-to-end gaps at once.
+- [ ] Carried over, still open: the forged-journal attempt-id reuse hole and a run
+      ending on a `human` node showing the last *agent* result (both in the payoff
+      pass's "deliberately not fixed" list above).
 
 ## Phase 2 — hardening & correctness
 
@@ -930,8 +1040,10 @@ Phase-2 kernel; none change kernel semantics.
 
 ## Phase 7 — daemon & remote surfaces
 
-- [ ] Per-run background controller; `RuntimeClient::Remote` over a run-local
-      socket + scoped token (`hex run --background`, attach/detach).
+- [ ] Per-run background controller; a remote client over a run-local socket +
+      scoped token (`hex run --background`, attach/detach). This is the second
+      implementation that earns back a client trait — derive it then, from two
+      real implementations, rather than keeping an empty one open for it.
 - [ ] `hex-mcp` server: same verbs as MCP tools; clients can start new runs;
       authoring prompts/templates exposed over MCP.
 - [ ] `hex graph new` architect command (worker drafts a graph from a
@@ -939,7 +1051,7 @@ Phase-2 kernel; none change kernel semantics.
 - [ ] Live operator views (need the controller to know what's live): `hex ps`
       — active runs with current node, in-flight worker/agent, and remaining
       budget — plus a live multi-run online-log/agent view.
-- [ ] `hex-dashboard` TUI: projection consumer + `RuntimeClient`; renders the
+- [ ] `hex-dashboard` TUI: projection consumer over the runtime; renders the
       live active-runs/agents/log views and can also start/control runs.
       _Candidate crate:_ `ratatui` (TUI); pairs with `rmcp` if the dashboard
       talks to a remote runtime.

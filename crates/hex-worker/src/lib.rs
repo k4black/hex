@@ -72,6 +72,10 @@ pub struct AttemptReport {
     /// The agent's session id, where it exposes one — the resume handle for a
     /// node declaring `context: continue`.
     pub session_id: Option<String>,
+    /// The program that owns `session_id` ([`Worker::program`]) — the identity a
+    /// later resume is checked against, because the registry name is a role alias
+    /// that survives being rebound to a different agent.
+    pub agent: Option<String>,
     /// Per-model usage; a list because one claude attempt bills several models.
     pub models: Vec<ModelUsage>,
     /// Attempt total in micro-USD, when the agent reports money.
@@ -89,6 +93,14 @@ impl AttemptReport {
             && self.models.is_empty()
             && self.cost_micro_usd.is_none()
             && self.duration_ms.is_none()
+    }
+
+    /// Stamp the owning program onto a report. Called by the shared plumbing, so
+    /// no adapter can forget it and leave a session that cannot be safely resumed.
+    #[must_use]
+    fn owned_by(mut self, agent: Option<&str>) -> Self {
+        self.agent = agent.map(ToOwned::to_owned);
+        self
     }
 }
 

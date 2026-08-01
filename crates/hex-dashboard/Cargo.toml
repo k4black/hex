@@ -1,6 +1,6 @@
 [package]
 name = "hex-dashboard"
-description = "hex: TUI/web viewer, a thin RuntimeClient client (later)"
+description = "hex: TUI/web viewer, a thin Runtime client (later)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

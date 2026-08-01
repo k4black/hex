@@ -1,6 +1,6 @@
 [package]
 name = "hex-mcp"
-description = "hex: MCP transport, a thin RuntimeClient peer of the CLI (later)"
+description = "hex: MCP transport, a thin Runtime client peer of the CLI (later)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

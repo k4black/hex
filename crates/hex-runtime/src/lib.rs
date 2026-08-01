@@ -5,9 +5,11 @@
 //! and crash recovery. The kernel decides *what*; the runtime is the only
 //! layer that *does*.
 //!
-//! Clients (CLI, MCP, dashboard) are thin peers over the [`RuntimeClient`]
-//! trait — [`Runtime`] is the in-process implementation now; a `Remote`
-//! client (per-run background controller) arrives later behind the same trait.
+//! Clients (CLI, MCP, dashboard) are thin peers over [`Runtime`]: they parse
+//! arguments and render, and every fact they show is one this layer computed.
+//! There was a `RuntimeClient` trait here for a future `Remote` client; it had
+//! one implementation and no callers, so it was deleted — a trait is cheaper to
+//! re-derive from a second implementation than to keep honest without one.
 
 pub mod config;
 pub mod control;
@@ -133,6 +135,39 @@ pub struct StatusReport {
     /// That node's question, so the thing you have to answer is on screen with the
     /// fact that you have to answer it.
     pub question: Option<String>,
+}
+
+/// How far a follower has read each of an attempt's streams.
+///
+/// Opaque to the caller: it holds paths, which are the runtime's business. Reset
+/// it (or make a new one) when moving to a different attempt.
+#[derive(Debug, Clone, Default)]
+pub struct StreamCursor {
+    offsets: BTreeMap<PathBuf, u64>,
+}
+
+impl StreamCursor {
+    /// A cursor positioned at the *end* of everything already written, so a
+    /// follower joining a long-running attempt streams what happens next instead
+    /// of replaying an hour of output it missed.
+    ///
+    /// # Errors
+    /// Fails if the run id or attempt id is not a safe grammar.
+    pub fn at_end(runtime: &Runtime, run_id: &str, attempt_id: &str) -> Result<Self> {
+        let mut cursor = Self::default();
+        runtime.read_streams(run_id, attempt_id, &mut cursor)?;
+        Ok(cursor)
+    }
+}
+
+/// Newly appended output from one of an attempt's streams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamChunk {
+    /// Which stream: `stdout`, `stderr`, or `3-test/stdout` for a command step.
+    pub label: String,
+    /// The bytes appended since the cursor's previous position, lossily decoded
+    /// (a read boundary can land mid-codepoint).
+    pub text: String,
 }
 
 /// The attempt currently executing.
@@ -789,9 +824,11 @@ impl Runtime {
             // Two different "not yet applied" states, and an operator needs both:
             // `queued` is in the control inbox and no driver has looked at it,
             // `pending_steer` has been journaled and awaits the next agent attempt.
+            // Propagated, not swallowed: an unreadable control directory means
+            // hex cannot say whether a queued command exists, and reporting
+            // "nothing queued" would be a claim it has no basis for.
             queued: Inbox::new(&run_dir)
-                .queued()
-                .unwrap_or_default()
+                .queued()?
                 .into_iter()
                 .map(|e| e.command)
                 .collect(),
@@ -801,17 +838,55 @@ impl Runtime {
         })
     }
 
-    /// Where one attempt's captured streams live, so a client can *tail* them
-    /// while the attempt is still running. The layout stays the runtime's
-    /// knowledge; a follower needs the path, not the rules for building it.
+    /// One attempt's captured streams, read from `cursor` onward.
+    ///
+    /// This is how a client tails a *running* attempt without learning the
+    /// on-disk layout: it hands back the bytes appended since it last asked, plus
+    /// an updated cursor. An attempt's streams are its own stdout/stderr **and**
+    /// both streams of every numbered step directory a `command` node writes, in
+    /// declared position — a gate is the slow thing an operator waits on, and
+    /// without its steps a follower showed a header and nothing else.
     ///
     /// # Errors
-    /// Fails if the run id is not a safe grammar or the run does not exist.
-    pub fn attempt_dir(&self, run_id: &str, attempt_id: &str) -> Result<PathBuf> {
+    /// Fails if the run id or attempt id is not a safe grammar, or the run does
+    /// not exist.
+    pub fn read_streams(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        cursor: &mut StreamCursor,
+    ) -> Result<Vec<StreamChunk>> {
         // The attempt id comes from the journal, never from an operator, but it
         // still ends up in a path — so it gets the same grammar check as a run id.
         validate_run_id(attempt_id)?;
-        Ok(self.run_dir(run_id)?.join("attempts").join(attempt_id))
+        let dir = self.run_dir(run_id)?.join("attempts").join(attempt_id);
+        let mut chunks = Vec::new();
+        for path in attempt_streams(&dir) {
+            let label = stream_label(&dir, &path);
+            let offset = cursor.offsets.entry(path.clone()).or_insert(0);
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let len = meta.len();
+            // A shorter file means it was truncated (a re-attempt clears its logs);
+            // leaving the cursor past the end would go silent forever.
+            if len < *offset {
+                *offset = 0;
+            }
+            if len == *offset {
+                continue;
+            }
+            // Read exactly the bytes we accounted for. Reading to EOF instead would
+            // print anything a concurrent writer appended *after* the length was
+            // sampled while advancing the cursor only to the sampled length — so
+            // the next read would print those bytes a second time.
+            let text = read_span(&path, *offset, len - *offset)?;
+            *offset = len;
+            if !text.is_empty() {
+                chunks.push(StreamChunk { label, text });
+            }
+        }
+        Ok(chunks)
     }
 
     /// Read every event of a run (for `watch`).
@@ -1229,97 +1304,6 @@ pub(crate) fn try_lock_file(path: &Path) -> Result<Option<std::fs::File>> {
     }
 }
 
-/// The one control surface every client speaks. The CLI, MCP transport, and
-/// dashboard are all thin clients over this trait — never parallel
-/// implementations. Authority is scoped per actor, not per surface.
-pub trait RuntimeClient {
-    /// List every runnable graph.
-    fn list_graphs(&self) -> Vec<GraphEntry>;
-    /// Start a new run with an optional operator prompt and an optional session
-    /// name (used in the run id).
-    ///
-    /// # Errors
-    /// Propagates resolution, validation, and IO failures.
-    fn start(
-        &self,
-        reference: &str,
-        prompt: Option<&str>,
-        name: Option<&str>,
-        isolation: &Isolation,
-    ) -> Result<RunReport>;
-    /// Resume an existing run.
-    ///
-    /// # Errors
-    /// Propagates replay and IO failures.
-    fn resume(&self, run_id: &str) -> Result<RunReport>;
-    /// Projected status of a run.
-    ///
-    /// # Errors
-    /// Propagates replay failures.
-    fn status(&self, run_id: &str) -> Result<StatusReport>;
-    /// Every event of a run.
-    ///
-    /// # Errors
-    /// Fails if the run does not exist.
-    fn events(&self, run_id: &str) -> Result<Vec<Event>>;
-    /// Per-attempt captured output of a run.
-    ///
-    /// # Errors
-    /// Fails if the run does not exist.
-    fn logs(&self, run_id: &str) -> Result<Vec<AttemptLog>>;
-    /// Every run under the project.
-    ///
-    /// # Errors
-    /// Fails if the runs directory cannot be read.
-    fn list_runs(&self) -> Result<Vec<RunSummary>>;
-    /// Queue an operator command for a run (pause/resume/steer/respond).
-    ///
-    /// # Errors
-    /// Fails if the run does not exist, has finished, or the inbox is unwritable.
-    fn control(&self, run_id: &str, actor: &Actor, command: &Command) -> Result<()>;
-    /// Cancel a run, directly or via a live driver's control inbox.
-    ///
-    /// # Errors
-    /// Propagates IO failures.
-    fn cancel(&self, run_id: &str, actor: &Actor) -> Result<Cancellation>;
-}
-
-impl RuntimeClient for Runtime {
-    fn list_graphs(&self) -> Vec<GraphEntry> {
-        Runtime::list_graphs(self)
-    }
-    fn start(
-        &self,
-        reference: &str,
-        prompt: Option<&str>,
-        name: Option<&str>,
-        isolation: &Isolation,
-    ) -> Result<RunReport> {
-        Runtime::start(self, reference, prompt, name, isolation)
-    }
-    fn resume(&self, run_id: &str) -> Result<RunReport> {
-        Runtime::resume(self, run_id)
-    }
-    fn status(&self, run_id: &str) -> Result<StatusReport> {
-        Runtime::status(self, run_id)
-    }
-    fn events(&self, run_id: &str) -> Result<Vec<Event>> {
-        Runtime::events(self, run_id)
-    }
-    fn logs(&self, run_id: &str) -> Result<Vec<AttemptLog>> {
-        Runtime::logs(self, run_id)
-    }
-    fn list_runs(&self) -> Result<Vec<RunSummary>> {
-        Runtime::list_runs(self)
-    }
-    fn control(&self, run_id: &str, actor: &Actor, command: &Command) -> Result<()> {
-        Runtime::control(self, run_id, actor, command)
-    }
-    fn cancel(&self, run_id: &str, actor: &Actor) -> Result<Cancellation> {
-        Runtime::cancel(self, run_id, actor)
-    }
-}
-
 /// Read the per-step captures under one attempt directory, in declared order.
 ///
 /// The driver names each step dir `<position>-<slug>`, so the position is
@@ -1353,6 +1337,52 @@ fn step_logs(attempt_dir: &Path) -> Vec<StepLog> {
         .collect();
     steps.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.label.cmp(&b.1.label)));
     steps.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Every captured stream an attempt owns: its own two, then both of each
+/// numbered step directory, ordered by declared position so `10-` follows `9-`.
+fn attempt_streams(attempt_dir: &Path) -> Vec<PathBuf> {
+    let mut files = vec![
+        attempt_dir.join("stdout.log"),
+        attempt_dir.join("stderr.log"),
+    ];
+    let Ok(entries) = std::fs::read_dir(attempt_dir) else {
+        return files;
+    };
+    let mut steps: Vec<(u32, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            Some((name.split_once('-')?.0.parse().ok()?, e.path()))
+        })
+        .collect();
+    steps.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, dir) in steps {
+        files.push(dir.join("stdout.log"));
+        files.push(dir.join("stderr.log"));
+    }
+    files
+}
+
+/// A stream's name relative to its attempt (`stderr`, `3-test/stdout`) — enough
+/// for a client to label a chunk without knowing where any of it lives.
+fn stream_label(attempt_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(attempt_dir)
+        .unwrap_or(path)
+        .with_extension("")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Exactly `len` bytes of `path` starting at `offset`, lossily decoded.
+fn read_span(path: &Path, offset: u64, len: u64) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = Vec::new();
+    file.take(len).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// The project root for a runtime: the current working directory.

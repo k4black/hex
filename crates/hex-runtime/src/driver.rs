@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use hex_kernel::graph::{CommandMode, CommandStep, Context, NodeKind, NodeSpec};
 use hex_kernel::validate::DONE_SIGNAL;
-use hex_kernel::{Effect, Graph, RunState, Status, reduce, schedule};
+use hex_kernel::{Effect, Graph, RunState, SessionHandle, Status, reduce, schedule};
 use hex_proto::{Actor, Command, Disposition, EventBody};
 use hex_worker::{WorkOutcome, WorkRequest};
 
@@ -499,13 +499,8 @@ impl<'a> Session<'a> {
         // land on a different adapter than the one that opened the session. Only
         // resume a handle its own worker recorded — otherwise run fresh, rather
         // than handing a codex thread id to `claude --resume`.
-        let resume_session = match context {
-            Context::Continue => self
-                .state
-                .sessions
-                .get(node_id)
-                .filter(|h| h.worker == worker_name)
-                .map(|h| h.id.clone()),
+        let resume_handle = match context {
+            Context::Continue => self.state.sessions.get(node_id).cloned(),
             Context::Fresh => None,
         };
         // Capture before `record` (its `&mut self`) ends the `node` borrow.
@@ -555,6 +550,8 @@ impl<'a> Session<'a> {
                 Disposition::Failed,
             );
         };
+
+        let resume_session = resumable_id(resume_handle.as_ref(), adapter.program());
 
         let attempt_dir = self.attempt_dir(attempt_id)?;
         let deadline_ms = self.attempt_deadline();
@@ -609,6 +606,7 @@ impl<'a> Session<'a> {
                 Actor::agent(worker_name.clone()),
                 EventBody::AttemptReported {
                     session_id: report.session_id,
+                    agent: report.agent,
                     models: report.models,
                     cost_micro_usd: report.cost_micro_usd,
                     duration_ms: report.duration_ms,
@@ -1098,6 +1096,22 @@ pub fn graph_hash(source: &str) -> String {
     out
 }
 
+/// The session id to resume, given the recorded handle and the program that is
+/// about to run — `None` when they disagree, or when there is nothing to resume.
+///
+/// The comparison must be against the **program**. A node names a *role*, and a
+/// role is registered in the worker registry under its own alias, so
+/// `"implementer" == "implementer"` holds after you rebind
+/// `roles.implementer.worker` from codex to claude — waving through exactly the
+/// mistake this guards: `claude --resume <codex-thread-id>`.
+///
+/// A mismatch runs fresh rather than failing. The operator changed the binding,
+/// and a fresh session is what they have now asked for.
+fn resumable_id(handle: Option<&SessionHandle>, program: Option<&str>) -> Option<String> {
+    let handle = handle?;
+    (program? == handle.agent).then(|| handle.id.clone())
+}
+
 /// Ensure every agent node references a worker present in the registry, and that
 /// a node asking to continue a session is bound to a worker that can.
 ///
@@ -1137,6 +1151,43 @@ pub fn check_workers(graph: &Graph, workers: &Workers) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::resumable_id;
+    use hex_kernel::SessionHandle;
+
+    fn handle(agent: &str) -> SessionHandle {
+        SessionHandle {
+            agent: agent.to_owned(),
+            id: "019fb9a2".to_owned(),
+        }
+    }
+
+    /// The bug this exists for: a role registers under its own alias, so the
+    /// alias still matches after the role is rebound to a different agent. Only
+    /// the program can tell codex's thread id apart from claude's.
+    #[test]
+    fn a_session_is_not_resumed_by_a_different_program() {
+        assert_eq!(resumable_id(Some(&handle("codex")), Some("claude")), None);
+    }
+
+    #[test]
+    fn a_session_is_resumed_by_the_program_that_opened_it() {
+        assert_eq!(
+            resumable_id(Some(&handle("codex")), Some("codex")).as_deref(),
+            Some("019fb9a2")
+        );
+    }
+
+    /// A worker that spawns nothing (the mock) has no program to match, so it can
+    /// never inherit somebody else's session.
+    #[test]
+    fn a_worker_with_no_program_resumes_nothing() {
+        assert_eq!(resumable_id(Some(&handle("codex")), None), None);
+        assert_eq!(resumable_id(None, Some("codex")), None);
+    }
 }
 
 #[cfg(test)]

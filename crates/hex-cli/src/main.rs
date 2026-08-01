@@ -1,7 +1,7 @@
 //! `hex` — a thin, deterministic control plane for agentic loops and graphs.
 //!
-//! This binary is one operator surface: argument parsing and rendering over a
-//! [`hex_runtime::RuntimeClient`]. A human at a TTY and an agent (via injected
+//! This binary is one operator surface: argument parsing and rendering over
+//! [`hex_runtime::Runtime`]. A human at a TTY and an agent (via injected
 //! `hex emit`) share the same control protocol; every action becomes an event.
 //!
 //! Verbs: `init` · `validate` · `graph` · `run` · `resume` · `runs` · `status` ·
@@ -99,7 +99,7 @@ enum Command {
         /// Read the operator prompt from a file instead of `--prompt`
         #[arg(short, long, value_name = "PATH", conflicts_with = "prompt")]
         file: Option<String>,
-        /// Name this run (used in the run id; else <workflow>-<short-uuid>)
+        /// Name this run (used in the run id; else the graph name and a short uuid)
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
         /// Run in an isolated git worktree, branched from BASE (default HEAD)
@@ -157,8 +157,9 @@ enum Command {
         /// Last N lines of an attempt still running (default 20)
         #[arg(long, value_name = "N")]
         tail: Option<usize>,
-        /// Stream the in-flight attempt's output until the run finishes
-        #[arg(long)]
+        /// Stream the attempt's output until the run finishes (streams every
+        /// captured byte, so `--full` adds nothing; honours `--node`)
+        #[arg(long, conflicts_with = "json")]
         follow: bool,
     },
     /// Block until a run finishes, exiting with its disposition code
@@ -1188,16 +1189,19 @@ fn print_usage(usage: &hex_runtime::Usage, visits: &std::collections::BTreeMap<S
     if usage.total.tokens() == 0 {
         return;
     }
-    // A row's left column is a node id in one block and a model name in the next,
-    // which is only readable if each block says which — hence two headers.
+    // Every category the agents report, because they are not interchangeable: a
+    // cached read costs a fraction of a fresh one, and collapsing them hides the
+    // fact that 93% of a review run is cache. REASON is a *subset* of OUT, carried
+    // for information and never added into the totals.
     let row = |left: &str, visits: String, t: &hex_runtime::Totals| {
         println!(
-            "{left:<24} {visits:>8} {:>10} {:>11}",
-            tokens(t.tokens()),
-            // Zero cost means *nothing reported one* — codex reports tokens only —
-            // so printing `$0.0000` would claim the work was free. An em dash says
-            // "unknown", which is the truth.
-            money(t.cost_micro_usd)
+            "{left:<22} {visits:>6} {:>9} {:>9} {:>9} {:>9} {:>8} {:>12}",
+            tokens(t.input_tokens),
+            tokens(t.output_tokens),
+            tokens(t.cache_read_tokens),
+            tokens(t.cache_write_tokens),
+            tokens(t.reasoning_tokens),
+            cost_cell(t),
         );
     };
     // `VISITS`, not `ATTEMPTS`: this is the projection's per-node visit count, and
@@ -1205,8 +1209,8 @@ fn print_usage(usage: &hex_runtime::Usage, visits: &std::collections::BTreeMap<S
     // reports against one visit. Calling it attempts would be a number that
     // occasionally disagrees with itself.
     println!(
-        "\n{:<24} {:>8} {:>10} {:>11}",
-        "NODE", "VISITS", "TOKENS", "COST"
+        "\n{:<22} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8} {:>12}",
+        "NODE", "VISITS", "IN", "OUT", "CACHE R", "CACHE W", "REASON", "COST"
     );
     for (node, t) in &usage.by_node {
         row(node, visits.get(node).copied().unwrap_or(0).to_string(), t);
@@ -1223,6 +1227,27 @@ fn print_usage(usage: &hex_runtime::Usage, visits: &std::collections::BTreeMap<S
         .filter_map(|n| visits.get(n))
         .sum::<u32>();
     row("total", attempts.to_string(), &usage.total);
+    if usage.total.cost_is_partial() {
+        println!(
+            "\ncost is a lower bound: {} attempt(s) reported tokens but no price",
+            usage.total.unpriced_reports
+        );
+    }
+}
+
+/// A cost cell: `\u{2014}` when nothing reported one, `\u{2265} $X` when only part of the
+/// work was priced, plain `$X` when all of it was.
+///
+/// The marker is the whole point. codex reports tokens and no money, so a run
+/// mixing it with claude produced a figure covering half the work and labelled it
+/// the total — the one number an operator uses to decide whether a loop was worth
+/// it. hex now never shows a complete-looking cost it cannot back.
+fn cost_cell(t: &hex_runtime::Totals) -> String {
+    match (t.cost_micro_usd, t.cost_is_partial()) {
+        (0, _) => "\u{2014}".to_owned(),
+        (micro, true) => format!("\u{2265} {}", usd(micro)),
+        (micro, false) => usd(micro),
+    }
 }
 
 /// One [`hex_runtime::Totals`] as JSON: every token class the agents distinguish,
@@ -1237,6 +1262,10 @@ fn totals_json(t: &hex_runtime::Totals) -> serde_json::Value {
         "reasoning_tokens": t.reasoning_tokens,
         "tokens": t.tokens(),
         "cost_micro_usd": t.cost_micro_usd,
+        // A machine consumer needs the same caveat the table shows: a cost
+        // covering only part of the work is a lower bound, not a total.
+        "cost_is_partial": t.cost_is_partial(),
+        "unpriced_reports": t.unpriced_reports,
     })
 }
 
@@ -1321,58 +1350,62 @@ fn cmd_watch(run_id: &str, follow: bool, json: bool) -> Result<ExitCode, String>
     }
 }
 
-/// Stream the in-flight attempt's captured output until the run ends.
+/// Stream an attempt's captured output until the run ends.
 ///
-/// This is the "what is the agent doing right now" view. Before it, the bytes were
-/// already on disk and the only way to see them was `hex logs --full` re-run by
-/// hand, or a shell loop.
-fn follow_logs(runtime: &Runtime, run_id: &str, tail_lines: usize) -> Result<ExitCode, String> {
+/// Driven by the **journal**, not by polling "what is in flight". Sampling the
+/// projection every 400ms missed any attempt that started and finished between
+/// two polls — a quick check that wrote its failure and exited was never
+/// attached to, so the follower printed a disposition and none of the evidence
+/// for it. Every `AttemptStarted` is seen exactly once, whenever it lands.
+fn follow_logs(
+    runtime: &Runtime,
+    run_id: &str,
+    node: Option<&str>,
+    tail_lines: usize,
+) -> Result<ExitCode, String> {
     wait_for_journal(runtime, run_id)?;
     let tty = std::io::stdout().is_terminal();
-    // Which attempt we are attached to, and how far into each of its streams we
-    // have read. A map rather than two counters because the set of streams grows
-    // during a `command` attempt: each step's directory appears as it starts.
-    let mut attached: Option<(String, std::path::PathBuf)> = None;
-    let mut offsets: std::collections::BTreeMap<std::path::PathBuf, u64> =
-        std::collections::BTreeMap::new();
+    let mut open: Option<(String, hex_runtime::StreamCursor)> = None;
+    let mut seen = 0usize;
+    // The attempt already running when we attach is joined at its tail; anything
+    // starting later streams from its first byte.
+    let mut attaching = true;
     loop {
+        let events = runtime.events(run_id).map_err(|e| e.to_string())?;
+        for event in &events[seen.min(events.len())..] {
+            let hex_runtime::EventBody::AttemptStarted { worker, .. } = &event.body else {
+                continue;
+            };
+            let (Some(attempt_id), Some(node_id)) = (&event.attempt_id, &event.node_id) else {
+                continue;
+            };
+            if node.is_some_and(|want| want != node_id) {
+                continue;
+            }
+            drain(runtime, run_id, &mut open, tty)?;
+            let via = worker
+                .as_deref()
+                .map_or(String::new(), |w| format!(" via {w}"));
+            println!("\u{2500}\u{2500} {attempt_id} [{node_id}]{via} \u{2500}\u{2500}");
+            let cursor = if attaching {
+                for line in tail_of(runtime, run_id, attempt_id, tail_lines) {
+                    println!("{}", grey(&line, tty));
+                }
+                hex_runtime::StreamCursor::at_end(runtime, run_id, attempt_id)
+                    .map_err(|e| e.to_string())?
+            } else {
+                hex_runtime::StreamCursor::default()
+            };
+            open = Some((attempt_id.clone(), cursor));
+        }
+        seen = events.len();
+        attaching = false;
+        drain(runtime, run_id, &mut open, tty)?;
+
         let status = runtime.status(run_id).map_err(|e| e.to_string())?;
-        let current = status.in_flight.as_ref().map(|f| f.attempt_id.clone());
-        // An attempt stops being in-flight the moment it terminates, so its final
-        // bytes — a check's failure line, an agent's last word — land *after* the
-        // last poll that could still see it. Drain before letting go, or the most
-        // interesting line of the attempt is the one you never get.
-        if let Some((id, dir)) = &attached
-            && current.as_ref() != Some(id)
-        {
-            drain_streams(dir, &mut offsets, tail_lines, false, tty);
-            attached = None;
-            offsets.clear();
-        }
-        if let Some(f) = &status.in_flight {
-            let attaching = attached.is_none();
-            if attaching {
-                let via = f
-                    .worker
-                    .as_deref()
-                    .map_or(String::new(), |w| format!(" via {w}"));
-                println!(
-                    "\u{2500}\u{2500} {} [{}]{via} \u{2500}\u{2500}",
-                    f.attempt_id, f.node_id
-                );
-                let dir = runtime
-                    .attempt_dir(run_id, &f.attempt_id)
-                    .map_err(|e| e.to_string())?;
-                attached = Some((f.attempt_id.clone(), dir));
-                offsets.clear();
-            }
-            if let Some((_, dir)) = &attached {
-                drain_streams(dir, &mut offsets, tail_lines, attaching, tty);
-            }
-        }
         if status.status.is_finished() {
             println!(
-                "── {} ──",
+                "\u{2500}\u{2500} {} \u{2500}\u{2500}",
                 disposition_label(status.disposition, "finished")
             );
             return Ok(ExitCode::SUCCESS);
@@ -1381,86 +1414,40 @@ fn follow_logs(runtime: &Runtime, run_id: &str, tail_lines: usize) -> Result<Exi
     }
 }
 
-/// Print whatever is new in every stream of `dir`, advancing `offsets`.
-///
-/// `attaching` starts each stream at its *tail* rather than its head: joining a
-/// long attempt should show what it is doing now, not replay everything it said.
-fn drain_streams(
-    dir: &std::path::Path,
-    offsets: &mut std::collections::BTreeMap<std::path::PathBuf, u64>,
-    tail_lines: usize,
-    attaching: bool,
+/// Print whatever the open attempt has written since the last look. Called on
+/// every poll *and* before switching attempts: an attempt's final bytes land
+/// after the last poll that could still see it running, and those are the
+/// interesting ones — a check's failure, an agent's last word.
+fn drain(
+    runtime: &Runtime,
+    run_id: &str,
+    open: &mut Option<(String, hex_runtime::StreamCursor)>,
     tty: bool,
-) {
-    for path in attempt_streams(dir) {
-        let known = offsets.contains_key(&path);
-        let offset = offsets.entry(path.clone()).or_insert(0);
-        if attaching || !known {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                let lines: Vec<&str> = text.lines().collect();
-                let start = lines.len().saturating_sub(tail_lines);
-                for line in &lines[start..] {
-                    println!("{}", grey(line, tty));
-                }
-                *offset = text.len() as u64;
-            }
-        } else if let Some(new) = read_from(&path, offset) {
-            for line in new.lines() {
-                println!("{}", grey(line, tty));
-            }
+) -> Result<(), String> {
+    let Some((attempt_id, cursor)) = open.as_mut() else {
+        return Ok(());
+    };
+    for chunk in runtime
+        .read_streams(run_id, attempt_id, cursor)
+        .map_err(|e| e.to_string())?
+    {
+        for line in chunk.text.lines() {
+            println!("{}", grey(line, tty));
         }
     }
+    Ok(())
 }
 
-/// Every captured stream an attempt owns: its own two, plus both of each numbered
-/// step directory a `command` node writes. Without the step files, following a
-/// gate showed a header and nothing else — and a gate is exactly the thing you
-/// wait on (`cargo test` is the slow part of a loop).
-fn attempt_streams(attempt_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut files = vec![
-        attempt_dir.join("stdout.log"),
-        attempt_dir.join("stderr.log"),
-    ];
-    let Ok(entries) = std::fs::read_dir(attempt_dir) else {
-        return files;
-    };
-    let mut steps: Vec<(u32, std::path::PathBuf)> = entries
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            // Declared position, so `10-x` follows `9-x` rather than preceding it.
-            let position = name.split_once('-')?.0.parse().ok()?;
-            Some((position, e.path()))
-        })
+/// The last `lines` lines an attempt has written, across all of its streams.
+fn tail_of(runtime: &Runtime, run_id: &str, attempt_id: &str, lines: usize) -> Vec<String> {
+    let mut cursor = hex_runtime::StreamCursor::default();
+    let all: Vec<String> = runtime
+        .read_streams(run_id, attempt_id, &mut cursor)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|c| c.text.lines().map(ToOwned::to_owned).collect::<Vec<_>>())
         .collect();
-    steps.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    for (_, dir) in steps {
-        files.push(dir.join("stdout.log"));
-        files.push(dir.join("stderr.log"));
-    }
-    files
-}
-
-/// Bytes appended to `path` since `offset`, advancing it. `None` when there is
-/// nothing new (or the file is not there yet).
-fn read_from(path: &std::path::Path, offset: &mut u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    // A truncated file (a re-run attempt clears its logs) would otherwise leave the
-    // cursor past the end and go permanently silent.
-    if len < *offset {
-        *offset = 0;
-    }
-    if len == *offset {
-        return None;
-    }
-    file.seek(SeekFrom::Start(*offset)).ok()?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf).ok()?;
-    *offset = len;
-    Some(buf)
+    all[all.len().saturating_sub(lines)..].to_vec()
 }
 
 /// Lines of a still-running attempt shown by default. Enough to see what the
@@ -1478,7 +1465,7 @@ fn cmd_logs(
     let runtime = open_runtime()?;
     let tail_lines = tail.unwrap_or(DEFAULT_TAIL_LINES);
     if follow {
-        return follow_logs(&runtime, run_id, tail_lines);
+        return follow_logs(&runtime, run_id, node, tail_lines);
     }
     let in_flight = runtime
         .status(run_id)
@@ -1613,16 +1600,6 @@ fn usd(micro_usd: u64) -> String {
         micro_usd / 1_000_000,
         (micro_usd % 1_000_000) / 100
     )
-}
-
-/// Money for a table cell: an em dash when nothing reported a cost, because
-/// `$0.0000` reads as "this was free" rather than "the agent does not say".
-fn money(micro_usd: u64) -> String {
-    if micro_usd == 0 {
-        "—".to_owned()
-    } else {
-        usd(micro_usd)
-    }
 }
 
 /// A token count at a glance: exact when small, else `34.8k` / `1.2M`.
@@ -1804,14 +1781,25 @@ fn event_summary(body: &hex_runtime::EventBody) -> String {
         } => {
             let spent = cost_micro_usd
                 .or_else(|| {
-                    let per_model: u64 = models.iter().filter_map(|m| m.cost_micro_usd).sum();
+                    // Saturating like every other fold over reported usage: a
+                    // garbled value must not panic the renderer of the event that
+                    // carries it.
+                    let per_model: u64 = models
+                        .iter()
+                        .filter_map(|m| m.cost_micro_usd)
+                        .fold(0u64, u64::saturating_add);
                     (per_model > 0).then_some(per_model)
                 })
                 .map_or(String::new(), |c| format!(", {}", usd(c)));
             let names: Vec<&str> = models.iter().map(|m| m.model.as_str()).collect();
             format!(
                 "usage {} tokens{spent}{}",
-                tokens(models.iter().map(hex_runtime::ModelUsage::tokens).sum()),
+                tokens(
+                    models
+                        .iter()
+                        .map(hex_runtime::ModelUsage::tokens)
+                        .fold(0u64, u64::saturating_add)
+                ),
                 if names.is_empty() {
                     String::new()
                 } else {

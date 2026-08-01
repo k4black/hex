@@ -34,9 +34,9 @@ records · cli / mcp / dashboard are windows.**
 | [`hex-proto`](crates/hex-proto) | Versioned protocol: `Event`, `Command`, `Capability`. The one stable public surface, shared by kernel, workers, and clients. | — |
 | [`hex-kernel`](crates/hex-kernel) | **Pure, deterministic.** Graph IR, journal model, projections, and the three functions `reduce` / `schedule` / `accept`. No IO, no subprocess, no wall clock. | proto |
 | [`hex-worker`](crates/hex-worker) | Adapter for **one** opaque external agent/CLI behind the `Worker` trait + capability manifest (mock, subprocess/argv, coding-agent presets). Runs one worker, reports what happened. Never coordinates. | proto, kernel |
-| [`hex-runtime`](crates/hex-runtime) | Orchestration — the imperative shell. Drive loop, effect execution, journal writer, control-command ingestion, workspace isolation, run supervision. Exposes the `Runtime` API and the `RuntimeClient` trait. | kernel, worker, proto |
-| [`hex-cli`](crates/hex-cli) | The `hex` binary — a **thin client** over `RuntimeClient`. Arg parsing + rendering only. | runtime |
-| [`hex-mcp`](crates/hex-mcp) | *(later)* MCP transport — a thin client/peer of the CLI over the same `RuntimeClient`. Can start and control runs. | runtime |
+| [`hex-runtime`](crates/hex-runtime) | Orchestration — the imperative shell. Drive loop, effect execution, journal writer, control-command ingestion, workspace isolation, run supervision. Exposes the `Runtime` API, down to the byte-level stream reads a live tail needs, so no client walks `.hex/`. | kernel, worker, proto |
+| [`hex-cli`](crates/hex-cli) | The `hex` binary — a **thin client** over `Runtime`. Arg parsing + rendering only. | runtime |
+| [`hex-mcp`](crates/hex-mcp) | *(later)* MCP transport — a thin client/peer of the CLI over the same `Runtime` API. Can start and control runs. | runtime |
 | [`hex-dashboard`](crates/hex-dashboard) | *(later)* TUI/web viewer — another thin client; also able to start runs. | runtime |
 | [`hex-bench`](crates/hex-bench) | Criterion benchmarks. | kernel, runtime |
 
@@ -68,11 +68,14 @@ worker, and `replay(journal)` always reproduces the projection.
 
 ### Process & control model
 
-- **Now:** foreground single process — `hex run` owns the loop via
-  `RuntimeClient::InProcess`. No daemon.
-- **Later:** a per-run background controller + `Remote` client behind the same
-  `RuntimeClient` trait; the daemon is only a transport wrapper, never a second
-  implementation.
+- **Now:** foreground single process — `hex run` owns the loop in-process. No
+  daemon. Every client (CLI now, MCP and dashboard later) parses arguments and
+  renders; every fact it shows is one the runtime computed.
+- **Later:** a per-run background controller reached over a transport; the
+  daemon is only a transport wrapper, never a second implementation. There was
+  a `RuntimeClient` trait held open for that day — nine signatures, one
+  implementation, no callers — and it was deleted. A trait is cheaper to
+  re-derive from a second implementation than to keep honest without one.
 
 Workers talk back over **one `Command` protocol with two transports**: an
 injected `hex emit <event>` CLI (works for any subprocess — the universal
@@ -171,8 +174,27 @@ is a graph with no reachable `terminal: succeeded`, which could only ever fail.
 
 **Bounds** are layered: `budget.attempts` and `budget.elapsed` bound the run,
 `budget.attempt` bounds a single attempt (always set, so a hung agent can never
-block forever), and a per-node `budget: { visits: N }` bounds *one* loop — cap a
-review cycle at 3 rounds without also capping a cheap lint cycle.
+block forever), `budget.output_tokens` bounds what the run *generates*, and a
+per-node `budget: { visits: N }` bounds *one* loop — cap a review cycle at 3
+rounds without also capping a cheap lint cycle.
+
+```yaml
+defaults:
+  budget: { attempts: 8, elapsed: 30m, attempt: 10m, output_tokens: 200000 }
+```
+
+`output_tokens` counts **generation** only, not every token an agent reported.
+A bound over the raw total is dominated by cached input — a real run of this
+repo read 4.84M cached tokens against 209k fresh input and 20.5k generated — so
+it would have to be tuned to context size rather than to work done, and turning
+on `context: continue` would silently move it. Generated tokens are the one
+measure immune to that. The kernel checks it at an attempt boundary like every
+other budget, so the attempt that crosses the line is paid for and the next one
+never starts: worst-case overshoot is one attempt, itself bounded by
+`budget.attempt`. Crossing it ends the run `budget_exhausted` (exit 4 — no new
+disposition). `output_tokens: 0` is a validation error (`E-budget-zero`): it is
+spent before the first attempt, so the run would end having done nothing, which
+reads as a hex bug rather than a typo.
 
 **Acceptance** can route rather than dead-end. `accept.on_unmet: <node>` sends a
 run that reached a success terminal without the required evidence back to earn it;
@@ -363,6 +385,8 @@ hex watch <run>          print the event stream ([--follow] until the run ends)
 hex logs <run> [--node <id>] [--full] [--tail N] [--follow]
                          each attempt's final message + every check's output; a
                          still-running attempt's tail, streamed with --follow
+                         (honours --node, streams every captured byte so --full
+                         adds nothing, and rejects --json)
 hex pause <run>          pause at the next attempt boundary
 hex steer <run> <text>   add operator guidance to the next attempt
 hex respond <run> <text> answer a blocking `human` node
@@ -410,8 +434,35 @@ runs `codex exec --json` and yields tokens only — its stream names no model an
 cost, so the per-model split is labelled with the role's configured model; claude
 reports `modelUsage` per model with `costUSD`, plus `total_cost_usd`,
 `duration_ms` and a `session_id`. hex never estimates and ships **no price
-table**: an agent that reports no money shows no money, because a made-up cost is
-worse than an absent one.
+table**: prices drift, and a table in-tree is wrong the week a vendor changes
+one, so an agent that reports no money shows no money.
+
+That makes the *mixed* run the normal case — this repo's own config binds
+`reviewer` to codex and `implementer` to claude — so a partly priced total says
+so rather than presenting half the spend as the whole:
+
+```text
+NODE                   VISITS        IN       OUT   CACHE R   CACHE W   REASON         COST
+implement                   3     12.4k      8.1k      1.9M     41.2k     6.0k      $0.4183
+review                      2      3.1k      1.2k      2.9M         0      896            —
+MODEL
+claude-opus-5                     12.4k      8.1k      1.9M     41.2k     6.0k      $0.4183
+gpt-5-codex                        3.1k      1.2k      2.9M         0      896            —
+total                       5     15.5k      9.3k      4.8M     41.2k     6.9k    ≥ $0.4183
+
+cost is a lower bound: 2 attempt(s) reported tokens but no price
+```
+
+Every token category the agents distinguish gets its own column, because they
+are not interchangeable: a cached read costs a fraction of a fresh input and
+dominates the volume. `REASON` is a *subset* of `OUT`, carried for information
+and never added into a total. The cost cell reads `—` when nothing priced the
+work, `≥ $X` when only part of it did, and a plain `$X` when all of it did; an
+attempt counts as under-priced when it reports no authoritative total **and** at
+least one of its models named no price — which deliberately catches the mixed
+attempt, since summing only the priced half and calling it the total is the
+misreport being fixed. `--json` carries the same caveat as `cost_is_partial` and
+`unpriced_reports`, so a driving agent is not left reading the table.
 
 Money is integer **micro-USD** end to end. An `Event` is `Eq` and the journal
 compares facts, so a currency amount that round-trips through JSON as an `f64` is
@@ -485,14 +536,22 @@ applies to the NEXT attempt` — a steer is drained at an attempt boundary, and
 without that line an operator expects the running agent to change course and reads
 the unchanged output as a dropped command.
 
-`hex logs --follow` streams the in-flight attempt's output until the run ends, then
-closes with a `── succeeded ──` line. It follows *across* attempts, including a
-`command` node's numbered step directories — a gate is exactly the slow thing you
-wait on. It attaches at each stream's **tail**, so joining a long attempt shows what
-it is doing now rather than replaying an hour, and it drains an attempt's final
-bytes when that attempt stops being in flight, because the most interesting line —
-a check's failure, an agent's last word — is written after the last poll that could
-still see it. Without `--follow`, a still-running attempt shows its last `--tail N`
+`hex logs --follow` streams attempts' output until the run ends, then closes with
+a `── succeeded ──` line. It is driven by the **journal**, not by sampling what is
+in flight: every `AttemptStarted` is seen exactly once whenever it lands, so an
+attempt that starts and finishes between two polls — a quick check writing its
+failure and exiting — is still shown, where before the follower printed a
+disposition and none of the evidence for it. It follows *across* attempts,
+including a `command` node's numbered step directories, because a gate is exactly
+the slow thing you wait on. The attempt already running when you attach is joined
+at its **tail** (so joining a long attempt shows what it is doing now rather than
+replaying an hour); later ones stream from their first byte. An attempt is drained
+before the follower switches away from it, because the most interesting line — a
+check's failure, an agent's last word — is written after the last poll that could
+still see it running. `--node <id>` narrows it to one node; `--full` adds nothing
+(follow streams every captured byte anyway); `--json --follow` is rejected by the
+parser rather than silently emitting human text. Without `--follow`, a
+still-running attempt shows its last `--tail N`
 lines (default 20) and `(still running)`, instead of the `(no final message
 captured)` it used to print over ten lines of live output. Both streams either way:
 codex writes everything to stderr and nothing to stdout, so one stream alone is
@@ -521,7 +580,7 @@ worktrees, and a serialized integration queue arrive later.
 
 ## Status
 
-**Phase 1 works, plus five follow-up passes.** The critique loop runs end-to-end
+**Phase 1 works, plus six follow-up passes.** The critique loop runs end-to-end
 on real agent CLIs, records everything to a JSONL journal, enforces run *and*
 per-attempt budgets, resumes a killed run, and reports why it stopped, what it
 produced, and what it cost.
@@ -571,6 +630,25 @@ the check that went red, a cost of zero renders as an em dash rather than claimi
 the work was free, and the spend column is labelled `VISITS` because that is what
 the projection counts. Also: the shipped presets now declare `context: continue` on
 the node a loop revisits and keep the reviewer `fresh`.
+
+Landed 2026-08-01 — honest spend, a generation budget, and one fewer seam: the
+usage table reports every token category (`IN`/`OUT`/`CACHE R`/`CACHE W`/`REASON`)
+instead of one collapsed count, and a partly priced run renders `≥ $X` with a
+closing lower-bound line rather than passing half the spend off as the total —
+the mixed run is the normal case here, since this repo reviews with codex (tokens
+only) and implements with claude (money). New run-wide
+`budget: { output_tokens: N }` bounds what a run *generates*. The `RuntimeClient`
+trait is gone (nine signatures, one impl, no callers), and the stream reads a
+follower needs moved into the runtime, so the CLI no longer walks `.hex/`.
+Round-2 review fixes in the same pass: a session was resumable by the *wrong*
+agent (the check compared the worker registry name, which is a role alias and
+survives rebinding the role from codex to claude — `AttemptReported` now records
+the owning program); `logs --follow` is journal-driven, so an attempt that began
+and ended between two polls is no longer missed; every remaining fold over
+reported usage saturates; a follower reads exactly the bytes it accounts for
+(the old one could print a concurrent writer's append twice); `--follow` honours
+`--node` and rejects `--json`; and an unreadable control inbox is an error rather
+than a report of "nothing queued".
 
 ### Known broken
 

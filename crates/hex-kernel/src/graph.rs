@@ -224,6 +224,19 @@ pub struct Budget {
     pub attempt_elapsed_ms: Option<u64>,
     /// Maximum visits to any single node (per-cycle bound).
     pub cycle_visits: Option<u32>,
+    /// Maximum **generation** tokens across the whole run — what the agents
+    /// produced, summed from `AttemptReported`.
+    ///
+    /// Generation only, deliberately. A bound over *every* reported token is
+    /// dominated by cached input (93% of a real review run here), so it would
+    /// have to be tuned to context size rather than to work done, and enabling
+    /// `context: continue` would silently move it. Output tokens are the one
+    /// measure immune to that.
+    ///
+    /// Checked at an attempt boundary like every other budget: a count only
+    /// exists once an attempt reports, so the attempt that crosses the line is
+    /// paid for and the next one never starts.
+    pub output_tokens: Option<u64>,
 }
 
 /// Per-attempt wall-clock bound applied when a graph declares no attempt bound

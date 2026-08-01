@@ -1,7 +1,7 @@
 //! Subprocess agent adapters: one uniform [`Worker`] surface, one adapter per
 //! external coding-agent CLI.
 //!
-//! Every adapter shares the same spawn/log/emit/result plumbing ([`run_agent`]),
+//! Every adapter shares the same spawn/log/emit/result plumbing (`run_agent`),
 //! but each concrete worker ([`CodexWorker`], [`ClaudeWorker`], [`OpencodeWorker`])
 //! encapsulates *its* agent's specifics — argv, final-message capture, and the
 //! read-only flag it maps to. [`CommandWorker`] is the generic escape hatch for a
@@ -488,7 +488,13 @@ fn run_agent(
     // above this point, which is how a 15-minute review that finished and then
     // blew its deadline was recorded as producing nothing at all — the tokens
     // were spent, the answer was on disk, and hex threw both away.
-    let report = usage.map(|u| read_report(u, &request.attempt_dir, model_hint));
+    // Stamped here rather than in each adapter: `command[0]` is literally the
+    // program being spawned, so the recorded session owner cannot drift from the
+    // process that created the session.
+    let report = usage.map(|u| {
+        read_report(u, &request.attempt_dir, model_hint)
+            .owned_by(command.first().map(String::as_str))
+    });
     let captured = capture_result(capture, &request.attempt_dir, &result_file);
     // A dead attempt has no final message of its own, so the tail of what it did
     // write stands in for one.
@@ -603,14 +609,22 @@ fn codex_report(path: &Path, model_hint: Option<&str>) -> AttemptReport {
                     // the whole prompt and `cached_input_tokens` is the part of it
                     // that hit cache. Adding both would count the cached tokens
                     // twice, so the fresh share is the difference.
+                    // Saturating: these come straight off an agent's stream, and a
+                    // garbled turn must not panic the attempt that produced it.
                     let cached = n("cached_input_tokens");
-                    usage.input_tokens += n("input_tokens").saturating_sub(cached);
-                    usage.cache_read_tokens += cached;
-                    usage.cache_write_tokens += n("cache_write_input_tokens");
-                    usage.output_tokens += n("output_tokens");
+                    usage.input_tokens = usage
+                        .input_tokens
+                        .saturating_add(n("input_tokens").saturating_sub(cached));
+                    usage.cache_read_tokens = usage.cache_read_tokens.saturating_add(cached);
+                    usage.cache_write_tokens = usage
+                        .cache_write_tokens
+                        .saturating_add(n("cache_write_input_tokens"));
+                    usage.output_tokens = usage.output_tokens.saturating_add(n("output_tokens"));
                     // Also a subset of `output_tokens`, so it is carried for
                     // information and never added into the total.
-                    usage.reasoning_tokens += n("reasoning_output_tokens");
+                    usage.reasoning_tokens = usage
+                        .reasoning_tokens
+                        .saturating_add(n("reasoning_output_tokens"));
                 }
             }
             _ => {}
@@ -641,6 +655,8 @@ fn claude_report(path: &Path) -> AttemptReport {
             .and_then(micro_usd),
         duration_ms: v.get("duration_ms").and_then(serde_json::Value::as_u64),
         models: Vec::new(),
+        // Stamped by the shared plumbing, which knows the program it spawned.
+        agent: None,
     };
     // `modelUsage` is keyed by model name and is the only place the per-model
     // split exists; claude's flat `usage` block aggregates them.

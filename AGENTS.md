@@ -19,8 +19,8 @@ runtime orchestrates and records · cli/mcp/dashboard are windows.*
 | `hex-proto` | Versioned protocol: `Event`, `Command`, `Capability`. Only stable public surface. | — |
 | `hex-kernel` | **Pure**: Graph IR, journal model, projections, `reduce`/`schedule`/`accept`. No IO/subprocess/clock. | proto |
 | `hex-worker` | `Worker` trait + capability manifest + adapters (mock, subprocess, coding-agent presets). Runs **one** worker; never coordinates. | proto, kernel |
-| `hex-runtime` | Imperative shell: drive loop, effect execution, journal writer, control ingestion, workspace isolation, run supervision. Exposes `Runtime` + `RuntimeClient` trait (`InProcess` now, `Remote` later). | kernel, worker, proto |
-| `hex-cli` | The `hex` binary — thin client over `RuntimeClient`; arg parsing + rendering only. | runtime |
+| `hex-runtime` | Imperative shell: drive loop, effect execution, journal writer, control ingestion, workspace isolation, run supervision. Exposes the concrete `Runtime` — including `read_streams`, so tailing a live attempt needs no knowledge of `.hex/`. (The `RuntimeClient` trait it also exposed was deleted 2026-08-01: one impl, no callers.) | kernel, worker, proto |
+| `hex-cli` | The `hex` binary — thin client over `Runtime`; arg parsing + rendering only. | runtime |
 | `hex-mcp` | *(later)* MCP transport — a peer client of the CLI; can start/control runs. | runtime |
 | `hex-dashboard` | *(later)* TUI/web viewer — another thin client. | runtime |
 | `hex-bench` | Cross-crate criterion benchmarks. | kernel, runtime |
@@ -72,7 +72,12 @@ into another agent framework. They are non-negotiable.
 8. **Human and agent share one control protocol**, with authority scoped per
    actor. One `Command` type, two worker transports (injected `hex emit` CLI +
    MCP tool hooks); every surface (CLI, `--json`, MCP, dashboard) is a thin
-   client over `RuntimeClient` — never a parallel implementation.
+   client over the runtime — it parses arguments and renders, and every fact it
+   shows the runtime computed. That is the substance, and it does not require a
+   trait: `RuntimeClient` (nine signatures, one implementation, zero callers)
+   was deleted 2026-08-01 because a trait is cheaper to re-derive from a second
+   implementation than to keep honest without one. The rule a client must not
+   break is *no parallel implementation*, not *implement this trait*.
 9. **The worker adapter never coordinates.** Sub-agents, watchdogs, fan-out
    are kernel-routed / runtime-scheduled graph constructs, or the external
    agent's own internal business — never logic inside `hex-worker`.
@@ -233,8 +238,8 @@ sign-off, confirmation.
 6. `hex run`'s workspace is the project cwd (shared isolation); run it from the
    repo root. Redo = new `run`; `resume` continues the same run and marks an
    orphaned attempt `interrupted` before re-attempting (never a silent rerun).
-7. `hex-mcp`/`hex-dashboard` are deliberate stubs; they become thin
-   `RuntimeClient` clients — a transport/projection, never orchestration.
+7. `hex-mcp`/`hex-dashboard` are deliberate stubs; they become thin clients over
+   `Runtime` — a transport/projection, never orchestration.
 8. Worktree isolation is per-run and opt-in (`hex run --worktree [<base>]` /
    `--no-worktree`), default `shared`; **no auto-merge** — the branch
    `hex/<run-id>` is left for explicit integration. Implemented as a thin slice
@@ -482,21 +487,19 @@ sign-off, confirmation.
    **nothing** into `done/` — a read that consumed a command would delete the very
    steer the operator was checking on. `hex steer` also prints, on stderr, that an
    in-flight attempt will not see it, since drain happens between attempts.
-37. **A follower must drain a stopped attempt, and must wait for a reserved run's
-   journal.** `follow_logs` polls `status().in_flight`; an attempt stops being
-   in-flight the instant it terminates, so its last bytes — a check's failure line,
-   an agent's final word — are written *after* the poll that could still see them.
-   Drain the streams before detaching (`drain_streams(..., false, ...)`), or the most
-   interesting line of the attempt is the one nobody sees. `attempt_streams` collects
-   the attempt's own two logs plus each numbered step dir's, in **declared** position
-   order (`10-` after `9-`), because a `command` node writes nothing to the attempt
-   dir and a gate is what you actually wait on. Attach at each stream's *tail*, not
-   its head. And both followers call `wait_for_journal` (15s, `FOLLOW_POLL` 400ms):
-   `--detach` reserves the run dir before the driver's first write, so
+37. **An attempt's streams are more than its two logs, and a follower waits for a
+   reserved run's journal.** `attempt_streams` (now in `hex-runtime`) collects the
+   attempt's own stdout/stderr plus each numbered step dir's, in **declared**
+   position order (`10-` after `9-`), because a `command` node writes nothing to
+   the attempt dir and a gate is what you actually wait on. Attach at each stream's
+   *tail*, not its head. Both followers call `wait_for_journal` (15s, `FOLLOW_POLL`
+   400ms): `--detach` reserves the run dir before the driver's first write, so
    `hex logs --follow "$(hex run … --detach)"` would otherwise fail instantly —
-   "not started yet" vs "does not exist" is told apart via `summary`, so a typo still
-   fails fast. `Runtime::attempt_dir` hands out the path (`validate_run_id`'d, since
-   an attempt id ends up in one) so no client learns the on-disk layout.
+   "not started yet" vs "does not exist" is told apart via `summary`, so a typo
+   still fails fast. `Runtime::read_streams(run, attempt, &mut StreamCursor)`
+   (`validate_run_id`'d, since an attempt id ends up in a path) hands back chunks,
+   so no client learns the on-disk layout; it replaced the `attempt_dir` accessor,
+   which handed one out. Attach/drain mechanics are gotcha 40.
 38. **Preset session policy: the implementer continues, the reviewer stays fresh.**
    `context: continue` is declared on the node a loop revisits (`implement` in
    `critique-loop`/`implement-until-green`/`plan-build-review`/`tdd`, plus `tdd`'s
@@ -509,4 +512,68 @@ sign-off, confirmation.
    `Capability::SessionResume` (gotcha 33), so pointing `implementer` at a
    `kind: command` worker makes these presets refuse to start until that node says
    `context: fresh`. Preset comments say so at the point of use — keep them there.
-39. _add new gotchas here as they are discovered_
+39. **A session's identity is the *program*, not the worker name.** The first
+   version of this guard compared `SessionHandle.worker` (the registry name) with
+   the node's worker, which looked right and was worthless: a role registers under
+   its **own alias**, so `"implementer" == "implementer"` still holds after
+   rebinding `roles.implementer.worker` from codex to claude — waving through
+   `claude --resume <codex-thread-id>`, the exact bug the check existed for.
+   `AttemptReported` now carries `agent` (the program, from `Worker::program()`,
+   stamped by the shared plumbing in `run_agent` from `command[0]` — the argv
+   actually spawned, so it cannot drift from the process that opened the session),
+   `SessionHandle` is `{ agent, id }`, and the comparison is the testable
+   `driver::resumable_id`. A mismatch runs **fresh**, not an error: the operator
+   changed the binding, so a fresh session is what they asked for. A report naming
+   no agent (an adapter that spawns nothing, e.g. the mock) is not resumable at
+   all. General lesson: when a check compares two names, verify they cannot be
+   equal for the wrong reason.
+40. **A follower is driven by the journal, drains before switching, and reads
+   exactly the bytes it accounts for.** Three separate bugs, one surface:
+   (a) sampling `status().in_flight` every 400ms missed any attempt that started
+   *and* finished between polls — a fast check wrote its failure and exited unseen,
+   so the follower printed a disposition and none of the evidence. Iterate
+   `AttemptStarted` events instead: append-only means each is seen exactly once,
+   whenever it lands. (b) An attempt's last bytes are written after the last poll
+   that could see it running, so `drain` runs both per-poll *and* before switching
+   attempts. (c) The old cursor sampled a file's length, read to **EOF**, then
+   stored the sampled length — anything a writer appended in between was printed
+   and printed again next poll; `read_span(path, offset, len - offset)` reads the
+   span it will account for. The attempt in flight at attach time joins at its tail
+   (`StreamCursor::at_end`); later ones stream from byte zero
+   (`StreamCursor::default`). `--follow` also honours `--node` and is
+   `conflicts_with = "json"` — a flag a command accepts and ignores is worse than
+   one it rejects.
+41. **Every fold over reported usage saturates — no exceptions left.** These are
+   numbers an agent printed and a journal replayed, so nothing here is trusted
+   arithmetic, and a projection recomputed on every read turns one debug panic (or
+   release wrap) into a permanently unreadable run. The first cost pass hardened
+   `Usage::add` and missed three: `ModelUsage::tokens`, codex's multi-turn
+   accumulator in `codex_report`, and both folds in the CLI's `event_summary`.
+   If you add an arithmetic operator to a path fed by `AttemptReported`, it is
+   `saturating_add`.
+42. **A partly priced total says so.** `Totals.unpriced_reports` +
+   `cost_is_partial()`; an attempt counts as under-priced when it reports **no**
+   authoritative attempt total **and** at least one of its models named no price.
+   The `and` is the point: it catches the *mixed* attempt where one model priced
+   its share and another did not, because summing only the priced half and calling
+   it the total is precisely the misreport. Rendering (`cost_cell`): `—` when
+   nothing was priced, `≥ $X` when part was, plain `$X` when all was, plus a
+   closing `cost is a lower bound: N attempt(s) reported tokens but no price`;
+   `--json` carries `cost_is_partial`/`unpriced_reports` so a machine consumer gets
+   the same caveat. This is the normal case in this repo, not an edge: this
+   project's `.hex/config.yaml` binds reviewer→codex (tokens only) and
+   implementer→claude (money). Still **no price table** — see gotcha 28.
+43. **`budget.output_tokens` counts generation only.** Run-wide, so it is declared
+   under `defaults: { budget: … }` (a node's `budget:` still takes `visits` only).
+   A bound over every reported
+   token is dominated by cached input (4.84M cache-read vs 209k fresh input and
+   20.5k generated in a measured run of this repo), so it would be tuned to context
+   size rather than to work done — and enabling `context: continue` would silently
+   move it. Checked in `schedule` at the attempt boundary like every other budget,
+   ending the run `budget_exhausted` (exit 4, no new disposition); worst-case
+   overshoot is one attempt, itself bounded by `budget.attempt`. `output_tokens: 0`
+   is `E-budget-zero`: spent before the first attempt, it would end a run that did
+   nothing, which reads as a hex bug rather than a typo. **Untested end-to-end**:
+   no fake worker reports usage, so enforcement is covered by kernel unit tests
+   only (TODO.md).
+44. _add new gotchas here as they are discovered_

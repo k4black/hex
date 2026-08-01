@@ -394,15 +394,31 @@ fn status_reports_what_the_run_spent() {
     assert!(s.contains("build"), "the node that spent it: {s}");
     assert!(s.contains("test-model"), "a per-model row: {s}");
     assert!(s.contains("total"), "a total row: {s}");
-    // 1000 + 200 tokens, $0.123456 — money is exact micro-USD, shown to 4 places.
-    assert!(s.contains("1200"), "tokens summed: {s}");
+    // Categories are reported separately: a cached read is not a fresh input, and
+    // collapsing them hides that most of a real run is cache.
+    assert!(
+        s.contains("IN") && s.contains("OUT"),
+        "per-category columns: {s}"
+    );
+    assert!(s.contains("CACHE R"), "cache is its own column: {s}");
+    assert!(
+        s.contains("1000") && s.contains("200"),
+        "the reported split: {s}"
+    );
+    // Money is exact micro-USD, shown to 4 places, and unqualified because this
+    // attempt priced all of its work.
     assert!(s.contains("$0.1234"), "cost rendered: {s}");
+    assert!(
+        !s.contains("lower bound"),
+        "a fully priced run states a real total: {s}"
+    );
 
     let json = hex(dir.path(), &["status", &run_id, "--json"]);
     let v: serde_json::Value = serde_json::from_str(stdout(&json).trim()).expect("status json");
     assert_eq!(v["usage"]["total"]["tokens"], 1200);
     assert_eq!(v["usage"]["total"]["cost_micro_usd"], 123_456);
     assert_eq!(v["usage"]["by_node"]["build"]["attempts"], 1);
+    assert_eq!(v["usage"]["total"]["cost_is_partial"], false);
     assert_eq!(v["usage"]["by_model"]["test-model"]["output_tokens"], 200);
 }
 
@@ -427,7 +443,47 @@ fn status_omits_the_usage_table_when_nothing_reported_any() {
 /// the `build` attempt — the kernel accepts it only while that attempt is in
 /// flight, so it goes directly after its `attempt_started`. `seq` is contiguous
 /// per run, so every following event is renumbered.
+/// Inject a report that spent tokens and named no price — codex's shape.
+fn inject_usage_unpriced(dir: &Path, run_id: &str) {
+    inject_report(
+        dir,
+        run_id,
+        serde_json::json!({
+            // The real mixed shape: claude prices its share, codex does not, and
+            // the attempt reports no authoritative total.
+            "models": [
+                { "model": "claude", "input_tokens": 10, "output_tokens": 5, "cost_micro_usd": 90_000 },
+                { "model": "codex", "input_tokens": 500, "output_tokens": 50 },
+            ],
+        }),
+    );
+}
+
+/// Splice a fully priced `attempt_reported` into a finished run's journal.
+///
+/// The journal is the authority, and no shell-based fake worker reports usage, so
+/// appending the exact event a real adapter writes is the honest stimulus for the
+/// projection and its rendering. (The parsers themselves are tested against
+/// captured real agent output in `hex-worker`.)
 fn inject_usage(dir: &Path, run_id: &str) {
+    inject_report(
+        dir,
+        run_id,
+        serde_json::json!({
+            "models": [{
+                "model": "test-model",
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "cost_micro_usd": 123_456,
+            }],
+            "cost_micro_usd": 123_456,
+        }),
+    );
+}
+
+/// Insert `body` as an `attempt_reported` right after the `build` attempt started,
+/// renumbering `seq` (which `journal::scan` requires to be contiguous).
+fn inject_report(dir: &Path, run_id: &str, body: serde_json::Value) {
     let path = dir
         .join(".hex")
         .join("runs")
@@ -442,29 +498,20 @@ fn inject_usage(dir: &Path, run_id: &str) {
         .iter()
         .position(|e| e["kind"] == "attempt_started" && e["node_id"] == "build")
         .expect("the build attempt is in the journal");
-    events.insert(
-        at + 1,
-        serde_json::json!({
-            "schema_version": 1,
-            "seq": 0,
-            "at_ms": events[at]["at_ms"],
-            "run_id": run_id,
-            "node_id": "build",
-            "attempt_id": events[at]["attempt_id"],
-            "actor": { "kind": "agent", "id": "builder" },
-            "kind": "attempt_reported",
-            "models": [{
-                "model": "test-model",
-                "input_tokens": 1000,
-                "output_tokens": 200,
-                "cache_read_tokens": 0,
-                "cache_write_tokens": 0,
-                "reasoning_tokens": 0,
-                "cost_micro_usd": 123_456,
-            }],
-            "cost_micro_usd": 123_456,
-        }),
-    );
+    let mut event = serde_json::json!({
+        "schema_version": 1,
+        "seq": 0,
+        "at_ms": events[at]["at_ms"],
+        "run_id": run_id,
+        "node_id": "build",
+        "attempt_id": events[at]["attempt_id"],
+        "actor": { "kind": "agent", "id": "builder" },
+        "kind": "attempt_reported",
+    });
+    for (k, v) in body.as_object().expect("object body") {
+        event[k] = v.clone();
+    }
+    events.insert(at + 1, event);
     let mut out = String::new();
     for (seq, mut event) in events.into_iter().enumerate() {
         event["seq"] = seq.into();
@@ -472,6 +519,43 @@ fn inject_usage(dir: &Path, run_id: &str) {
         out.push('\n');
     }
     std::fs::write(&path, out).expect("rewrite journal");
+}
+
+/// A run mixing an agent that prices its work with one that does not must say so.
+/// Presenting half the spend as "the total" is the number an operator uses to
+/// decide whether a loop was worth it.
+#[test]
+fn status_marks_a_partly_priced_total_as_a_lower_bound() {
+    let dir = project();
+    let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
+    inject_usage_unpriced(dir.path(), &run_id);
+
+    let out = hex(dir.path(), &["status", &run_id]);
+    let s = stdout(&out);
+    assert!(s.contains("lower bound"), "the caveat is stated: {s}");
+    assert!(
+        s.contains('\u{2265}'),
+        "the total is marked as a bound: {s}"
+    );
+
+    let json = hex(dir.path(), &["status", &run_id, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(stdout(&json).trim()).expect("json");
+    assert_eq!(v["usage"]["total"]["cost_is_partial"], true);
+    assert_eq!(v["usage"]["total"]["unpriced_reports"], 1);
+}
+
+/// `--follow` streams human text, so pairing it with `--json` would emit neither
+/// one thing nor the other. Rejected at parse time rather than silently ignored.
+#[test]
+fn follow_and_json_are_rejected_rather_than_silently_ignored() {
+    let dir = project();
+    let out = hex(dir.path(), &["logs", "whatever", "--follow", "--json"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("cannot be used with"),
+        "clap explains the conflict: {}",
+        stderr(&out)
+    );
 }
 
 /// `hex init` is the first command run in a new repo, so it must be safe to run

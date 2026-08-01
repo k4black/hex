@@ -83,7 +83,7 @@ pub enum WorkerKind {
 /// One role: the job a graph names, bound to a worker.
 ///
 /// Every field is optional so a higher layer can override one of them and
-/// inherit the rest — see [`RoleSpec::merge`].
+/// inherit the rest — see this type's private `merge`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoleSpec {
