@@ -21,12 +21,12 @@ use hex_runtime::{
 #[macro_use]
 mod out;
 mod agent_stream;
-mod glyphs;
 mod graph_export;
 mod graph_view;
 mod preview;
 #[cfg(test)]
 mod test_support;
+mod ui;
 
 /// Worked examples, shown under `hex --help`.
 const EXAMPLES: &str = "\
@@ -70,6 +70,10 @@ struct Cli {
     /// Disable the live in-flight preview pane (plain line streaming instead)
     #[arg(long, global = true)]
     no_preview: bool,
+
+    /// When to colour output
+    #[arg(long, global = true, value_name = "WHEN", default_value = "auto")]
+    color: ui::When,
 }
 
 /// The operator/worker verbs. Names are stable public surface.
@@ -254,9 +258,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
     match command {
         Command::Init => cmd_init(json),
         Command::List => cmd_list(json),
-        Command::Doctor => cmd_doctor(json),
+        Command::Doctor => cmd_doctor(json, cli.color, ui::Ui::stdout(cli.color, json)),
         Command::Validate { graph } => cmd_validate(&graph, json),
-        Command::Graph { graph, format } => cmd_graph(&graph, format, json),
+        Command::Graph { graph, format } => {
+            cmd_graph(&graph, format, json, ui::Ui::stdout(cli.color, json))
+        }
         Command::Run {
             graph,
             prompt,
@@ -280,7 +286,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             no_preview,
         ),
         Command::Resume { run_id } => cmd_resume(&run_id, json, no_preview),
-        Command::Runs => cmd_runs(json),
+        Command::Runs => cmd_runs(json, ui::Ui::stdout(cli.color, json)),
         Command::Status { run_id } => cmd_status(&run_id, json),
         Command::Watch { run_id, follow } => cmd_watch(&run_id, follow, json),
         Command::Logs {
@@ -546,7 +552,7 @@ fn print_graph_list(runtime: &Runtime, json: bool) {
 
 /// Report whether every configured worker and check can actually run. Exit 1 if
 /// anything is broken, so CI (or a driving agent) can gate on it.
-fn cmd_doctor(json: bool) -> Result<ExitCode, String> {
+fn cmd_doctor(json: bool, color: ui::When, ui: ui::Ui) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     let report = runtime.doctor();
     if json {
@@ -568,18 +574,31 @@ fn cmd_doctor(json: bool) -> Result<ExitCode, String> {
     } else if report.findings.is_empty() {
         outln!("no workers or checks configured");
     } else {
+        // The remediation text does not go in a cell: one 200-character
+        // explanation set the DETAIL column width for all eleven rows and wrapped
+        // three times on an 80-column terminal. Failures repeat it below, wrapped.
+        let mut table = ui::Table::new(&["", "KIND", "NAME", "DETAIL"], &[false; 4]).flex(3);
         for f in &report.findings {
-            let mark = if f.ok { "ok     " } else { "MISSING" };
-            outln!("  {mark} {:<7} {:<12} {}", f.kind, f.name, f.detail);
+            table.row(vec![
+                ui.mark(if f.ok { ui::Mark::Ok } else { ui::Mark::Fail }),
+                ui.paint(ui::style::DIM, f.kind).to_string(),
+                ui.paint(ui::style::ID, &f.name).to_string(),
+                ui.paint(ui::style::DIM, first_line(&f.detail)).to_string(),
+            ]);
         }
-        if report.ok() {
-            outln!("\nall good");
-        } else {
+        for line in table.render(ui) {
+            outln!("{line}");
+        }
+        if !report.ok() {
+            let err = ui::Ui::stderr(color, json);
             eprintln!(
-                "\n{} unusable: {}\ninstall the missing tools, or fix `.hex/config.yaml`",
+                "\nhex: {} of {} unusable.",
                 report.broken().len(),
-                report.broken().join(", ")
+                report.findings.len()
             );
+            for f in report.findings.iter().filter(|f| !f.ok) {
+                eprintln!("\n  {}  {}", err.paint(ui::style::ID, &f.name), f.detail);
+            }
         }
     }
     Ok(if report.ok() {
@@ -618,7 +637,12 @@ fn cmd_validate(reference: &str, json: bool) -> Result<ExitCode, String> {
     }
 }
 
-fn cmd_graph(reference: &str, format: GraphFormat, json: bool) -> Result<ExitCode, String> {
+fn cmd_graph(
+    reference: &str,
+    format: GraphFormat,
+    json: bool,
+    ui: ui::Ui,
+) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     // Source is the one format that must work on a graph that does not compile:
     // you reach for it precisely to fix one.
@@ -642,10 +666,28 @@ fn cmd_graph(reference: &str, format: GraphFormat, json: bool) -> Result<ExitCod
         // Handled above, before compilation.
         GraphFormat::Source => unreachable!("source returns before the graph is compiled"),
         GraphFormat::Text => {
-            let glyphs = crate::glyphs::Charset::resolve(None).glyphs();
+            let glyphs = ui.glyphs();
+            // Which layer this resolved from, and its one-line description —
+            // "which of the three graphs named this am I looking at" is a
+            // question the reference alone cannot answer.
+            let entry = runtime
+                .list_graphs()
+                .into_iter()
+                .find(|e| e.name == reference);
+            let origin = entry
+                .as_ref()
+                .map_or_else(|| reference.to_owned(), |e| e.origin.clone());
+            let description = entry.as_ref().and_then(|e| e.description.clone());
             out!(
                 "{}",
-                graph_view::render(&graph, reference, None, &runtime.worker_bindings(), &glyphs)
+                graph_view::render(
+                    &graph,
+                    &origin,
+                    description.as_deref(),
+                    &runtime.worker_bindings(),
+                    &glyphs,
+                    ui
+                )
             );
         }
     }
@@ -930,7 +972,7 @@ impl Payoff {
     }
 }
 
-fn cmd_runs(json: bool) -> Result<ExitCode, String> {
+fn cmd_runs(json: bool, ui: ui::Ui) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     let runs = runtime.list_runs().map_err(|e| e.to_string())?;
     if json {
@@ -957,51 +999,39 @@ fn cmd_runs(json: bool) -> Result<ExitCode, String> {
         outln!("no runs yet (start one with `hex run <graph> -p \"…\"`)");
         return Ok(ExitCode::SUCCESS);
     }
-    // Widths from the data, not constants: `finished:budget_exhausted` is 25
-    // characters and a legacy `run_1784…` id is 46, so fixed columns ran the
-    // fields together in exactly the listing a new user sees first.
-    let rows: Vec<[String; 5]> = runs
-        .iter()
-        .map(|r| {
-            [
-                r.run_id.clone(),
-                r.status
-                    .as_ref()
-                    .map_or("unreadable".to_owned(), ToString::to_string),
-                age(r.updated_at_ms),
-                r.current.clone().unwrap_or_else(|| "-".to_owned()),
-                r.liveness.to_string(),
-            ]
-        })
-        .collect();
-    let headers = ["RUN", "STATE", "AGE", "NODE", "PROCESS"];
-    // The last column is never padded, so it needs no width.
-    let widths: Vec<usize> = (0..4)
-        .map(|c| {
-            rows.iter()
-                .map(|r| r[c].chars().count())
-                .chain(std::iter::once(headers[c].len()))
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-    let line = |cells: &[String; 5]| {
-        let mut out = String::new();
-        for (c, cell) in cells.iter().enumerate() {
-            if c == cells.len() - 1 {
-                out.push_str(cell);
-            } else {
-                out.push_str(&format!("{cell:<width$} ", width = widths[c]));
-            }
-        }
-        out
-    };
-    outln!("{}", line(&headers.map(ToOwned::to_owned)));
-    for (r, cells) in runs.iter().zip(&rows) {
-        outln!("{}", line(cells));
-        if let Some(err) = &r.error {
-            eprintln!("  {}: {err}", r.run_id);
-        }
+    // One table, one width policy, one place that knows how a state looks.
+    let mut table = ui::Table::new(
+        &["", "RUN", "STATE", "AGE", "NODE", "PROCESS"],
+        &[false, false, false, true, false, false],
+    )
+    .flex(1);
+    for r in &runs {
+        let state = r
+            .status
+            .as_ref()
+            .map_or("unreadable".to_owned(), ToString::to_string);
+        table.row(vec![
+            ui.mark(mark_for(r)),
+            ui.paint(ui::style::ID, &r.run_id).to_string(),
+            ui.paint(state_style(&state), &state).to_string(),
+            ui.paint(ui::style::DIM, &age(r.updated_at_ms)).to_string(),
+            r.current.clone().unwrap_or_else(|| "-".to_owned()),
+            ui.paint(ui::style::DIM, &r.liveness.to_string())
+                .to_string(),
+        ]);
+    }
+    for line in table.render(ui) {
+        outln!("{line}");
+    }
+    // Buffered to one line: four 130-character yaml errors interleaved with the
+    // table on a terminal and vanished entirely when it was redirected.
+    let broken: Vec<&hex_runtime::RunSummary> = runs.iter().filter(|r| r.error.is_some()).collect();
+    if !broken.is_empty() {
+        eprintln!(
+            "hex: {} run(s) could not be replayed (a graph from an older schema); \
+             `hex status <run>` prints why",
+            broken.len()
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1010,6 +1040,43 @@ fn cmd_runs(json: bool) -> Result<ExitCode, String> {
 /// a few ms, and a negative "elapsed" is worse than a zero one.
 fn elapsed_ms(at_ms: u64) -> u64 {
     hex_runtime::journal::now_ms().saturating_sub(at_ms)
+}
+
+/// The first line of a detail string — the rest is remediation prose that
+/// belongs under the table, not inside a column.
+fn first_line(s: &str) -> &str {
+    s.split(" — ")
+        .next()
+        .unwrap_or(s)
+        .lines()
+        .next()
+        .unwrap_or(s)
+}
+
+/// The glyph for a run's state — the column you scan before reading anything.
+fn mark_for(r: &hex_runtime::RunSummary) -> ui::Mark {
+    use hex_runtime::{Disposition as D, Status};
+    match (&r.status, r.disposition) {
+        (None, _) => ui::Mark::Warn,
+        (_, Some(D::Succeeded)) => ui::Mark::Ok,
+        (_, Some(D::Failed)) => ui::Mark::Fail,
+        (_, Some(D::TimedOut | D::BudgetExhausted)) => ui::Mark::Warn,
+        (_, Some(D::Cancelled)) => ui::Mark::Idle,
+        (Some(Status::Running), None) => ui::Mark::Running,
+        _ => ui::Mark::Idle,
+    }
+}
+
+/// Colour a state word by what it means, so a red row is findable at a glance.
+fn state_style(state: &str) -> anstyle::Style {
+    match state {
+        s if s.ends_with("succeeded") => ui::style::OK,
+        s if s.ends_with("failed") => ui::style::FAIL,
+        s if s.ends_with("timed_out") || s.ends_with("budget_exhausted") => ui::style::WARN,
+        "unreadable" => ui::style::WARN,
+        "running" => ui::style::RUN,
+        _ => ui::style::DIM,
+    }
 }
 
 /// A compact "how long ago" for a listing (`3m`, `2h`, `4d`).

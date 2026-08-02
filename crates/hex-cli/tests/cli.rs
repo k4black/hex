@@ -149,13 +149,21 @@ fn no_args_prints_help_to_stderr_and_exits_2() {
     let err = stderr(&out);
     assert!(err.contains("Usage: hex"), "clap usage on stderr: {err}");
     assert!(err.contains("Commands:"), "command list shown: {err}");
-    // And it must match `hex --help` (which clap prints to stdout, exit 0).
-    let help = hex(dir.path(), &["--help"]);
-    assert!(help.status.success());
+    // Bare `hex` prints the *short* help, so it must match `-h`, not `--help`:
+    // `--help` is clap's long form and expands per-variant documentation that
+    // the summary deliberately omits.
+    let short = hex(dir.path(), &["-h"]);
+    assert!(short.status.success());
     assert_eq!(
         err,
-        stdout(&help),
-        "bare-hex and --help must be identical text"
+        stdout(&short),
+        "bare hex and -h must be identical text"
+    );
+    let long = hex(dir.path(), &["--help"]);
+    assert!(long.status.success());
+    assert!(
+        stdout(&long).contains("Colour when the stream is a terminal"),
+        "--help expands what -h summarises"
     );
 }
 

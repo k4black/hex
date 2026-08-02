@@ -616,12 +616,16 @@ dependencies = [
 name = "hex-cli"
 version = "0.0.0"
 dependencies = [
+ "anstyle",
+ "anstyle-query",
  "assert_cmd",
  "clap",
+ "crossterm",
  "hex-runtime",
  "ratatui",
  "serde_json",
  "tempfile",
+ "unicode-width",
 ]
 
 [[package]]
