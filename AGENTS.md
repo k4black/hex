@@ -370,7 +370,13 @@ sign-off, confirmation.
    mutex, which makes them green **but stops the concurrent path being exercised
    at all** — treat "parallel runs grow the pool" as untested. Diagnose (thread id
    + realpath + inode at each lock attempt) before trusting it; do not add another
-   mutex. Original detail:
+   mutex. **There is now a reproducer in the suite**: under full-workspace
+   parallel load, `cancel_of_an_idle_run_is_recorded_directly` fails roughly
+   1-in-4 at the `Cancellation::Recorded` assertion — `cancel` took the
+   `WouldBlock` path and queued the command instead of appending the terminal.
+   Verified 2026-08-02 to reproduce identically at `adc173f`, so it is not new;
+   `cargo test -p hex-runtime --test control` alone always passes, which is why
+   it hid for so long. Original detail:
    serialized runs pass 8/8, parallel ones failed ~1-in-3, even across separate
    repos with distinct lock inodes. The safety invariant (no two live leases share
    a slot) holds regardless, so the cost is a needless extra slot, not corruption.
