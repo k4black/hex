@@ -26,7 +26,7 @@ pub mod worktree;
 
 pub use control::{Inbox, Liveness};
 pub use doctor::Report as DoctorReport;
-pub use driver::{AttemptView, ProgressSink};
+pub use driver::{AttemptView, NodeProgress, NodeState, ProgressSink};
 pub use error::{HexError, Result};
 pub use hex_kernel::graph::NodeKind;
 pub use hex_kernel::graph::{Budget, Context, Node, NodeSpec};

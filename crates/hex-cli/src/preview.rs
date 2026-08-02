@@ -26,10 +26,11 @@ use hex_runtime::{AttemptView, Event, NodeKind, ProgressSink};
 use ratatui::Frame;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Position;
-use ratatui::style::Stylize;
-use ratatui::text::Line;
+use ratatui::style::{Style, Stylize};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
+use unicode_width::UnicodeWidthStr;
 
 /// Lines of agent output shown in the pane.
 const TAIL_LINES: usize = 8;
@@ -144,6 +145,7 @@ impl Drop for LivePreview {
 /// across the thread boundary. Elapsed time is measured monotonically from the
 /// thread's own start rather than the view's wall-clock stamp.
 struct OwnedView {
+    progress: Vec<hex_runtime::NodeProgress>,
     node_id: String,
     kind: NodeKind,
     worker: Option<String>,
@@ -157,6 +159,7 @@ struct OwnedView {
 impl From<&AttemptView> for OwnedView {
     fn from(v: &AttemptView) -> Self {
         Self {
+            progress: v.progress.clone(),
             node_id: v.node_id.clone(),
             kind: v.kind,
             worker: v.worker.clone(),
@@ -285,8 +288,11 @@ fn render_footer(
     elapsed: Duration,
     ticks: usize,
 ) {
+    // The graph strip rides the bottom border: it is persistent context, so it
+    // must not eat a line of the tail, which is the part that changes.
     let block = Block::bordered()
         .title(status_line(view, elapsed, ticks))
+        .title_bottom(progress_line(view, frame.area().width))
         .dim();
     let inner = block.inner(frame.area());
     frame.render_widget(&block, frame.area());
@@ -326,6 +332,91 @@ fn status_line(view: &OwnedView, elapsed: Duration, ticks: usize) -> String {
     }
     s.push(' ');
     s
+}
+
+/// The graph as one line, with each node marked by where it stands.
+///
+/// `attempt 7 on implement` cannot tell you whether a loop is advancing or
+/// circling; the shape can. A visited node carries its round count, because
+/// that is the number a bound is about to stop — and because the count is what
+/// separates *visited* from *pending* in text, so the distinction survives a
+/// terminal that renders no dim.
+///
+/// No colour and no `✓`: a node the run has been through is not a node that
+/// succeeded (the strip above is drawn while a failing gate loops), so the only
+/// hierarchy here is weight — bold for where the run is, dim for where it has
+/// not been.
+fn progress_line(view: &OwnedView, width: u16) -> Line<'static> {
+    use hex_runtime::NodeState;
+    let cells: Vec<(String, Style)> = view
+        .progress
+        .iter()
+        .map(|n| {
+            let (prefix, style) = match n.state {
+                NodeState::Active => ("▸ ", Style::new().bold().not_dim()),
+                NodeState::Visited => ("", Style::new().not_dim()),
+                NodeState::Pending => ("", Style::new()),
+            };
+            let count = if n.state == NodeState::Pending {
+                String::new()
+            } else {
+                format!(" ×{}", n.visits)
+            };
+            (format!("{prefix}{}{count}", n.id), style)
+        })
+        .collect();
+
+    // Two border corners plus a space of padding at each end.
+    let budget = usize::from(width).saturating_sub(4);
+    let (from, elided) = fits_from(&cells, active_index(&view.progress), budget);
+
+    let mut spans = vec![Span::raw(" ")];
+    if elided {
+        spans.push(Span::styled("… ", Style::new()));
+    }
+    for (i, (text, style)) in cells.iter().enumerate().skip(from) {
+        if i > from {
+            spans.push(Span::raw(" · "));
+        }
+        spans.push(Span::styled(text.clone(), *style));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+/// Index of the node the run is on, or 0 when none is (every node pending).
+fn active_index(progress: &[hex_runtime::NodeProgress]) -> usize {
+    progress
+        .iter()
+        .position(|n| n.state == hex_runtime::NodeState::Active)
+        .unwrap_or(0)
+}
+
+/// The earliest node the strip can start at and still show `active` within
+/// `budget` cells, plus whether anything was dropped off the front.
+///
+/// Nodes are dropped from the *front* because the strip's job is where the run
+/// is and what is left; a graph long enough to overflow has already-visited
+/// history that the journal keeps anyway.
+fn fits_from(cells: &[(String, Style)], active: usize, budget: usize) -> (usize, bool) {
+    let sep = 3; // " · "
+    let width = |s: &str| UnicodeWidthStr::width(s);
+    let total: usize =
+        cells.iter().map(|(t, _)| width(t)).sum::<usize>() + sep * cells.len().saturating_sub(1);
+    if total <= budget {
+        return (0, false);
+    }
+    // Walk the start forward until the remainder fits; "… " costs 2.
+    for from in 1..cells.len() {
+        let kept = &cells[from..];
+        let w: usize = kept.iter().map(|(t, _)| width(t)).sum::<usize>()
+            + sep * kept.len().saturating_sub(1)
+            + 2;
+        if w <= budget && from <= active {
+            return (from, true);
+        }
+    }
+    (active, true)
 }
 
 /// Format a duration as `M:SS` (minutes may exceed 59).
@@ -478,6 +569,7 @@ mod tests {
 
     fn view(worker: Option<&str>, kind: NodeKind, deadline_ms: Option<u64>) -> OwnedView {
         OwnedView {
+            progress: Vec::new(),
             node_id: "build".to_owned(),
             kind,
             worker: worker.map(str::to_owned),
@@ -495,6 +587,73 @@ mod tests {
         assert_eq!(fmt_mmss(Duration::from_secs(47)), "0:47");
         assert_eq!(fmt_mmss(Duration::from_secs(90)), "1:30");
         assert_eq!(fmt_mmss(Duration::from_secs(3600)), "60:00");
+    }
+
+    fn progress(nodes: &[(&str, hex_runtime::NodeState, u32)]) -> OwnedView {
+        let mut v = view(Some("codex"), NodeKind::Agent, None);
+        v.progress = nodes
+            .iter()
+            .map(|(id, state, visits)| hex_runtime::NodeProgress {
+                id: (*id).to_owned(),
+                state: *state,
+                visits: *visits,
+            })
+            .collect();
+        v
+    }
+
+    /// The whole point: whether the loop is advancing or circling, at a glance.
+    /// The strip's text with styling dropped, for assertions.
+    fn flat(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn the_strip_marks_where_every_node_stands() {
+        use hex_runtime::NodeState::{Active, Pending, Visited};
+        let line = progress_line(
+            &progress(&[
+                ("implement", Visited, 3),
+                ("review", Active, 2),
+                ("done", Pending, 0),
+            ]),
+            80,
+        );
+        assert_eq!(flat(&line), " implement ×3 · ▸ review ×2 · done ");
+    }
+
+    /// A visited node must not wear a `✓`: the strip is drawn while a failing
+    /// gate loops, and a tick there reads as a verdict the run never reached.
+    #[test]
+    fn a_visited_node_is_not_marked_as_passed() {
+        use hex_runtime::NodeState::Visited;
+        let line = progress_line(&progress(&[("check", Visited, 1)]), 80);
+        assert!(!flat(&line).contains('✓'), "got: {}", flat(&line));
+        // ×1 is what separates visited from pending without relying on dim.
+        assert_eq!(flat(&line), " check ×1 ");
+    }
+
+    /// The strip must never outgrow the border it rides on, and must keep the
+    /// active node visible when it drops nodes to fit.
+    #[test]
+    fn a_long_strip_elides_from_the_front_and_keeps_the_active_node() {
+        use hex_runtime::NodeState::{Active, Pending, Visited};
+        let line = progress_line(
+            &progress(&[
+                ("gather-requirements", Visited, 1),
+                ("draft-the-plan", Visited, 1),
+                ("implement", Active, 2),
+                ("verify", Pending, 0),
+            ]),
+            40,
+        );
+        let flat = flat(&line);
+        assert!(flat.starts_with(" … "), "elision marker: {flat}");
+        assert!(flat.contains("▸ implement ×2"), "active kept: {flat}");
+        assert!(
+            UnicodeWidthStr::width(flat.as_str()) <= 40 - 2,
+            "fits inside the border: {flat}"
+        );
     }
 
     #[test]

@@ -908,6 +908,14 @@ Phase-2 kernel; none change kernel semantics.
       `attempt_finished` + `AttemptView`); the CLI renders on a background
       thread — the worker/kernel are untouched. TTY-only; `--no-preview`/
       `--json`/non-TTY fall back to plain line streaming.
+- [x] Graph progress strip in the live preview (shipped 2026-08-02): the bottom
+      border carries the whole graph in `Topology` order — `▸` on the active
+      node, `×N` on every node entered, dim for the not-yet-reached — so the
+      footer answers *is this loop advancing or circling* without a second
+      command. `Session::progress()` builds it from `state.visits`; it rides the
+      border (costs no tail line) and elides from the front to fit, keeping the
+      active node. Deliberately colourless and tick-free: the strip is drawn
+      while a failing gate loops, so a `✓` there would read as a verdict.
 - [ ] **Structured tool-call feed** in the preview (and richer `hex logs`):
       parse each agent's line-delimited-JSON stream into a normalized
       `ToolCallEvent {kind, target, status, exit_code?}` and render the last N

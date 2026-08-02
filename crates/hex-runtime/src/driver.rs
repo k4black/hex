@@ -50,6 +50,36 @@ pub struct AttemptView {
     pub stdout_log: PathBuf,
     /// The file the attempt's stderr streams to, live.
     pub stderr_log: PathBuf,
+    /// Every node in the graph's reading order, with where it stands.
+    ///
+    /// A loop is hard to follow from one line of text: "attempt 7 on implement"
+    /// says nothing about whether the run is circling or advancing. The whole
+    /// shape, marked, answers that at a glance.
+    pub progress: Vec<NodeProgress>,
+}
+
+/// Where one node stands in a run, for a progress strip.
+///
+/// The runtime decides *which* node is where; the client decides how that looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeState {
+    /// Entered at least once and not currently running.
+    Visited,
+    /// The attempt about to run.
+    Active,
+    /// Not reached yet.
+    Pending,
+}
+
+/// One node's standing, in the graph's reading order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeProgress {
+    /// Node id.
+    pub id: String,
+    /// Where it stands.
+    pub state: NodeState,
+    /// How many times it has been entered — a loop's round counter.
+    pub visits: u32,
 }
 
 /// A live-progress consumer. The runtime calls these around each attempt; the
@@ -822,7 +852,28 @@ impl<'a> Session<'a> {
             started_at_ms: now_ms(),
             stdout_log: attempt_dir.join("stdout.log"),
             stderr_log: attempt_dir.join("stderr.log"),
+            progress: self.progress(node_id),
         }
+    }
+
+    /// The whole graph's standing, in the same reading order `hex graph` uses —
+    /// so the live strip and the static rendering cannot disagree about shape.
+    fn progress(&self, active: &str) -> Vec<NodeProgress> {
+        hex_kernel::Topology::of(self.graph)
+            .order
+            .into_iter()
+            .map(|id| {
+                let visits = self.state.visits.get(&id).copied().unwrap_or(0);
+                let state = if id == active {
+                    NodeState::Active
+                } else if visits > 0 {
+                    NodeState::Visited
+                } else {
+                    NodeState::Pending
+                };
+                NodeProgress { id, state, visits }
+            })
+            .collect()
     }
 }
 

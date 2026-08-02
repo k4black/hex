@@ -505,9 +505,23 @@ from *hung* from *crashed* — and a crashed run is continued with `hex resume`,
 which marks the orphaned attempt `interrupted` rather than silently rerunning it.
 
 On an interactive terminal, `hex run`/`hex resume` show a **live preview**: a
-sticky footer that tails the in-flight attempt's output with a status line
-(node · worker · attempt N/budget · elapsed · deadline). It auto-disables for a
-non-TTY, `--json`, or `--no-preview`, falling back to plain event-line streaming.
+sticky footer that tails the in-flight attempt's output, with a status line on
+the top border and the graph on the bottom one:
+
+```text
+┌ build · stepper · attempt 3/5 · ⠴ 0:05 · 0:54 left ──────────┐
+│working 1                                                     │
+│working 2                                                     │
+│                                                              │
+└ ▸ build ×2 · check ×1 · ok ──────────────────────────────────┘
+```
+
+`▸` is where the run is; `×N` is how many times a node has been entered (so a
+loop that is circling looks different from one that is advancing); a node with
+no count has not been reached. The strip rides the border rather than taking a
+line, and elides from the front on a narrow terminal, keeping the active node.
+The preview auto-disables for a non-TTY, `--json`, or `--no-preview`, falling
+back to plain event-line streaming.
 
 ### Checking in on a live run, and steering it
 
