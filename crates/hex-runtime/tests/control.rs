@@ -504,6 +504,78 @@ fn a_respond_with_no_human_waiting_is_journaled_as_ignored() {
     );
 }
 
+/// Ctrl-C kills `hex` but not the attempt it was waiting on, so the journal is
+/// left ending on `AttemptStarted`. `cancel` is the documented cleanup, and it
+/// used to append `RunFinished` straight onto the open attempt — which
+/// `lifecycle` rejects, making the run permanently *unreadable* (`hex status`
+/// failed with `E-journal-lifecycle`) instead of cancelled.
+#[test]
+fn cancelling_a_crashed_run_closes_its_orphaned_attempt() {
+    let root = temp_root("crashed-cancel");
+    write_graph(&root, "cl", LOOP_GRAPH);
+    let runtime = Runtime::with_workers(
+        root.clone(),
+        Config::builtin(),
+        workers(&[
+            (
+                "implementer",
+                format!(
+                    "{}printf ready > \"$HEX_EMIT_FILE\"",
+                    queue(&format!("{{{FROM_OPERATOR},\"command\":\"pause\"}}"))
+                ),
+            ),
+            (
+                "reviewer",
+                "printf approved > \"$HEX_EMIT_FILE\"".to_owned(),
+            ),
+        ]),
+    );
+    let report = runtime
+        .start("cl", None, None, &Isolation::Shared)
+        .expect("run");
+
+    // Simulate the crash: an attempt opens and nothing ever terminates it,
+    // exactly the journal a Ctrl-C'd run is left with.
+    let run_dir = only_run_dir(&root);
+    let (mut journal, _) =
+        hex_runtime::journal::Journal::open_append(run_dir.join("events.jsonl")).expect("open");
+    // Lift the pause the way `resume` does, then open an attempt on the node
+    // the run is sitting at and stop writing.
+    journal
+        .append(
+            &report.run_id,
+            None,
+            None,
+            Actor::runtime(),
+            EventBody::RunResumed,
+        )
+        .expect("resume");
+    journal
+        .append(
+            &report.run_id,
+            Some("review"),
+            Some("orphan-1"),
+            Actor::runtime(),
+            EventBody::AttemptStarted {
+                idempotency_key: "orphan-1".to_owned(),
+                worker: Some("reviewer".to_owned()),
+            },
+        )
+        .expect("append");
+    drop(journal);
+
+    let outcome = runtime
+        .cancel(&report.run_id, &Actor::human("t"))
+        .expect("cancel");
+    assert_eq!(outcome, hex_runtime::Cancellation::Recorded);
+
+    // The whole point: the run is still readable, and it reads as cancelled.
+    let status = runtime
+        .status(&report.run_id)
+        .expect("status stays readable");
+    assert_eq!(status.disposition, Some(Disposition::Cancelled));
+}
+
 /// `hex cancel` on a run nobody is driving still appends the terminal itself,
 /// and reports which path it took.
 #[test]

@@ -1012,6 +1012,20 @@ impl Runtime {
         if state.is_finished() {
             return Ok(Cancellation::Recorded);
         }
+        // Cancelling a *dead* run (Ctrl-C, crash) reaches here with an attempt
+        // still open, and `RunFinished` on top of one is rejected by
+        // `lifecycle` — which left the journal permanently unreadable, on the
+        // very path an operator takes to clean up after Ctrl-C. Close the
+        // orphan first, exactly as `resume` does.
+        if state.awaiting() {
+            journal.append(
+                run_id,
+                state.current.as_deref(),
+                state.current_attempt.as_deref(),
+                actor.clone(),
+                EventBody::AttemptInterrupted,
+            )?;
+        }
         journal.append(
             run_id,
             None,

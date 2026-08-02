@@ -342,6 +342,23 @@ Phase (b) of the agreed sequence, implemented as specified.
 - [x] Comment trims where the prose dwarfed the code — including my own
       17-line-comment/4-line-function `pool_shape_gate`.
 
+### OPEN BUG — Ctrl-C orphans the agent
+
+- [ ] **`hex run` + Ctrl-C leaves the agent running.** Verified under a pty
+      (2026-08-02). `process_group(0)` (needed so a timeout kills the whole tree)
+      also takes the agent out of the terminal's foreground process group, so the
+      tty's SIGINT reaches only `hex`; there is no SIGINT handler. The agent keeps
+      spending tokens and writing the workspace, the run reads `abandoned`, and
+      `hex resume` then starts a *second* agent alongside the live orphan.
+      `hex cancel` cannot stop an in-flight attempt either (inbox drains at
+      attempt boundaries). Fix: install a handler (`signal_hook` or a
+      `ctrlc`-style one) that kills the current attempt's process group and
+      records `AttemptInterrupted` + a terminal — i.e. Ctrl-C should mean
+      `cancel`, synchronously. Second press should hard-kill.
+      Partly mitigated 2026-08-02: `Runtime::cancel` now closes an orphaned
+      attempt before appending `RunFinished`, so cleaning up after Ctrl-C no
+      longer corrupts the journal into `unreadable`.
+
 ### OPEN BUGS — found by review round 3, introduced by round 2's cycle fix
 
 Both are unbounded-loop holes in the `accept.on_unmet` cycle validation added on
