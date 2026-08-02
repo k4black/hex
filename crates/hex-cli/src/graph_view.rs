@@ -37,8 +37,12 @@ pub fn render(
     out
 }
 
-/// Name, origin, entry, budget and the acceptance contract — `kubectl describe`
-/// shape: a fixed key column, one fact per line, no box.
+/// Identity, limits and the acceptance contract.
+///
+/// No `Entry` field: the `▶` in the flow already says which node starts. Labels
+/// are **bold, never dim** — dim reads as "you may skip this", and a label is a
+/// signpost. Dim is reserved for text whose deletion would not change a
+/// decision: provenance, descriptions, commentary.
 fn header(
     out: &mut String,
     graph: &Graph,
@@ -47,54 +51,45 @@ fn header(
     g: &Glyphs,
     ui: Ui,
 ) {
-    let key = |k: &str| ui.field(style::DIM, k, 10);
     out.push_str(&format!(
-        "{}{:<48} {}\n",
-        key("Graph"),
-        ui.paint(style::ID, &graph.name).to_string(),
+        "{}   {}\n",
+        ui.paint(style::ID, &graph.name),
         ui.paint(style::DIM, origin)
     ));
     if let Some(d) = description {
-        out.push_str(&format!("{:<10}{}\n", "", ui.paint(style::DIM, d)));
+        out.push_str(&format!("{}\n", ui.paint(style::DIM, d)));
     }
     out.push_str(&format!(
-        "{}{}\n",
-        key("Entry"),
-        ui.paint(style::ID, &graph.entry)
-    ));
-    out.push_str(&format!(
-        "{:<10}{}\n",
-        "Budget",
+        "\n{}{}\n",
+        ui.field(style::HEADER, "Limits", 9),
         budget_line(&graph.budget, g)
     ));
-
-    if !graph.accept.require.is_empty() || graph.accept.on_unmet.is_some() {
-        let mut first = true;
-        for req in &graph.accept.require {
-            let k = if first { "Accept" } else { "" };
-            let label = if first { "require" } else { "" };
-            out.push_str(&format!(
-                "{}{}{}.{}\n",
-                key(k),
-                ui.field(style::DIM, label, 10),
-                req.node,
-                ui.paint(style::SIGNAL, &req.signal)
-            ));
-            first = false;
-        }
-        if let Some(to) = &graph.accept.on_unmet {
-            let k = if first { "Accept" } else { "" };
-            out.push_str(&format!(
-                "{}{}{to}   {}\n",
-                key(k),
-                ui.field(style::DIM, "on_unmet", 10),
-                ui.paint(
-                    style::DIM,
-                    "a success terminal missing evidence reroutes here"
-                )
-            ));
-        }
+    if let Some(contract) = accept_line(graph, g, ui) {
+        out.push_str(&format!(
+            "{}{contract}\n",
+            ui.field(style::HEADER, "Accept", 9)
+        ));
     }
+}
+
+/// The acceptance contract on one line: the evidence, then the fallback.
+///
+/// `require:`/`on_unmet:` were YAML keys leaking into a human view, with a
+/// sentence of prose explaining what an arrow says on its own.
+fn accept_line(graph: &Graph, g: &Glyphs, ui: Ui) -> Option<String> {
+    if graph.accept.require.is_empty() && graph.accept.on_unmet.is_none() {
+        return None;
+    }
+    let mut parts: Vec<String> = graph
+        .accept
+        .require
+        .iter()
+        .map(|r| format!("{}.{}", r.node, ui.paint(style::SIGNAL, &r.signal)))
+        .collect();
+    if let Some(to) = &graph.accept.on_unmet {
+        parts.push(format!("otherwise {} {to}", g.binds));
+    }
+    Some(parts.join(&format!(" {} ", g.sep)))
 }
 
 fn budget_line(budget: &Budget, g: &Glyphs) -> String {
@@ -157,7 +152,17 @@ fn flow(
             ui.paint(style::DIM, gutter),
             badge_painted(graph, id, g, ui),
             ui.field(style::ID, id, 12),
-            ui.paint(style::DIM, &policy(graph, node, bindings, g))
+            // The policy is dim (deletable context); a visit bound is not — it is
+            // the thing that stops this node looping forever.
+            match node.max_visits {
+                Some(v) => format!(
+                    "{}   max {v} visits",
+                    ui.paint(style::DIM, &policy(graph, node, bindings, g))
+                ),
+                None => ui
+                    .paint(style::DIM, &policy(graph, node, bindings, g))
+                    .to_string(),
+            }
         ));
         // Continuation rows keep the gutter only while more nodes follow *and*
         // this one is on the rail; a detached sink's details hang free.
@@ -298,9 +303,6 @@ fn policy(
             parts.push(disposition.as_str().to_owned());
         }
     }
-    if let Some(v) = node.max_visits {
-        parts.push(format!("visits {} {v}", g.le));
-    }
     parts.join(&format!(" {} ", g.sep))
 }
 
@@ -322,8 +324,8 @@ fn steps(node: &hex_runtime::Node) -> Vec<String> {
 /// One outgoing transition, with its signal and — for a loop — its bound.
 fn transition(t: &Transition, topo: &Topology, g: &Glyphs, ui: Ui) -> String {
     let (arrow, note, arrow_style) = match (t.class, t.is_reroute()) {
-        (EdgeClass::Back, true) => (g.reroute, "   accept.on_unmet".to_owned(), style::LOOP),
-        (EdgeClass::Back, false) => (g.back, cycle_note(topo, t, g), style::LOOP),
+        (EdgeClass::Back, true) => (g.reroute, "   accept fallback".to_owned(), style::LOOP),
+        (EdgeClass::Back, false) => (g.back, cycle_note(topo, t), style::LOOP),
         (EdgeClass::Forward, _) => (g.forward, String::new(), style::DIM),
     };
     let signal = t.on.clone().unwrap_or_else(|| "accept unmet".to_owned());
@@ -332,22 +334,21 @@ fn transition(t: &Transition, topo: &Topology, g: &Glyphs, ui: Ui) -> String {
         ui.field(style::SIGNAL, &signal, 20),
         ui.paint(arrow_style, arrow),
         t.to,
-        // An empty note must not become an empty escape pair.
+        // The arrow is yellow because a loop is semantic; the note beside it is
+        // annotation, so it is dim.
         if note.is_empty() {
             String::new()
         } else {
-            ui.paint(style::LOOP, &note).to_string()
+            ui.paint(style::DIM, &note).to_string()
         }
     )
 }
 
-fn cycle_note(topo: &Topology, t: &Transition, g: &Glyphs) -> String {
+fn cycle_note(topo: &Topology, t: &Transition) -> String {
     topo.cycles
         .iter()
         .position(|c| c.nodes.contains(&t.to) && c.nodes.contains(&t.from))
-        .map_or_else(String::new, |i| {
-            format!("   back edge {} cycle {}", g.binds, i + 1)
-        })
+        .map_or_else(String::new, |i| format!("   cycle {}", i + 1))
 }
 
 /// Every loop and the bound that stops it.
@@ -359,83 +360,71 @@ fn cycles(out: &mut String, topo: &Topology, g: &Glyphs, ui: Ui) {
     if topo.cycles.is_empty() {
         return;
     }
-    let bounded = topo
+    let unbounded = topo
         .cycles
         .iter()
-        .filter(|c| c.bounded_by.is_some())
+        .filter(|c| c.bounded_by.is_none())
         .count();
-    let all = topo.cycles.len();
-    let verdict = if bounded == all {
-        ui.paint(style::DIM, "all bounded").to_string()
-    } else {
-        ui.paint(style::FAIL, &format!("{} UNBOUNDED", all - bounded))
-            .to_string()
-    };
-    out.push_str(&format!(
-        "\n{}{all}, {verdict}\n",
-        ui.field(style::HEADER, "Cycles", 10)
-    ));
+    out.push_str(&format!("\n{}\n", ui.paint(style::HEADER, "Cycles")));
     for (i, c) in topo.cycles.iter().enumerate() {
         let path = c.nodes.join(&format!(" {} ", g.step));
-        let bound = c
-            .bounded_by
-            .clone()
-            .unwrap_or_else(|| "nothing bounds it".to_owned());
-        let via = if c.via_reroute {
-            "   via accept.on_unmet"
-        } else {
-            ""
-        };
         out.push_str(&format!(
-            "  {}  {path} {} {}   {}{}\n",
+            "  {}  {path} {} {}\n",
             i + 1,
             ui.paint(style::LOOP, g.back.trim_start_matches(['-', '─'])),
-            c.nodes.first().map_or("", String::as_str),
+            c.nodes.first().map_or("", String::as_str)
+        ));
+    }
+    // Stated once. Repeating the same bound under every cycle made the section
+    // look longer than it was and buried the one case that matters.
+    let bounds: Vec<&str> = {
+        let mut b: Vec<&str> = topo
+            .cycles
+            .iter()
+            .filter_map(|c| c.bounded_by.as_deref())
+            .collect();
+        b.sort_unstable();
+        b.dedup();
+        b
+    };
+    if unbounded > 0 {
+        out.push_str(&format!(
+            "  {}\n",
             ui.paint(
-                if c.bounded_by.is_some() {
-                    style::DIM
-                } else {
-                    style::FAIL
-                },
-                &bound
-            ),
-            if via.is_empty() {
-                String::new()
-            } else {
-                ui.paint(style::DIM, via).to_string()
-            }
+                style::FAIL,
+                &format!("{unbounded} UNBOUNDED — validation rejects this")
+            )
+        ));
+    }
+    if !bounds.is_empty() {
+        out.push_str(&format!(
+            "  {} {}\n",
+            ui.paint(style::DIM, "bounded by"),
+            bounds.join(&format!(" {} ", g.sep))
         ));
     }
 }
 
-/// Counts and the legend.
+/// One line of counts. The legend is gone: eight symbols explaining themselves
+/// cost more attention than they returned, and the shapes are learned in one
+/// reading.
 fn summary(out: &mut String, graph: &Graph, topo: &Topology, g: &Glyphs, ui: Ui) {
-    let count = |k: NodeKind| graph.nodes.values().filter(|n| n.spec.kind() == k).count();
     let gates = graph.nodes.keys().filter(|id| graph.is_gate(id)).count();
     let reroutes = topo.transitions.iter().filter(|t| t.is_reroute()).count();
-    let mut kinds = Vec::new();
-    for (kind, label) in [
-        (NodeKind::Agent, "agent"),
-        (NodeKind::Command, "command"),
-        (NodeKind::Human, "human"),
-        (NodeKind::Terminal, "terminal"),
-    ] {
-        let n = count(kind);
-        if n > 0 {
-            kinds.push(format!("{n} {label}"));
-        }
+    let mut parts = vec![
+        format!("{} nodes", graph.nodes.len()),
+        format!("{} edges", graph.edges.len()),
+    ];
+    if reroutes > 0 {
+        parts.push(format!("{reroutes} implicit"));
+    }
+    if gates > 0 {
+        parts.push(format!("{gates} gate{}", if gates == 1 { "" } else { "s" }));
     }
     out.push_str(&format!(
-        "\n{} nodes ({}) {} {} edges {} {reroutes} implicit {} {gates} {}\n",
-        graph.nodes.len(),
-        kinds.join(", "),
-        g.sep,
-        graph.edges.len(),
-        g.sep,
-        g.sep,
-        if gates == 1 { "gate" } else { "gates" },
+        "\n{}\n",
+        ui.paint(style::DIM, &parts.join(&format!(" {} ", g.sep)))
     ));
-    out.push_str(&format!("{}\n", ui.paint(style::DIM, &g.legend())));
 }
 
 /// Round milliseconds to the unit a human wrote them in.

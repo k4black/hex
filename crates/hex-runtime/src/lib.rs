@@ -33,7 +33,7 @@ pub use hex_kernel::graph::{Budget, Context, Node, NodeSpec};
 pub use hex_kernel::topology::{Cycle, EdgeClass, Topology, Transition};
 pub use hex_kernel::{Graph, RunState, Status, Totals, Usage};
 pub use hex_proto::{Actor, Command, Disposition, Event, EventBody, ModelUsage, PROTOCOL_VERSION};
-pub use preset::Entry as GraphEntry;
+pub use preset::{Entry as GraphEntry, Layer};
 pub use workers::Workers;
 pub use worktree::Isolation;
 

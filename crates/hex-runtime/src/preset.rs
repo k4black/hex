@@ -69,6 +69,11 @@ pub struct Resolved {
 pub struct Entry {
     /// The name to pass to `hex run`.
     pub name: String,
+    /// Which layer this resolved from — what a listing groups by.
+    pub layer: Layer,
+    /// Whether a lower layer defines the same name and is therefore invisible.
+    /// A project graph silently shadowing a built-in is a surprise worth naming.
+    pub shadows: bool,
     /// Where it resolves from (a path, or `built-in`).
     pub origin: String,
     /// One-line summary from the graph's `description:`, if any.
@@ -130,6 +135,29 @@ pub fn resolve(reference: &str, project_root: &Path) -> Result<Resolved> {
     )))
 }
 
+/// Where a graph came from, in precedence order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Layer {
+    /// `.hex/graphs/` — wins.
+    Project,
+    /// `~/.config/hex/graphs/`.
+    User,
+    /// Shipped with the binary.
+    BuiltIn,
+}
+
+impl Layer {
+    /// The heading a listing groups under.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::User => "user",
+            Self::BuiltIn => "built-in",
+        }
+    }
+}
+
 /// The embedded source of the built-in named `name` — looked up in [`BUILTINS`]
 /// so shipping a preset means adding one table entry, not two.
 fn builtin(name: &str) -> Option<&'static str> {
@@ -144,13 +172,24 @@ pub fn list(project_root: &Path) -> Vec<Entry> {
     use std::collections::BTreeMap;
     // Insert lowest precedence first so higher layers overwrite the origin.
     let mut found: BTreeMap<String, String> = BTreeMap::new();
+    // Track every layer that defines a name, so the winner can say whether it is
+    // hiding something.
+    let mut layers: BTreeMap<String, Vec<Layer>> = BTreeMap::new();
     for name in BUILTINS.iter().map(|b| b.name) {
         found.insert((*name).to_owned(), "built-in".to_owned());
+        layers
+            .entry((*name).to_owned())
+            .or_default()
+            .push(Layer::BuiltIn);
     }
     if let Some(dir) = user_graphs_dir() {
-        collect_yaml(&dir, &mut found);
+        for name in collect_yaml(&dir, &mut found) {
+            layers.entry(name).or_default().push(Layer::User);
+        }
     }
-    collect_yaml(&project_root.join(".hex").join("graphs"), &mut found);
+    for name in collect_yaml(&project_root.join(".hex").join("graphs"), &mut found) {
+        layers.entry(name).or_default().push(Layer::Project);
+    }
     found
         .into_iter()
         .map(|(name, origin)| {
@@ -162,7 +201,11 @@ pub fn list(project_root: &Path) -> Vec<Entry> {
                 std::fs::read_to_string(&origin).ok()
             };
             let meta = source.and_then(|s| crate::loader::metadata(&s).ok());
+            let seen = layers.get(&name).cloned().unwrap_or_default();
+            let layer = seen.iter().copied().min().unwrap_or(Layer::BuiltIn);
             Entry {
+                layer,
+                shadows: seen.len() > 1,
                 name,
                 origin,
                 description: meta.as_ref().and_then(|m| m.description.clone()),
@@ -174,9 +217,10 @@ pub fn list(project_root: &Path) -> Vec<Entry> {
 
 /// Record each `*.yaml`/`*.yml` file in `dir` as `<stem> -> <path>` (overwriting
 /// lower-precedence origins). A missing directory is simply skipped.
-fn collect_yaml(dir: &Path, found: &mut std::collections::BTreeMap<String, String>) {
+fn collect_yaml(dir: &Path, found: &mut std::collections::BTreeMap<String, String>) -> Vec<String> {
+    let mut names = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return names;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -190,8 +234,10 @@ fn collect_yaml(dir: &Path, found: &mut std::collections::BTreeMap<String, Strin
             && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
         {
             found.insert(stem.to_owned(), path.display().to_string());
+            names.push(stem.to_owned());
         }
     }
+    names
 }
 
 fn user_graphs_dir() -> Option<PathBuf> {

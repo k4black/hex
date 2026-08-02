@@ -27,6 +27,7 @@ mod preview;
 #[cfg(test)]
 mod test_support;
 mod ui;
+use hex_runtime::Layer;
 
 /// Worked examples, shown under `hex --help`.
 const EXAMPLES: &str = "\
@@ -148,6 +149,9 @@ enum Command {
     Status {
         /// Run id, as printed by `hex run`
         run_id: String,
+        /// Also break the spend down per node and per model
+        #[arg(long)]
+        usage: bool,
     },
     /// Print a run's recorded event stream
     Watch {
@@ -257,7 +261,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
 
     match command {
         Command::Init => cmd_init(json),
-        Command::List => cmd_list(json),
+        Command::List => cmd_list(json, ui::Ui::stdout(cli.color, json)),
         Command::Doctor => cmd_doctor(json, cli.color, ui::Ui::stdout(cli.color, json)),
         Command::Validate { graph } => cmd_validate(&graph, json),
         Command::Graph { graph, format } => {
@@ -284,10 +288,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             },
             json,
             no_preview,
+            ui::Ui::stdout(cli.color, json),
         ),
         Command::Resume { run_id } => cmd_resume(&run_id, json, no_preview),
         Command::Runs => cmd_runs(json, ui::Ui::stdout(cli.color, json)),
-        Command::Status { run_id } => cmd_status(&run_id, json),
+        Command::Status { run_id, usage } => {
+            cmd_status(&run_id, usage, json, ui::Ui::stdout(cli.color, json))
+        }
         Command::Watch { run_id, follow } => cmd_watch(&run_id, follow, json),
         Command::Logs {
             run_id,
@@ -510,15 +517,15 @@ fn relative(root: &std::path::Path, path: &std::path::Path) -> String {
         .to_string()
 }
 
-fn cmd_list(json: bool) -> Result<ExitCode, String> {
-    print_graph_list(&open_runtime()?, json);
+fn cmd_list(json: bool, ui: ui::Ui) -> Result<ExitCode, String> {
+    print_graph_list(&open_runtime()?, json, ui);
     Ok(ExitCode::SUCCESS)
 }
 
 /// Print the runnable graphs (shared by `hex list` and bare `hex run`). Each
 /// entry shows its name + origin, a one-line description, and a ready-to-run
 /// example invocation.
-fn print_graph_list(runtime: &Runtime, json: bool) {
+fn print_graph_list(runtime: &Runtime, json: bool, ui: ui::Ui) {
     let graphs = runtime.list_graphs();
     if json {
         let items: Vec<_> = graphs
@@ -527,6 +534,8 @@ fn print_graph_list(runtime: &Runtime, json: bool) {
                 serde_json::json!({
                     "name": g.name,
                     "origin": g.origin,
+                    "layer": g.layer.label(),
+                    "shadows": g.shadows,
                     "description": g.description,
                     "example": g.example,
                 })
@@ -539,15 +548,73 @@ fn print_graph_list(runtime: &Runtime, json: bool) {
         outln!("no graphs found (add one to .hex/graphs/ or ~/.config/hex/graphs/)");
         return;
     }
-    outln!("available graphs:\n");
-    for g in &graphs {
-        outln!("  {}  ({})", g.name, g.origin);
-        if let Some(desc) = &g.description {
-            outln!("      {desc}");
+    // Grouped by layer, highest precedence first: which graph actually runs is
+    // decided by the layer, so a flat alphabetical list buried the one fact the
+    // reader needs. Within a group, alphabetical.
+    let root = std::env::current_dir().unwrap_or_default();
+    let mut first_group = true;
+    for layer in [Layer::Project, Layer::User, Layer::BuiltIn] {
+        let group: Vec<&hex_runtime::GraphEntry> =
+            graphs.iter().filter(|g| g.layer == layer).collect();
+        if group.is_empty() {
+            continue;
         }
-        let example = g.example.as_deref().unwrap_or("<prompt>");
-        outln!("      hex run {} -p \"{example}\"\n", g.name);
+        // The directory belongs in the heading: one line per group beats one
+        // line per graph, and it answers "where would I put a new one".
+        let dir = group
+            .first()
+            .map(|g| std::path::Path::new(&g.origin))
+            .filter(|_| layer != Layer::BuiltIn)
+            .and_then(std::path::Path::parent)
+            .map(|d| format!("   {}", relative(&root, d)))
+            .unwrap_or_default();
+        // No empty escape pair when a layer has no directory to name.
+        if first_group {
+            first_group = false;
+        } else {
+            outln!();
+        }
+        if dir.is_empty() {
+            outln!("{}", ui.paint(ui::style::HEADER, layer.label()));
+        } else {
+            outln!(
+                "{}{}",
+                ui.paint(ui::style::HEADER, layer.label()),
+                ui.paint(ui::style::DIM, &dir)
+            );
+        }
+        let mut table = ui::Table::new(&["", "GRAPH", "DESCRIPTION"], &[false; 3]).flex(2);
+        for g in group {
+            table.row(vec![
+                // A project graph hiding a built-in of the same name is a
+                // surprise; mark it rather than letting the built-in vanish.
+                if g.shadows {
+                    ui.paint(ui::style::WARN, "*").to_string()
+                } else {
+                    " ".to_owned()
+                },
+                ui.paint(ui::style::ID, &g.name).to_string(),
+                ui.paint(ui::style::DIM, g.description.as_deref().unwrap_or("—"))
+                    .to_string(),
+            ]);
+        }
+        for line in table.render(ui) {
+            outln!("  {line}");
+        }
     }
+    if graphs.iter().any(|g| g.shadows) {
+        outln!(
+            "\n{}",
+            ui.paint(ui::style::DIM, "* shadows a lower layer of the same name")
+        );
+    }
+    outln!(
+        "\n{}",
+        ui.paint(
+            ui::style::DIM,
+            "hex graph <name>   to read one   ·   hex run <name> -p \"…\"   to start it"
+        )
+    );
 }
 
 /// Report whether every configured worker and check can actually run. Exit 1 if
@@ -709,6 +776,10 @@ fn isolation_from(worktree: Option<&str>, no_worktree: bool, init: Option<&str>)
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one verb's flags; a struct would only move them"
+)]
 fn cmd_run(
     reference: Option<&str>,
     prompt: Option<String>,
@@ -717,11 +788,12 @@ fn cmd_run(
     mode: RunMode,
     json: bool,
     no_preview: bool,
+    ui: ui::Ui,
 ) -> Result<ExitCode, String> {
     let runtime = open_runtime_streaming(json, no_preview)?;
     // `hex run` with no graph lists what you can run instead of erroring.
     let Some(reference) = reference else {
-        print_graph_list(&runtime, json);
+        print_graph_list(&runtime, json, ui);
         return Ok(ExitCode::SUCCESS);
     };
     if mode.detach {
@@ -1000,25 +1072,36 @@ fn cmd_runs(json: bool, ui: ui::Ui) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     // One table, one width policy, one place that knows how a state looks.
-    let mut table = ui::Table::new(
-        &["", "RUN", "STATE", "AGE", "NODE", "PROCESS"],
-        &[false, false, false, true, false, false],
-    )
-    .flex(1);
+    // `finished:failed` in STATE beside `finished` in PROCESS said "finished"
+    // twice and nothing else. The mark carries the colour, the word carries the
+    // verdict, and liveness appears only while it still means something.
+    // Liveness, not status: an *unreadable* run has no status but is not a
+    // process anyone is waiting on, and letting it force the column back means
+    // the column never disappears.
+    let live = runs
+        .iter()
+        .any(|r| !matches!(r.liveness, hex_runtime::Liveness::Finished));
+    let mut headers: Vec<&str> = vec!["", "RUN", "RESULT", "AGE", "LAST"];
+    if live {
+        headers.push("PROCESS");
+    }
+    let right = [false, false, false, true, false, false];
+    let mut table = ui::Table::new(&headers, &right[..headers.len()]).flex(1);
     for r in &runs {
-        let state = r
-            .status
-            .as_ref()
-            .map_or("unreadable".to_owned(), ToString::to_string);
-        table.row(vec![
+        let mut row = vec![
             ui.mark(mark_for(r)),
             ui.paint(ui::style::ID, &r.run_id).to_string(),
-            ui.paint(state_style(&state), &state).to_string(),
+            result_word(r),
             ui.paint(ui::style::DIM, &age(r.updated_at_ms)).to_string(),
             r.current.clone().unwrap_or_else(|| "-".to_owned()),
-            ui.paint(ui::style::DIM, &r.liveness.to_string())
-                .to_string(),
-        ]);
+        ];
+        if live {
+            row.push(
+                ui.paint(ui::style::DIM, &r.liveness.to_string())
+                    .to_string(),
+            );
+        }
+        table.row(row);
     }
     for line in table.render(ui) {
         outln!("{line}");
@@ -1053,6 +1136,38 @@ fn first_line(s: &str) -> &str {
         .unwrap_or(s)
 }
 
+/// The outcome as one coloured word, for a record header.
+fn result_line(s: &hex_runtime::StatusReport) -> String {
+    s.disposition
+        .map_or_else(|| s.status.to_string(), |d| d.to_string().replace('_', " "))
+}
+
+/// Tokens and money on one line: what a run cost, without a table.
+fn spend_line(t: &hex_runtime::Totals, ui: ui::Ui) -> String {
+    let mut parts = vec![
+        format!(
+            "{} in",
+            tokens(t.input_tokens + t.cache_read_tokens + t.cache_write_tokens)
+        ),
+        format!("{} out", tokens(t.output_tokens)),
+    ];
+    if t.cost_micro_usd > 0 || t.cost_is_partial() {
+        parts.push(cost_cell(t));
+    }
+    let line = parts.join(" · ");
+    if t.cost_is_partial() {
+        format!(
+            "{line}   {}",
+            ui.paint(
+                ui::style::DIM,
+                &format!("({} attempt(s) reported no price)", t.unpriced_reports)
+            )
+        )
+    } else {
+        line
+    }
+}
+
 /// The glyph for a run's state — the column you scan before reading anything.
 fn mark_for(r: &hex_runtime::RunSummary) -> ui::Mark {
     use hex_runtime::{Disposition as D, Status};
@@ -1067,15 +1182,22 @@ fn mark_for(r: &hex_runtime::RunSummary) -> ui::Mark {
     }
 }
 
-/// Colour a state word by what it means, so a red row is findable at a glance.
-fn state_style(state: &str) -> anstyle::Style {
-    match state {
-        s if s.ends_with("succeeded") => ui::style::OK,
-        s if s.ends_with("failed") => ui::style::FAIL,
-        s if s.ends_with("timed_out") || s.ends_with("budget_exhausted") => ui::style::WARN,
-        "unreadable" => ui::style::WARN,
-        "running" => ui::style::RUN,
-        _ => ui::style::DIM,
+/// The outcome in words, without the `finished:` ceremony.
+///
+/// Left uncoloured on purpose: the mark in the first column already carries the
+/// colour, and colour must never be the only thing saying what happened.
+fn result_word(r: &hex_runtime::RunSummary) -> String {
+    use hex_runtime::{Disposition as D, Status};
+    match (&r.status, r.disposition) {
+        (None, _) => "unreadable".to_owned(),
+        (_, Some(D::Succeeded)) => "succeeded".to_owned(),
+        (_, Some(D::Failed)) => "failed".to_owned(),
+        (_, Some(D::TimedOut)) => "timed out".to_owned(),
+        (_, Some(D::BudgetExhausted)) => "budget exhausted".to_owned(),
+        (_, Some(D::Cancelled)) => "cancelled".to_owned(),
+        (Some(Status::Paused), _) => "paused".to_owned(),
+        (Some(Status::Running), _) => "running".to_owned(),
+        _ => "created".to_owned(),
     }
 }
 
@@ -1180,7 +1302,7 @@ fn cmd_control(run_id: &str, command: &ControlCommand, json: bool) -> Result<Exi
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_status(run_id: &str, json: bool) -> Result<ExitCode, String> {
+fn cmd_status(run_id: &str, usage: bool, json: bool, ui: ui::Ui) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     let s = runtime.status(run_id).map_err(|e| e.to_string())?;
     if json {
@@ -1227,48 +1349,75 @@ fn cmd_status(run_id: &str, json: bool) -> Result<ExitCode, String> {
         });
         outln!("{v}");
     } else {
-        outln!("run: {}", s.run_id);
-        outln!("status: {}", s.status);
+        // Four questions, answered before anything else: which run, is it
+        // going, where did it stop, and what did it cost in aggregate.
+        outln!("{}", ui.paint(ui::style::ID, &s.run_id));
+        let mut line = vec![result_line(&s)];
         if let Some(c) = &s.current {
-            outln!("current: {c}");
+            line.push(format!("at {c}"));
         }
-        outln!("attempts: {}", s.attempts);
-        // The live picture, before the spend table: an operator checking on a
-        // running loop wants "what is happening now", and a bare `running` sent
-        // them to `hex watch` to find out.
+        line.push(format!("{} attempts", s.attempts));
+        outln!("{}", line.join(" · "));
+
+        // What is happening right now, when something is.
         if let Some(f) = &s.in_flight {
             let via = f
                 .worker
                 .as_deref()
                 .map_or(String::new(), |w| format!(" via {w}"));
             outln!(
-                "in flight: {} on {}{via}, running {}",
+                "{}{} on {}{via}, running {}",
+                ui.field(ui::style::HEADER, "In flight", 11),
                 f.attempt_id,
                 f.node_id,
-                age(f.started_at_ms)
+                ui.paint(ui::style::DIM, &age(f.started_at_ms))
             );
         }
         if let Some(node) = &s.asked {
-            outln!("waiting for you: `hex respond {} \"…\"` ({node})", s.run_id);
+            outln!(
+                "{}{}",
+                ui.field(ui::style::HEADER, "Waiting", 11),
+                format_args!("`hex respond {} \"…\"`   ({node})", s.run_id)
+            );
             if let Some(q) = &s.question {
-                outln!("{}", grey(q.trim_end(), std::io::stdout().is_terminal()));
+                outln!("           {}", ui.paint(ui::style::DIM, q.trim_end()));
             }
         }
-        // Two stages of "sent but not applied", and conflating them is how a steer
-        // looks lost: `queued` is still in the inbox, `pending_steer` has been
-        // journaled and is waiting for an agent attempt to read it.
         for command in &s.queued {
             match command {
-                ControlCommand::Steer { text } => {
-                    outln!("queued steer (not yet picked up): {text}");
-                }
-                other => outln!("queued {} (not yet picked up)", other.as_str()),
+                ControlCommand::Steer { text } => outln!(
+                    "{}{text}   {}",
+                    ui.field(ui::style::HEADER, "Queued", 11),
+                    ui.paint(ui::style::DIM, "(not yet picked up)")
+                ),
+                other => outln!(
+                    "{}{}",
+                    ui.field(ui::style::HEADER, "Queued", 11),
+                    other.as_str()
+                ),
             }
         }
         for text in &s.pending_steer {
-            outln!("steer accepted (applies to the next agent attempt): {text}");
+            outln!(
+                "{}{text}   {}",
+                ui.field(ui::style::HEADER, "Steer", 11),
+                ui.paint(ui::style::DIM, "(applies to the next agent attempt)")
+            );
         }
-        print_usage(&s.usage, &s.visits);
+
+        // One aggregate line. The per-node/per-model breakdown is accounting,
+        // not status, and printing it always made a two-attempt run look like a
+        // billing report — it lives behind `--usage`.
+        if s.usage.total.tokens() > 0 {
+            outln!(
+                "{}{}",
+                ui.field(ui::style::HEADER, "Usage", 11),
+                spend_line(&s.usage.total, ui)
+            );
+        }
+        if usage {
+            print_usage(&s.usage, &s.visits, ui);
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1278,7 +1427,11 @@ fn cmd_status(run_id: &str, json: bool) -> Result<ExitCode, String> {
 /// Silent when nothing reported usage — a `command`-only graph, or an agent whose
 /// CLI reports no accounting, would otherwise grow a table of zeroes that reads
 /// like a run that cost nothing rather than one that never said.
-fn print_usage(usage: &hex_runtime::Usage, visits: &std::collections::BTreeMap<String, u32>) {
+fn print_usage(
+    usage: &hex_runtime::Usage,
+    visits: &std::collections::BTreeMap<String, u32>,
+    ui: ui::Ui,
+) {
     if usage.total.tokens() == 0 {
         return;
     }
@@ -1301,21 +1454,15 @@ fn print_usage(usage: &hex_runtime::Usage, visits: &std::collections::BTreeMap<S
     // a crash between `AttemptReported` and the attempt's terminal leaves two
     // reports against one visit. Calling it attempts would be a number that
     // occasionally disagrees with itself.
-    outln!(
-        "\n{:<22} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8} {:>12}",
-        "NODE",
-        "VISITS",
-        "IN",
-        "OUT",
-        "CACHE R",
-        "CACHE W",
-        "REASON",
-        "COST"
+    let head = format!(
+        "{:<22} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8} {:>12}",
+        "NODE", "VISITS", "IN", "OUT", "CACHE R", "CACHE W", "REASON", "COST"
     );
+    outln!("\n{}", ui.paint(ui::style::HEADER, &head));
     for (node, t) in &usage.by_node {
         row(node, visits.get(node).copied().unwrap_or(0).to_string(), t);
     }
-    outln!("MODEL");
+    outln!("{}", ui.paint(ui::style::HEADER, "MODEL"));
     for (model, t) in &usage.by_model {
         row(model, String::new(), t);
     }

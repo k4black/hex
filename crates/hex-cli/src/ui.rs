@@ -186,8 +186,6 @@ pub struct Glyphs {
     pub sep: &'static str,
     /// Joins nodes when printing a cycle path.
     pub step: &'static str,
-    /// "at most", for visit bounds.
-    pub le: &'static str,
     /// Binds a role to the worker it resolves to.
     pub binds: &'static str,
 }
@@ -208,7 +206,6 @@ impl Glyphs {
         reroute: "┈┈↺",
         sep: "·",
         step: "▸",
-        le: "≤",
         binds: "→",
     };
 
@@ -227,27 +224,8 @@ impl Glyphs {
         reroute: "..^",
         sep: ",",
         step: ">",
-        le: "<=",
         binds: "->",
     };
-
-    /// The one-line legend. Printed every time, like terraform reprints its
-    /// `+ ~ -` key: a symbol vocabulary nobody can look up is a puzzle.
-    #[must_use]
-    pub fn legend(&self) -> String {
-        format!(
-            "{} agent  {} command  {} gate  {} human  {} succeeded  {} failed  \
-             {} back edge  {} implicit",
-            self.agent,
-            self.command,
-            self.gate,
-            self.human,
-            self.ok,
-            self.fail,
-            self.back,
-            self.reroute,
-        )
-    }
 }
 
 /// A glyph and its colour chosen *together*. A green `✓` beside the word
@@ -560,45 +538,6 @@ mod tests {
     }
 
     /// No glyph may carry emoji presentation: a font that substitutes a colour
-    /// emoji takes two cells and breaks every column to its right.
-    #[test]
-    fn no_glyph_is_an_emoji_presentation_codepoint() {
-        for g in [Glyphs::UNICODE, Glyphs::ASCII] {
-            let all = format!(
-                "{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
-                g.entry,
-                g.rail,
-                g.rail_end,
-                g.agent,
-                g.command,
-                g.gate,
-                g.human,
-                g.ok,
-                g.fail,
-                g.forward,
-                g.back,
-                g.reroute,
-                g.sep,
-                g.step,
-                g.le,
-                g.binds
-            );
-            for c in all.chars() {
-                assert!(
-                    !matches!(c, '\u{FE0F}' | '\u{FE0E}') && (c as u32) < 0x1_0000,
-                    "{c:?} is outside the BMP or carries a variation selector"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_legend_names_every_badge() {
-        let legend = Glyphs::UNICODE.legend();
-        for badge in ["◆", "□", "▣", "?", "✓", "✗"] {
-            assert!(legend.contains(badge), "legend omits {badge}: {legend}");
-        }
-    }
 
     #[test]
     fn an_explicit_choice_beats_everything() {

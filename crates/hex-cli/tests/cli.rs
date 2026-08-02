@@ -395,7 +395,12 @@ fn status_reports_what_the_run_spent() {
     let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
     inject_usage(dir.path(), &run_id);
 
-    let out = hex(dir.path(), &["status", &run_id]);
+    // Default status is a summary, not a billing report.
+    let brief = stdout(&hex(dir.path(), &["status", &run_id]));
+    assert!(brief.contains("Usage"), "one aggregate line: {brief}");
+    assert!(!brief.contains("NODE"), "no table by default: {brief}");
+
+    let out = hex(dir.path(), &["status", &run_id, "--usage"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let s = stdout(&out);
     assert!(s.contains("NODE"), "a per-node table: {s}");
@@ -538,7 +543,7 @@ fn status_marks_a_partly_priced_total_as_a_lower_bound() {
     let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
     inject_usage_unpriced(dir.path(), &run_id);
 
-    let out = hex(dir.path(), &["status", &run_id]);
+    let out = hex(dir.path(), &["status", &run_id, "--usage"]);
     let s = stdout(&out);
     assert!(s.contains("lower bound"), "the caveat is stated: {s}");
     assert!(
@@ -845,7 +850,10 @@ fn runs_lists_a_finished_run_with_its_state() {
     assert!(out.status.success());
     let s = stdout(&out);
     assert!(s.contains(&run_id), "the run id is findable: {s}");
-    assert!(s.contains("finished:succeeded"), "{s}");
+    // The `finished:` prefix is gone: the mark carries the colour and RESULT
+    // carries the word, so saying "finished" twice added nothing.
+    assert!(s.contains("succeeded"), "{s}");
+    assert!(!s.contains("finished:succeeded"), "no ceremony prefix: {s}");
 }
 
 #[test]
@@ -864,7 +872,7 @@ fn status_and_watch_reflect_a_finished_run() {
     let run_id = v["run_id"].as_str().unwrap();
 
     let st = hex(dir.path(), &["status", run_id]);
-    assert!(stdout(&st).contains("finished:succeeded"));
+    assert!(stdout(&st).contains("succeeded"));
 
     let watch = hex(dir.path(), &["watch", run_id]);
     assert!(stdout(&watch).contains("run_finished"));
