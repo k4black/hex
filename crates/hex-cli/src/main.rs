@@ -10,7 +10,7 @@
 //! `retry`/`replay`. The mid-run verbs are all thin writes to the run's control
 //! inbox — the same transport a human and an agent use.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as _};
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -349,6 +349,19 @@ fn open_runtime_streaming(json: bool, no_preview: bool) -> Result<Runtime, Strin
     // `--json` (machine output), `--no-preview`, or a piped stderr fall back to
     // plain line streaming — same behavior as before this feature.
     let preview = !json && !no_preview && std::io::stderr().is_terminal();
+    // Ctrl-C must kill the agent, not just us: it runs in its own process group,
+    // so the tty's SIGINT never reaches it and it would otherwise keep working
+    // (and spending) unlogged and unnoticed. Installed for foreground `run` and
+    // `resume` only — the two commands that own a live agent.
+    hex_runtime::interrupt::install(|| {
+        // Tearing down a process group takes up to the SIGTERM grace period, so
+        // say so; a silent pause reads as a hang. The live footer may repaint
+        // over this, which is why `print_outcome` reports it again at the end.
+        let _ = writeln!(
+            std::io::stderr(),
+            "\ninterrupting: stopping the agent and saving progress (press again to force-quit)"
+        );
+    });
     Ok(open_runtime()?.with_progress(Box::new(preview::LivePreview::new(preview))))
 }
 
@@ -931,7 +944,15 @@ fn print_outcome(
         outln!("disposition: {disposition}");
         payoff.print();
         if report.disposition.is_none() {
-            eprintln!("paused; continue with `hex resume {}`", report.run_id);
+            // Distinguish the two ways a run pauses: an operator `pause` stopped
+            // it cleanly at a boundary, an interrupt killed a live agent. Both
+            // resume the same way, but only one of them left a corpse.
+            let how = if hex_runtime::interrupt::requested() {
+                "interrupted; the agent was killed and progress saved"
+            } else {
+                "paused"
+            };
+            eprintln!("{how}; continue with `hex resume {}`", report.run_id);
         }
     }
     Ok(exit_for_report(report))

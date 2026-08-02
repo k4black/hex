@@ -598,21 +598,32 @@ sign-off, confirmation.
    transition, not from where the traversal met it.
    Escaping is per *line*, before joining: escaping a DOT label's `\n` as data
    prints a literal backslash instead of breaking the line.
-45. **Ctrl-C kills `hex`, not the agent it is waiting on.** Verified 2026-08-02
-   under a pty: the agent keeps running, keeps spending tokens, and keeps writing
-   the workspace. `logged_command` spawns with `process_group(0)` (gotcha 31), so
-   the agent is *not* in the terminal's foreground process group and the tty's
-   SIGINT never reaches it — the same call that makes timeout-kill reliable makes
-   Ctrl-C ineffective, and there is no SIGINT handler anywhere in the workspace.
-   The run is left with an open attempt and no terminal, so it reads `abandoned`.
-   Two consequences: `hex resume` will start a *second* agent on the same
-   workspace while the orphan is still live, and `hex cancel` cannot stop an
-   in-flight attempt either (the inbox is drained at attempt boundaries — gotcha
-   36). Until a handler exists, the honest cleanup is to kill the agent's process
-   group by hand, then `hex cancel`. Cancelling a crashed run used to *corrupt*
-   it — `RunFinished` on top of an open attempt is rejected by `lifecycle`,
-   leaving the run permanently unreadable — fixed by having `cancel` append
-   `AttemptInterrupted` first, exactly as `resume` does
-   (`cancelling_a_crashed_run_closes_its_orphaned_attempt`). A cleanup path that
-   corrupts what it cleans up is worse than no cleanup path.
+45. **Ctrl-C stops the run *and* the agent, and lands it in `paused`.** The
+   agent runs in its own process group (gotcha 31), so the tty's SIGINT reaches
+   only `hex` — before this, Ctrl-C left the agent spending tokens and writing
+   the workspace with no journal, no logs and no notice, and `hex resume` would
+   then run a *second* agent beside the live orphan. Now `hex-runtime`'s
+   `interrupt::install` (signal-hook, already in the tree via crossterm; its
+   `Signals` iterator delivers on a normal thread, so no `unsafe`) sets the
+   process-global flag in `hex_worker::interrupt`, which the **existing polling
+   wait** (`wait_bounded`) checks each 25 ms tick — the same tick that enforces
+   deadlines, so the kill path is the proven `kill_group` one and no new
+   plumbing carries it. A second press exits 130.
+   The flag is in `hex-worker` because that is the lowest crate that must read
+   it; the *policy* is in the runtime; the CLI only chooses to install it. What
+   an interrupted attempt becomes: usage and salvaged output are journaled
+   first, then `AttemptInterrupted` + `RunPaused` — **not** `AttemptFailed`,
+   which would both misreport it (nothing failed) and make it unresumable (a
+   failed attempt ends the run). `Paused` already had a producer, an exit code
+   (6) and a continuation verb, so Ctrl-C invents no state. `wait_bounded` no
+   longer blocks in `child.wait()` when `deadline_ms` is `None`, or an unbounded
+   attempt would be uninterruptible. Pinned by
+   `hex-runtime/tests/interrupt.rs`, in its **own** test binary because the flag
+   is process-global — setting it in a shared file would kill unrelated tests'
+   subprocesses.
+   Related, and still true: `hex cancel` cannot stop an in-flight attempt (the
+   inbox drains at attempt boundaries — gotcha 36), and cancelling a *crashed*
+   run used to corrupt it, since `RunFinished` over an open attempt is rejected
+   by `lifecycle`; `cancel` now writes `AttemptInterrupted` first, as `resume`
+   does.
 46. _add new gotchas here as they are discovered_

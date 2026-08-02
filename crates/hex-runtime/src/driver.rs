@@ -211,6 +211,14 @@ impl<'a> Session<'a> {
             if self.state.is_finished() {
                 break;
             }
+            // Interrupted between attempts (or while blocked on a human node):
+            // there is no attempt to close, so just pause here. Checked at the
+            // boundary for the same reason control is — anywhere else would
+            // orphan the in-flight attempt.
+            if hex_worker::interrupt::requested() && self.state.status != Status::Paused {
+                self.record(None, None, Actor::runtime(), EventBody::RunPaused)?;
+                return Ok(None);
+            }
             if self.state.status == Status::Paused {
                 return Ok(None);
             }
@@ -621,6 +629,7 @@ impl<'a> Session<'a> {
             result,
             error,
             timed_out,
+            interrupted,
             report,
         } = adapter.run(&request);
 
@@ -653,6 +662,14 @@ impl<'a> Session<'a> {
                 Actor::agent(worker_name.clone()),
                 EventBody::NodeResult { text },
             )?;
+        }
+
+        // The operator interrupted the run. The agent is already dead (its
+        // process group was killed) and everything it spent and produced is
+        // journaled above, so the attempt is closed and the run pauses — it is
+        // resumable, and nothing is left running unrecorded.
+        if interrupted {
+            return self.interrupt_attempt(node_id, attempt_id);
         }
 
         match signal {
@@ -780,6 +797,7 @@ impl<'a> Session<'a> {
                     },
                 )
             }
+            Err(fail) if fail.interrupted => self.interrupt_attempt(node_id, attempt_id),
             Err(fail) => {
                 let disposition = if fail.timed_out {
                     Disposition::TimedOut
@@ -789,6 +807,25 @@ impl<'a> Session<'a> {
                 self.fail_attempt(node_id, attempt_id, &fail.reason, disposition)
             }
         }
+    }
+
+    /// Close an attempt the operator interrupted, and pause the run.
+    ///
+    /// Not a failure: nothing was exceeded and nothing went wrong, so recording
+    /// `AttemptFailed` would both misreport the run and make it unresumable
+    /// (a failed attempt ends the run — redo is a new run). `AttemptInterrupted`
+    /// is the same event `resume` writes for an attempt orphaned by a crash,
+    /// which is exactly what this is, only deliberate. `RunPaused` then leaves
+    /// the run in a state that already has a producer, an exit code (6) and a
+    /// continuation verb (`hex resume`).
+    fn interrupt_attempt(&mut self, node_id: &str, attempt_id: &str) -> Result<()> {
+        self.record(
+            Some(node_id),
+            Some(attempt_id),
+            Actor::runtime(),
+            EventBody::AttemptInterrupted,
+        )?;
+        self.record(None, None, Actor::runtime(), EventBody::RunPaused)
     }
 
     /// Record a failed attempt as a single *terminal* event carrying its
@@ -881,6 +918,8 @@ impl<'a> Session<'a> {
 /// verdict): a bad argv, spawn/log error, or a deadline kill.
 struct ProcFail {
     timed_out: bool,
+    /// Killed by an operator interrupt rather than by a deadline or a fault.
+    interrupted: bool,
     reason: String,
 }
 
@@ -888,6 +927,7 @@ impl ProcFail {
     fn infra(reason: impl Into<String>) -> Self {
         Self {
             timed_out: false,
+            interrupted: false,
             reason: reason.into(),
         }
     }
@@ -1000,6 +1040,7 @@ fn remaining_deadline(
     if left == 0 {
         return Err(ProcFail {
             timed_out: true,
+            interrupted: false,
             reason: "command steps exceeded the attempt's time budget".to_owned(),
         });
     }
@@ -1034,8 +1075,15 @@ fn run_process(
             let _ = std::fs::write(attempt_dir.join("exit"), code);
             Ok(status.success())
         }
+        // Same kill, two causes; the flag is what tells them apart.
+        Ok(None) if hex_worker::interrupt::requested() => Err(ProcFail {
+            timed_out: false,
+            interrupted: true,
+            reason: "command interrupted by the operator (killed)".to_owned(),
+        }),
         Ok(None) => Err(ProcFail {
             timed_out: true,
+            interrupted: false,
             reason: "command exceeded its time budget (killed)".to_owned(),
         }),
         Err(e) => Err(ProcFail::infra(format!("command wait failed: {e}"))),

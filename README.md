@@ -498,6 +498,22 @@ hex respond "$id" "approved, but skip the cache part"
 hex wait   "$id"                      # exits with the disposition
 ```
 
+**Ctrl-C** on a foreground run stops the agent too, and keeps the work. Each
+attempt runs in its own process group (so a deadline can take down the whole
+tree it spawned), which also means the terminal's SIGINT reaches only `hex` —
+so `hex` forwards it: the in-flight attempt's process group is killed
+(`SIGTERM`, 2s, `SIGKILL`), what the attempt spent and produced is journaled,
+and the run is left **paused** (exit 6) rather than failed:
+
+```text
+^C
+interrupting: stopping the agent and saving progress (press again to force-quit)
+interrupted; the agent was killed and progress saved; continue with `hex resume 2026-08-02-fix-auth`
+```
+
+Nothing is left running unrecorded, and `hex resume` picks the run back up. A
+second Ctrl-C exits immediately (130) without waiting for the kill to finish.
+
 A detached run re-execs the binary in its own process group with stdio to files
 and outlives the launcher. Liveness comes from the run lock (kernel-released on
 death, unlike a pidfile) plus a heartbeat, so `hex runs` distinguishes *running*

@@ -519,6 +519,15 @@ fn run_agent(
 
     let status = match waited {
         Ok(Some(status)) => status,
+        // `wait_bounded` kills the group for both a blown deadline and an
+        // operator interrupt; the flag is what tells them apart. Salvage and the
+        // usage report are kept either way — an interrupted attempt spent real
+        // tokens, and throwing that away is what "no logs and no notice" means.
+        Ok(None) if crate::interrupt::requested() => {
+            return WorkOutcome::interrupted()
+                .with_result(salvage("the run was interrupted"))
+                .with_report(report);
+        }
         Ok(None) => {
             return WorkOutcome::timed_out("attempt exceeded its time budget (killed)")
                 .with_result(salvage("the attempt exceeded its time budget"))
@@ -553,6 +562,7 @@ fn run_agent(
             result,
             error: None,
             timed_out: false,
+            interrupted: false,
             report: report.filter(|r| !r.is_empty()),
         },
         Err(reason) => WorkOutcome::error(reason)
@@ -1036,15 +1046,23 @@ pub fn wait_bounded(
     child: &mut Child,
     deadline_ms: Option<u64>,
 ) -> std::io::Result<Option<ExitStatus>> {
-    let Some(budget) = deadline_ms else {
-        return child.wait().map(Some);
-    };
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
         }
-        if u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX) >= budget {
+        // An operator interrupt kills the attempt exactly like a blown deadline
+        // does — the agent is in its own process group, so this is the *only*
+        // thing that reaches it (see `crate::interrupt`). Checked before the
+        // deadline so an unbounded attempt is still interruptible; this loop is
+        // also why `deadline_ms: None` no longer blocks in `child.wait()`.
+        if crate::interrupt::requested() {
+            kill_group(child)?;
+            return Ok(None);
+        }
+        if let Some(budget) = deadline_ms
+            && u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX) >= budget
+        {
             // Verify termination rather than assuming kill succeeded — and take
             // the agent's whole process group, not just the process we hold.
             kill_group(child)?;

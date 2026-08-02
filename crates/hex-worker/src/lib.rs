@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use hex_proto::{Capability, ModelUsage};
 
 pub mod agent;
+pub mod interrupt;
 pub mod mock;
 
 pub use agent::{
@@ -120,6 +121,10 @@ pub struct WorkOutcome {
     /// Whether the failure was specifically a per-attempt timeout, so the
     /// runtime can record the `TimedOut` disposition rather than plain `Failed`.
     pub timed_out: bool,
+    /// Whether the attempt was killed because the operator interrupted the run
+    /// (Ctrl-C). Distinct from `timed_out`: nothing was exceeded and nothing
+    /// failed, so the runtime pauses the run rather than recording a failure.
+    pub interrupted: bool,
     /// What the agent reported about this attempt — present on **every**
     /// outcome, including a timeout. An attempt that spent tokens and then died
     /// is precisely the one whose cost you need to see.
@@ -132,6 +137,16 @@ impl WorkOutcome {
     pub fn signal(name: impl Into<String>) -> Self {
         Self {
             signal: Some(name.into()),
+            ..Self::default()
+        }
+    }
+
+    /// An attempt killed by an operator interrupt.
+    #[must_use]
+    pub fn interrupted() -> Self {
+        Self {
+            error: Some("attempt interrupted by the operator (killed)".to_owned()),
+            interrupted: true,
             ..Self::default()
         }
     }

@@ -16,6 +16,7 @@ pub mod control;
 pub mod doctor;
 pub mod driver;
 pub mod error;
+pub mod interrupt;
 pub mod journal;
 pub mod loader;
 pub mod preset;

@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+signal-hook = { workspace = true }
 hex-proto = { workspace = true }
 hex-kernel = { workspace = true }
 hex-worker = { workspace = true }
