@@ -664,21 +664,37 @@ fn reachable_from<'a>(graph: &'a Graph, start: &'a str) -> BTreeSet<&'a str> {
 ///    looking for a cycle in what is left. A cycle that survives that deletion
 ///    passes through no bounded node, so nothing stops it.
 fn check_cycles(graph: &Graph, issues: &mut Vec<Issue>) {
-    // A run-wide bound stops every cycle, so nothing more to prove.
-    if graph.budget.bounds_cycles() {
+    // The blanket visit cap stops every cycle: every cycle contains a
+    // non-terminal node (a terminal's only exit is the implicit reroute, whose
+    // target is validated non-terminal), and `schedule` checks `cycle_visits`
+    // at every non-terminal before acting.
+    if graph.budget.cycle_visits.is_some() {
         return;
     }
+    // `budget.attempts` stops only cycles that *spend* attempts. A human
+    // response and a terminal reroute cost none, so a cycle of only those
+    // nodes spins under any attempt budget — it needs a visit bound.
+    let attempts_bounded = graph.budget.attempts.is_some();
     let implicit = graph.implicit_reroutes();
-    if !has_unbounded_cycle(graph, &implicit) {
+    if !has_unbounded_cycle(graph, &implicit, attempts_bounded) {
         return;
     }
     // Name the implicit transition when it is what closes the loop: an author
     // staring at acyclic-looking edges has no other way to see it.
-    let via_unmet = !has_unbounded_cycle(graph, &[]);
-    let mut message = String::from(
-        "graph contains a cycle that no bound stops (set budget.attempts, \
-         budget.cycle_visits, or `budget: { visits: N }` on a node in the cycle)",
-    );
+    let via_unmet = !has_unbounded_cycle(graph, &[], attempts_bounded);
+    let mut message = if attempts_bounded {
+        String::from(
+            "graph contains a cycle that spends no attempts (human/terminal \
+             only), so budget.attempts cannot stop it — set budget.cycle_visits \
+             or `budget: { visits: N }` on a non-terminal node in the cycle",
+        )
+    } else {
+        String::from(
+            "graph contains a cycle that no bound stops (set budget.attempts, \
+             budget.cycle_visits, or `budget: { visits: N }` on a non-terminal \
+             node in the cycle)",
+        )
+    };
     if via_unmet && let Some(to) = &graph.accept.on_unmet {
         message.push_str(&format!(
             " — the cycle is closed by `accept.on_unmet: {to}`, which sends a success \
@@ -689,20 +705,33 @@ fn check_cycles(graph: &Graph, issues: &mut Vec<Issue>) {
 }
 
 /// DFS back-edge detection over the graph's transitions (`edges` plus `extra`),
-/// ignoring nodes whose own `budget.visits` already bounds every cycle through
-/// them. A back edge found among what remains is an unbounded cycle.
-fn has_unbounded_cycle(graph: &Graph, extra: &[(&str, &str)]) -> bool {
+/// ignoring nodes something already bounds every cycle through. A back edge
+/// found among what remains is an unbounded cycle.
+///
+/// A node breaks a cycle when its own `budget.visits` is enforced there, or —
+/// with `attempts_bounded` — when entering it spends an attempt. Two former
+/// holes (TODO round 3) live in that sentence: a **terminal's** `visits` is
+/// *not* enforced (`schedule` settles terminals before any budget check, so a
+/// reroute past it spins forever), and a `human` node spends **no attempt**
+/// (a human-only cycle runs free under any attempt budget).
+fn has_unbounded_cycle(graph: &Graph, extra: &[(&str, &str)], attempts_bounded: bool) -> bool {
     #[derive(Clone, Copy, PartialEq)]
     enum Mark {
         Open,
         Done,
     }
-    fn bounded(graph: &Graph, id: &str) -> bool {
-        graph.node(id).is_some_and(|n| n.max_visits.is_some())
+    fn breaks_cycle(graph: &Graph, id: &str, attempts_bounded: bool) -> bool {
+        graph.node(id).is_some_and(|n| {
+            let kind = n.spec.kind();
+            let own_bound = n.max_visits.is_some() && kind != NodeKind::Terminal;
+            let spends_attempt = matches!(kind, NodeKind::Agent | NodeKind::Command);
+            own_bound || (attempts_bounded && spends_attempt)
+        })
     }
     fn visit<'a>(
         graph: &'a Graph,
         extra: &[(&'a str, &'a str)],
+        attempts_bounded: bool,
         id: &'a str,
         marks: &mut std::collections::BTreeMap<&'a str, Mark>,
     ) -> bool {
@@ -719,14 +748,14 @@ fn has_unbounded_cycle(graph: &Graph, extra: &[(&str, &str)]) -> bool {
                     .map(|(_, to)| *to),
             );
         for to in targets {
-            if bounded(graph, to) {
-                continue; // any cycle through `to` is bounded by its own budget
+            if breaks_cycle(graph, to, attempts_bounded) {
+                continue; // any cycle through `to` is stopped at `to`
             }
             match marks.get(to) {
                 Some(Mark::Open) => return true,
                 Some(Mark::Done) => {}
                 None => {
-                    if visit(graph, extra, to, marks) {
+                    if visit(graph, extra, attempts_bounded, to, marks) {
                         return true;
                     }
                 }
@@ -738,9 +767,9 @@ fn has_unbounded_cycle(graph: &Graph, extra: &[(&str, &str)]) -> bool {
 
     let mut marks = std::collections::BTreeMap::new();
     graph.nodes.keys().any(|id| {
-        !bounded(graph, id)
+        !breaks_cycle(graph, id, attempts_bounded)
             && !marks.contains_key(id.as_str())
-            && visit(graph, extra, id, &mut marks)
+            && visit(graph, extra, attempts_bounded, id, &mut marks)
     })
 }
 
@@ -833,6 +862,68 @@ mod tests {
     fn a_per_node_visit_bound_bounds_its_cycle() {
         let g = unmet_loop_graph(Budget::default(), Some(3));
         assert!(validate(&g).is_ok(), "{:?}", validate(&g));
+    }
+
+    /// A **terminal's** `budget.visits` is never enforced — `schedule` settles
+    /// terminals before any budget check — so it must not count as a cycle
+    /// breaker. This graph passed validation and then rerouted forever (open
+    /// bug from review round 3).
+    #[test]
+    fn a_terminal_visit_bound_does_not_bound_a_reroute_cycle() {
+        let g = Graph::builder("t", "implement")
+            .agent("implement", "w", "p", &["ready", "blocked"])
+            .terminal("done", Disposition::Succeeded)
+            .edge("implement", "ready", "done")
+            .edge("implement", "blocked", "done")
+            .require("implement", "ready")
+            .on_unmet("implement")
+            .max_visits("done", 3)
+            .build();
+        let issues = validate(&g).unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.code == "E-unbounded-cycle"),
+            "{issues:?}"
+        );
+    }
+
+    /// A human response spends no attempt, so `budget.attempts` cannot stop a
+    /// human-only cycle — with `attempts: 2` this spun forever while validation
+    /// passed (open bug from review round 3). A visit bound on a node in the
+    /// cycle is the fix, and must satisfy the validator.
+    #[test]
+    fn an_attempt_budget_does_not_bound_a_human_only_cycle() {
+        let human_loop = |visits: Option<u32>| {
+            let mut b = Graph::builder("t", "ask")
+                .human("ask", "q1")
+                .human("confirm", "q2")
+                .terminal("done", Disposition::Succeeded)
+                .edge("ask", "answered", "confirm")
+                .edge("confirm", "answered", "ask")
+                .budget(Budget {
+                    attempts: Some(2),
+                    ..Budget::default()
+                });
+            if let Some(v) = visits {
+                b = b.max_visits("ask", v);
+            }
+            b.build()
+        };
+        let issues = validate(&human_loop(None)).unwrap_err();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.code == "E-unbounded-cycle" && i.message.contains("spends no attempts")),
+            "{issues:?}"
+        );
+        let bounded = human_loop(Some(3));
+        // Only the cycle finding may remain absent; other validators (e.g. the
+        // human single-edge rule) are not under test here.
+        if let Err(issues) = validate(&bounded) {
+            assert!(
+                !issues.iter().any(|i| i.code == "E-unbounded-cycle"),
+                "{issues:?}"
+            );
+        }
     }
 
     /// An `accept.require` that can never be unmet adds no implicit transition, so

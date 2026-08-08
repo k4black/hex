@@ -244,14 +244,6 @@ pub struct Budget {
 /// knob — declare `budget.attempt` to override.
 pub const DEFAULT_ATTEMPT_ELAPSED_MS: u64 = 30 * 60 * 1000;
 
-impl Budget {
-    /// Whether the budget bounds cycles at all (attempts or visit cap set).
-    #[must_use]
-    pub fn bounds_cycles(&self) -> bool {
-        self.attempts.is_some() || self.cycle_visits.is_some()
-    }
-}
-
 /// The run's acceptance contract: the evidence a success terminal requires, and
 /// optionally where to go when it is missing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -442,6 +434,18 @@ impl Builder {
     #[must_use]
     pub fn terminal(mut self, id: &str, disposition: Disposition) -> Self {
         self.insert(id, NodeSpec::Terminal { disposition });
+        self
+    }
+
+    /// Add a human node.
+    #[must_use]
+    pub fn human(mut self, id: &str, prompt: &str) -> Self {
+        self.insert(
+            id,
+            NodeSpec::Human {
+                prompt: prompt.to_owned(),
+            },
+        );
         self
     }
 

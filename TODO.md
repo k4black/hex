@@ -354,28 +354,25 @@ Phase (b) of the agreed sequence, implemented as specified.
 
 ### OPEN BUGS — found by review round 3, introduced by round 2's cycle fix
 
-Both are unbounded-loop holes in the `accept.on_unmet` cycle validation added on
-2026-07-31, i.e. the fix for one unbounded-cycle bug opened two more. Neither is
-fixed. **Fix before trusting `on_unmet` or `human` nodes in an unattended run.**
+Both were unbounded-loop holes in the `accept.on_unmet` cycle validation added
+on 2026-07-31. **Both fixed 2026-08-08** in `check_cycles`: a node breaks a
+cycle only when its bound is actually enforced there.
 
-- [ ] **A terminal's `budget: { visits: N }` is honoured by the validator but never
-      enforced at runtime.** `check_cycles` (`hex-kernel/src/validate.rs:648`)
-      treats *any* node carrying `max_visits` as breaking the cycle, but
-      `schedule` (`hex-kernel/src/lib.rs:380`) settles terminal nodes **before** it
-      checks visit budgets. So `implement → done → implement` (via `on_unmet`) with
-      `budget.visits` on `done` alone passes validation and then reroutes forever.
-      Fix: either check a terminal's visit bound before emitting `RerouteUnmet`, or
-      stop counting terminal bounds as cycle breakers during validation. The
-      second is probably right — a terminal spends no attempt, so bounding it is a
-      confusing place to express a loop limit.
-- [ ] **An attempt budget does not bound a human-only cycle.** `Graph::implicit_reroutes`
-      (`graph.rs:236`) and `check_cycles` (`validate.rs:615`) both assume
-      `budget.attempts` stops every cycle, but a human response creates **no
-      attempt** — so `human A → human B → human A` costs one attempt to enter and
-      then spins forever with `attempts: 2` while validation passes. Fix: treat an
-      attempt budget as bounding only cycles that contain an `agent` or `command`
-      node; a human-only cycle must require a visit bound. (Only reachable now that
-      `human` nodes actually run, i.e. it arrived with the control pass.)
+- [x] **A terminal's `budget: { visits: N }` was honoured by the validator but
+      never enforced at runtime** (`schedule` settles terminals before budget
+      checks). Fixed the recommended way: a terminal's `max_visits` no longer
+      counts as a cycle breaker, so `implement → done → implement` (via
+      `on_unmet`) bounded only on `done` is now `E-unbounded-cycle` instead of
+      an infinite reroute. Pinned by
+      `a_terminal_visit_bound_does_not_bound_a_reroute_cycle` (verified to fail
+      pre-fix).
+- [x] **An attempt budget did not bound a human-only cycle** (a human response
+      spends no attempt). Fixed: `budget.attempts` now breaks only cycles
+      containing an `agent`/`command` node; a human-only cycle needs a visit
+      bound, and the error message says so. Pinned by
+      `an_attempt_budget_does_not_bound_a_human_only_cycle` (verified to fail
+      pre-fix). `Budget::bounds_cycles` (one caller, now-wrong semantics) was
+      deleted.
 
 ### Deliberately deferred by the quality pass (real, but need a decision)
 

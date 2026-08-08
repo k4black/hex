@@ -309,11 +309,14 @@ sign-off, confirmation.
    concurrent evidence reads like sequential evidence and the journal stays
    deterministic. Infra failure in any step still fails the *attempt* rather than
    routing `failed` (gotcha 11).
-17. **`accept.on_unmet` routes instead of dead-ending** — and has **two open
-   unbounded-loop bugs** (see TODO.md "OPEN BUGS"): a terminal's `budget.visits`
-   satisfies cycle validation but `schedule` settles terminals before checking
-   visit budgets, and `budget.attempts` cannot bound a human-only cycle because a
-   human response spends no attempt. Do not rely on `on_unmet` bounding itself yet. Reaching a success
+17. **`accept.on_unmet` routes instead of dead-ending.** Its two former
+   unbounded-loop holes were closed 2026-08-08 in `check_cycles`: a node now
+   breaks a cycle only when its bound is *enforced* there — a terminal's
+   `budget.visits` no longer counts (`schedule` settles terminals before budget
+   checks, so it was never enforced), and `budget.attempts` breaks only cycles
+   containing an `agent`/`command` node (a human response spends no attempt).
+   Both graphs that used to spin forever are now `E-unbounded-cycle` at compile
+   time, with the human-only case named in the message. Reaching a success
    terminal with missing evidence used to end the run `failed`, which spent the
    whole budget and fixed nothing. Now the kernel emits `Effect::RerouteUnmet` and
    the runtime journals `EventBody::AcceptanceUnmet` — its own event, *not* a
