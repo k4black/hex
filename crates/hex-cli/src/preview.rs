@@ -84,6 +84,40 @@ impl LivePreview {
     fn plain(line: &str) {
         let _ = writeln!(std::io::stderr(), "  {line}");
     }
+
+    /// Print an out-of-band line (not a journal event) above the footer, or
+    /// plainly when none is live. The interrupt banner comes through here: a
+    /// raw stderr write from the signal thread would interleave with the
+    /// render thread's cursor movements and desync the inline viewport's
+    /// position bookkeeping for the rest of the run.
+    pub fn notice(&self, line: &str) {
+        let guard = self.active.lock().expect("preview lock");
+        if let Some(a) = guard.as_ref()
+            && a.tx.send(Cmd::Line(line.to_owned())).is_ok()
+        {
+            return;
+        }
+        drop(guard);
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+}
+
+/// The preview shared between the runtime (which owns its sink as a `Box`) and
+/// the interrupt handler (which must print through the same footer channel):
+/// both hold one `Arc`, and this newtype gives the `Box` side its
+/// [`ProgressSink`].
+pub struct SharedPreview(pub std::sync::Arc<LivePreview>);
+
+impl ProgressSink for SharedPreview {
+    fn event(&self, e: &Event) {
+        self.0.event(e);
+    }
+    fn attempt_started(&self, v: &AttemptView) {
+        self.0.attempt_started(v);
+    }
+    fn attempt_finished(&self) {
+        self.0.attempt_finished();
+    }
 }
 
 impl ProgressSink for LivePreview {

@@ -10,7 +10,7 @@
 //! `retry`/`replay`. The mid-run verbs are all thin writes to the run's control
 //! inbox — the same transport a human and an agent use.
 
-use std::io::{IsTerminal, Write as _};
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -353,16 +353,18 @@ fn open_runtime_streaming(json: bool, no_preview: bool) -> Result<Runtime, Strin
     // so the tty's SIGINT never reaches it and it would otherwise keep working
     // (and spending) unlogged and unnoticed. Installed for foreground `run` and
     // `resume` only — the two commands that own a live agent.
-    hex_runtime::interrupt::install(|| {
+    let sink = std::sync::Arc::new(preview::LivePreview::new(preview));
+    let banner = std::sync::Arc::clone(&sink);
+    hex_runtime::interrupt::install(move || {
         // Tearing down a process group takes up to the SIGTERM grace period, so
-        // say so; a silent pause reads as a hang. The live footer may repaint
-        // over this, which is why `print_outcome` reports it again at the end.
-        let _ = writeln!(
-            std::io::stderr(),
-            "\ninterrupting: stopping the agent and saving progress (press again to force-quit)"
+        // say so; a silent pause reads as a hang. Through the preview, not a raw
+        // stderr write: while the footer is live, its render thread owns the
+        // terminal, and an interleaved write desyncs the inline viewport.
+        banner.notice(
+            "interrupting: stopping the agent and saving progress (press again to force-quit)",
         );
     });
-    Ok(open_runtime()?.with_progress(Box::new(preview::LivePreview::new(preview))))
+    Ok(open_runtime()?.with_progress(Box::new(preview::SharedPreview(sink))))
 }
 
 /// A one-line rendering of an event for progress/watch output.
@@ -947,8 +949,9 @@ fn print_outcome(
             // Distinguish the two ways a run pauses: an operator `pause` stopped
             // it cleanly at a boundary, an interrupt killed a live agent. Both
             // resume the same way, but only one of them left a corpse.
+            // "any live agent": an interrupt during a human wait kills nothing.
             let how = if hex_runtime::interrupt::requested() {
-                "interrupted; the agent was killed and progress saved"
+                "interrupted; any live agent was killed and progress saved"
             } else {
                 "paused"
             };
@@ -1377,7 +1380,11 @@ fn cmd_status(run_id: &str, usage: bool, json: bool, ui: ui::Ui) -> Result<ExitC
         if let Some(c) = &s.current {
             line.push(format!("at {c}"));
         }
-        line.push(format!("{} attempts", s.attempts));
+        line.push(format!(
+            "{} attempt{}",
+            s.attempts,
+            if s.attempts == 1 { "" } else { "s" }
+        ));
         outln!("{}", line.join(" · "));
 
         // What is happening right now, when something is.

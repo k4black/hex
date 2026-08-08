@@ -211,10 +211,11 @@ impl<'a> Session<'a> {
             if self.state.is_finished() {
                 break;
             }
-            // Interrupted between attempts (or while blocked on a human node):
-            // there is no attempt to close, so just pause here. Checked at the
-            // boundary for the same reason control is — anywhere else would
-            // orphan the in-flight attempt.
+            // Interrupted between attempts: there is no attempt to close, so
+            // just pause here. Checked at the boundary for the same reason
+            // control is — anywhere else would orphan the in-flight attempt.
+            // (A human wait runs its own copy of this check inside
+            // `request_human`, since it blocks without reaching a boundary.)
             if hex_worker::interrupt::requested() && self.state.status != Status::Paused {
                 self.record(None, None, Actor::runtime(), EventBody::RunPaused)?;
                 return Ok(None);
@@ -472,6 +473,15 @@ impl<'a> Session<'a> {
                 if answered || self.state.is_finished() || self.state.status == Status::Paused {
                     return Ok(());
                 }
+            }
+            // Ctrl-C while blocked here pauses the run, exactly like `drive()`'s
+            // boundary check. This wait is the one blocking path that never
+            // reaches `wait_bounded` (a human node runs no process), so without
+            // this the request sat unnoticed until *after* the human answered —
+            // and the stale flag then paused the run, or killed the next
+            // attempt, for no operator-visible reason.
+            if hex_worker::interrupt::requested() {
+                return self.record(None, None, Actor::runtime(), EventBody::RunPaused);
             }
             if let Some(limit) = deadline_ms
                 && u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX) >= limit

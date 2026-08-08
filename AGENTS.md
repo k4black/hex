@@ -634,7 +634,18 @@ sign-off, confirmation.
    attempt would be uninterruptible. Pinned by
    `hex-runtime/tests/interrupt.rs`, in its **own** test binary because the flag
    is process-global — setting it in a shared file would kill unrelated tests'
-   subprocesses.
+   subprocesses (one flag-setting test per binary; the human-wait case below is
+   `interrupt_human.rs` for the same reason).
+   Two gaps a review closed after the first ship: (a) the **human-node wait**
+   (`request_human`) is the one blocking path that never reaches `wait_bounded`,
+   so it polls the flag itself and journals `RunPaused` directly (no
+   `AttemptInterrupted` — a human node opens no attempt); unfixed, the stale
+   flag survived the wait and paused the run — or killed the next attempt —
+   *after* the human answered. (b) The CLI's interrupt banner routes through
+   `LivePreview::notice` (the footer's own channel), never a raw stderr write
+   from the signal thread: ratatui's inline viewport tracks the cursor from its
+   own writes, so an interleaved foreign write desyncs the footer for the rest
+   of the run.
    Related, and still true: `hex cancel` cannot stop an in-flight attempt (the
    inbox drains at attempt boundaries — gotcha 36), and cancelling a *crashed*
    run used to corrupt it, since `RunFinished` over an open attempt is rejected
