@@ -1,0 +1,139 @@
+version: 1
+name: checklist
+description: "Work through a checklist file item by item — critique loop per item, then one holistic review of the whole change"
+example: "tasks/todo.md: migrate the config loader to layered YAML"
+
+# The decomposition workflow: a driving agent (or a human) splits a big job into
+# a Markdown checklist of `- [ ]` items, then hands the file to this graph. Each
+# round the implementer does exactly one item and a different model reviews it;
+# when every item is checked, a *fresh* reviewer judges the whole change as one —
+# per-item approval does not imply the pieces cohere.
+#
+# The checklist file is the loop's memory (the autoresearch pattern): progress
+# lives on disk as `[x]` marks, so a crash, a pause, or a `hex resume` picks up
+# exactly where the file says — and holistic feedback is folded back in as *new
+# checklist items*, so "was it addressed" is readable state, not model recall.
+#
+# Invoke with the checklist path first in the prompt:
+#   hex run checklist -p "tasks/todo.md: <one-line goal of the whole job>"
+#
+# Gate-free so it runs anywhere. To gate each item on your tests, declare
+# `checks: { test: [...] }`, copy this graph (`hex graph checklist --format
+# source`), and add a `command: { check: test }` node between implement and
+# review.
+
+defaults:
+  role: implementer
+  context: fresh
+  budget:
+    # Each item costs at least two attempts (implement + review); this allows
+    # roughly 8-10 items with a few fix rounds. Raise it for longer lists.
+    attempts: 30
+    elapsed: 90m
+
+entry: implement
+
+nodes:
+  implement:
+    agent:
+      # Revisited once per item, so it continues its own agent session: the
+      # implementer keeps the codebase and the job in its head across items
+      # instead of re-deriving them each round. Needs a worker that can resume
+      # (codex and claude can); with a `kind: command` implementer set
+      # `context: fresh` here — the file carries the loop state regardless.
+      context: continue
+      prompt: |
+        You are working through a checklist, one item per round. The task below
+        names the checklist file — a Markdown file with `- [ ]` items.
+
+        Task: {{prompt}}
+
+        Per-item reviewer's last message:
+        {{review.result}}
+
+        Holistic reviewer's verdict on the finished change (only set near the
+        end):
+        {{final_review.result}}
+
+        Follow this protocol exactly, first match wins:
+        1. If the per-item reviewer's message above requests changes, fix the
+           item you just implemented, then run:  hex emit item_done
+        2. If the holistic reviewer's verdict above requests changes that no
+           checklist item covers yet, append each such point to the checklist
+           file as a new `- [ ]` item, then continue with step 3.
+        3. If the checklist has an unchecked item: take the FIRST one, implement
+           only that item — the smallest change that satisfies it — mark it
+           `[x]` in the checklist file, then run:  hex emit item_done
+        4. Every item is checked: run:  hex emit all_done
+      may_propose: [item_done, all_done]
+    on:
+      item_done: review
+      all_done: final_review
+
+  review:
+    agent:
+      role: reviewer
+      # Inherits `context: fresh` deliberately: every item gets an independent
+      # pair of eyes, not a continuation of the session that judged the last one.
+      prompt: |
+        Review the checklist item that was just implemented.
+
+        The overall task (the file it names is the checklist):
+        {{prompt}}
+
+        The implementer's report on what it just did:
+        {{implement.result}}
+
+        Run `git diff` (and `git status`) to see the change, and read the
+        checklist file to see which item was just checked. Judge only that
+        item's change — review only, do not edit files. If it is acceptable,
+        run:
+          hex emit approved
+        Otherwise put concrete, actionable feedback in your final message (it
+        is handed back to the implementer) and run:
+          hex emit changes_requested
+      may_propose: [approved, changes_requested]
+    # Bounds the per-item cycle: one visit per item plus fix rounds. This is
+    # the knob to raise for a long checklist, together with budget.attempts.
+    budget:
+      visits: 20
+    on:
+      approved: implement
+      changes_requested: implement
+
+  final_review:
+    agent:
+      role: reviewer
+      # Fresh, and a different node from `review`, on purpose: this reviewer has
+      # seen none of the per-item arguments, so it judges the sum — coherence
+      # across items, nothing skipped, no seams between rounds.
+      prompt: |
+        Every checklist item has been implemented and item-reviewed. Review the
+        WHOLE change as one piece of work.
+
+        The overall task (the file it names is the checklist):
+        {{prompt}}
+
+        Read the checklist file, then run `git diff` (and `git status`) over
+        the full change. Judge coherence across items, completeness against the
+        checklist, and overall quality — review only, do not edit files. If the
+        complete change is acceptable, run:
+          hex emit approved
+        Otherwise put concrete, actionable feedback in your final message (the
+        implementer turns it into new checklist items) and run:
+          hex emit changes_requested
+      may_propose: [approved, changes_requested]
+    budget:
+      visits: 3
+    on:
+      approved: done
+      changes_requested: implement
+
+  done:
+    terminal: succeeded
+
+accept:
+  require: [final_review.approved]
+  # If `done` is somehow reached without a holistic approval on record, go back
+  # and earn one rather than failing the run outright.
+  on_unmet: implement

@@ -13,6 +13,7 @@ use crate::error::{HexError, Result};
 
 /// The built-in workflow library, embedded so a fresh checkout can run them.
 const CRITIQUE_LOOP: &str = include_str!("presets/critique-loop.yaml");
+const CHECKLIST: &str = include_str!("presets/checklist.yaml");
 const IMPLEMENT_UNTIL_GREEN: &str = include_str!("presets/implement-until-green.yaml");
 const TDD: &str = include_str!("presets/tdd.yaml");
 const PLAN_BUILD_REVIEW: &str = include_str!("presets/plan-build-review.yaml");
@@ -32,6 +33,10 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "critique-loop",
         source: CRITIQUE_LOOP,
+    },
+    Builtin {
+        name: "checklist",
+        source: CHECKLIST,
     },
     Builtin {
         name: "implement-until-green",

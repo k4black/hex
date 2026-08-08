@@ -61,6 +61,7 @@ lookup in the agent's own shell.
 | Preset | Loop | Needs `checks.test` |
 |---|---|---|
 | `critique-loop` | implement → review, until approved | no |
+| `checklist` | one `- [ ]` item per round, critique loop each, then one holistic review | no |
 | `plan-build-review` | plan → implement → review | no |
 | `review` | one reviewer over the current diff | no |
 | `implement-until-green` | implement → test, until green | **yes** |
@@ -75,6 +76,22 @@ already argued about). `autoresearch` is all-fresh because its continuity is on 
 useful review exits 1.
 
 Fork any of them: `hex graph <name> --format source > .hex/graphs/<name>.yaml`.
+
+**Splitting a big job — the `checklist` workflow.** When a task is too big for one
+critique-loop pass, decompose it yourself and let hex grind through the pieces:
+
+1. Write the plan as a Markdown checklist file (`- [ ]` items, one bounded change each,
+   ordered so earlier items never depend on later ones).
+2. `hex run checklist -p "<file>: <one-line goal>" --detach` — the path goes **first** in
+   the prompt; the graph's agents read and edit the file themselves.
+3. `hex wait` (or poll `hex status`). Progress is the `[x]` marks in the file, so you can
+   watch it, and a crash or `hex resume` continues exactly where the file says.
+4. Each item is implemented then reviewed by a different model; after the last item a
+   **fresh** reviewer judges the whole change. Its objections come back as new `- [ ]`
+   items — check the file afterwards for scope the reviewer added.
+
+Budgets fit ~8-10 items (`attempts: 30`, `review` visits 20). For a longer list, fork the
+preset and raise both, or split into two runs.
 
 ## 3. Give it the task
 

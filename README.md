@@ -330,12 +330,13 @@ model reviews than wrote the code):
 | Preset | Loop | Needs a check? |
 |---|---|---|
 | `critique-loop` | implement → review, until approved (the flagship) | no |
+| `checklist` | work a `- [ ]` checklist file item by item, critique loop per item, then one holistic review of the whole change | no |
 | `plan-build-review` | plan → implement → review | no |
 | `review` | reviewer over the current `git diff`, no implementer | no |
 | `implement-until-green` | implement → test (the Ralph loop) | **`checks.test`** |
 | `tdd` | write-failing-test → prove red → implement → prove green | **`checks.test`** |
 
-The first three are gate-free, so they run in any repo with no setup — the
+All but the last two are gate-free, so they run in any repo with no setup — the
 reviewer is the backpressure. The last two exist *to* run your tests, so they
 refuse to start until you declare `checks.test`. A preset is a starting point:
 copy it out and edit it to change the topology, or just redefine a role in your
@@ -354,6 +355,22 @@ hex run tdd -p "add a --json flag" --name json-flag   # names the run
 
 Run ids read `yyyy-MM-dd-<workflow>-<short-uuid>`, or `yyyy-MM-dd-<name>` when
 you pass `--name`.
+
+**Splitting a big job.** The `checklist` preset is the decomposition workflow:
+you (or a driving agent) write the plan as a Markdown checklist, then hand hex
+the file — one item is implemented and reviewed per round, progress is the
+`[x]` marks in the file itself (so a crash or `hex resume` picks up exactly
+where the file says), and a fresh reviewer judges the finished change as a
+whole. Holistic feedback becomes new checklist items, not a vague redo.
+
+```bash
+cat > tasks/todo.md <<'EOF'
+- [ ] extract the config loader into its own module
+- [ ] add layered merge (project over user over built-in)
+- [ ] cover the merge with tests
+EOF
+hex run checklist -p "tasks/todo.md: refactor config loading to layered YAML"
+```
 
 **Node-to-node handoff.** An agent's final message is captured as its result and
 a downstream node can reference it as `{{node.result}}` (e.g. the planner's plan

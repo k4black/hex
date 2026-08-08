@@ -508,12 +508,17 @@ sign-off, confirmation.
    which handed one out. Attach/drain mechanics are gotcha 40.
 38. **Preset session policy: the implementer continues, the reviewer stays fresh.**
    `context: continue` is declared on the node a loop revisits (`implement` in
-   `critique-loop`/`implement-until-green`/`plan-build-review`/`tdd`, plus `tdd`'s
+   `critique-loop`/`implement-until-green`/`plan-build-review`/`tdd`/`checklist`,
+   plus `tdd`'s
    `spec`, which `red` sends back), and deliberately *not* on `review` — a reviewer
    continuing its own session carries its earlier verdict into the next round, which
    is how a critic talks itself into approving what it already argued about.
    `autoresearch` stays all-`fresh` because its continuity is on disk
-   (`.hex/research-notes.md`). Consequence to remember before rebinding a role:
+   (`.hex/research-notes.md`); `checklist` combines both patterns — a continuing
+   implementer, but the loop state itself is the `[x]` marks in the checklist
+   file, and its `final_review` is a *separate fresh node* from the per-item
+   `review`, so the whole-change verdict comes from eyes that saw none of the
+   per-item arguments. Consequence to remember before rebinding a role:
    `check_workers` **refuses at compile time** a `continue` node whose worker lacks
    `Capability::SessionResume` (gotcha 33), so pointing `implementer` at a
    `kind: command` worker makes these presets refuse to start until that node says
