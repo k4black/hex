@@ -901,6 +901,25 @@ Phase-2 kernel; none change kernel semantics.
       **Remaining:** aligned tables elsewhere, TTY-aware color with `--no-color`
       (+ `NO_COLOR`), `--quiet`/`--verbose`, and human-friendly diagnostics with
       source spans.
+- [x] **`hex dash` shipped 2026-08-09** — a live, full-screen table of all runs
+      (a `top` for hex), the live counterpart of `hex runs`: same rows and
+      vocabulary, redrawn every `--interval` ms (default 1000, `≥ 1`), quitting
+      on `q`/`Esc`/`Ctrl-C`. A thin `Runtime` client reusing `hex runs`' row
+      helpers and the shared `ui::Mark` colour/charset policy; refuses a non-TTY
+      and `--json` (no machine mode — `hex runs --json` instead).
+- [ ] **Cut cross-model review cost — feed the reviewer the diff, not the whole
+      repo.** Found dogfooding `hex dash` (checklist preset, cross-model review):
+      a ~14-item run cost ≈ $40, almost all of it the codex reviewer re-reading
+      the entire repo *every* round, so cost scales with repo size × review
+      rounds. Worse, the holistic `final_review` looped — twice emitting
+      `changes_requested` on already-fixed points with stale line numbers —
+      burning attempts until a human steered/paused it. Candidates: (a) hand the
+      reviewer the change under review directly (a `git diff`/patch in the
+      prompt or a captured artifact) instead of relying on it to re-read; (b)
+      cap holistic-review visits harder and/or require it to cite current
+      line numbers; (c) let a review node scope its read to changed files. The
+      per-item commits are safe regardless, so the failure mode is cost, not
+      lost work. See memory `checklist-dogfood-cost-and-reviewer-loop`.
 - [ ] Proper ASCII graph rendering for `hex graph`: a real laid-out diagram
       (boxes + arrows, cycles visible), not today's flat node/edge list; keep
       `--format text|json|mermaid|dot` so the same IR renders to each (the

@@ -651,4 +651,19 @@ sign-off, confirmation.
    run used to corrupt it, since `RunFinished` over an open attempt is rejected
    by `lifecycle`; `cancel` now writes `AttemptInterrupted` first, as `resume`
    does.
-46. _add new gotchas here as they are discovered_
+46. **A ratatui table renders cell text literally — it does not interpret ANSI.**
+   `hex dash` (`hex-cli/src/dash.rs`) is a `Runtime` client like `hex runs`, but
+   it cannot reuse `ui::mark`'s output: that returns an ANSI-escaped `String`,
+   which ratatui would print as visible escape bytes. The shared semantics
+   travel through the `Mark` enum instead — `Mark::glyph(unicode)` and
+   `Mark::hue() -> Option<AnsiColor>` are the backend-neutral single source both
+   the ANSI renderer (`ui::mark`) and the ratatui adapter (`dash::mark_cell` +
+   `hue_to_ratatui`) derive from, so the two can never draw a different badge.
+   Bold/dim are colour too: `dash` gates *every* style on `ui.colored()`, or
+   `hex --color never dash` would still paint. Two lesser traps: the
+   `CrosstermBackend<Stdout>` type alias must not be named `Backend` (it clashes
+   with the `ratatui::backend::Backend` trait `flush` needs — alias is `Term`);
+   and in raw mode the tty sends no SIGINT, so `Ctrl-C` arrives as a
+   `KeyCode::Char('c')` + `CONTROL` key event, handled alongside `q`/`Esc`, not
+   as a signal.
+47. _add new gotchas here as they are discovered_

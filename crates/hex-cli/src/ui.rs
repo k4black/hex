@@ -96,6 +96,13 @@ impl Ui {
         self.unicode
     }
 
+    /// Whether this stream may emit colour. A backend adapter (e.g. the ratatui
+    /// `hex dash` table) needs the resolved policy, not just the raw `--color`.
+    #[must_use]
+    pub const fn colored(self) -> bool {
+        self.color
+    }
+
     /// Terminal width, when one is knowable. `None` means never truncate.
     #[must_use]
     pub const fn width(self) -> Option<usize> {
@@ -138,18 +145,16 @@ impl Ui {
         )
     }
 
-    /// A status glyph, coloured to match its meaning.
+    /// A status glyph, coloured to match its meaning. Both the glyph and the
+    /// colour come from [`Mark`] itself, so a backend adapter can derive the
+    /// same badge from the same data.
     #[must_use]
     pub fn mark(self, m: Mark) -> String {
-        let (uni, ascii, style) = match m {
-            Mark::Ok => ("✓", "+", style::OK),
-            Mark::Fail => ("✗", "x", style::FAIL),
-            Mark::Warn => ("!", "!", style::WARN),
-            Mark::Running => ("▸", ">", style::RUN),
-            Mark::Idle => ("·", ".", style::DIM),
+        let style = match m.hue() {
+            Some(c) => Style::new().fg_color(Some(anstyle::Color::Ansi(c))),
+            None => style::DIM,
         };
-        self.paint(style, if self.unicode { uni } else { ascii })
-            .to_string()
+        self.paint(style, m.glyph(self.unicode)).to_string()
     }
 }
 
@@ -244,6 +249,40 @@ pub enum Mark {
     Idle,
 }
 
+impl Mark {
+    /// The glyph for this mark in the given charset — the single source of
+    /// truth shared by [`Ui::mark`] and any backend adapter (e.g. the ratatui
+    /// `hex dash` table), so the two can never draw a different badge.
+    #[must_use]
+    pub const fn glyph(self, unicode: bool) -> &'static str {
+        match (self, unicode) {
+            (Mark::Ok, true) => "✓",
+            (Mark::Ok, false) => "+",
+            (Mark::Fail, true) => "✗",
+            (Mark::Fail, false) => "x",
+            (Mark::Warn, _) => "!",
+            (Mark::Running, true) => "▸",
+            (Mark::Running, false) => ">",
+            (Mark::Idle, true) => "·",
+            (Mark::Idle, false) => ".",
+        }
+    }
+
+    /// The mark's semantic colour as a four-bit ANSI hue, or `None` for the
+    /// hueless "dim" marks. Backend-neutral: [`Ui::mark`] renders it with
+    /// anstyle, a ratatui adapter maps it to `ratatui::style::Color`.
+    #[must_use]
+    pub const fn hue(self) -> Option<AnsiColor> {
+        match self {
+            Mark::Ok => Some(AnsiColor::Green),
+            Mark::Fail => Some(AnsiColor::Red),
+            Mark::Warn => Some(AnsiColor::Yellow),
+            Mark::Running => Some(AnsiColor::Cyan),
+            Mark::Idle => None,
+        }
+    }
+}
+
 /// The palette. Four-bit ANSI only, so it inherits the user's theme instead of
 /// fighting it, and survives ssh to anything.
 pub mod style {
@@ -255,8 +294,6 @@ pub mod style {
     pub const FAIL: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Red)));
     /// Timed out, exhausted, unreadable.
     pub const WARN: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Yellow)));
-    /// Running, live.
-    pub const RUN: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Cyan)));
     /// A routing signal — the word an edge is taken on.
     pub const SIGNAL: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Cyan)));
     /// A loop: the back edge and the bound that stops it.

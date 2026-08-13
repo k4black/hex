@@ -47,7 +47,7 @@ thiserror = "2"              # derive Display/Error on the runtime error type
 anstyle = "1"
 anstyle-query = "1"          # NO_COLOR / CLICOLOR / CLICOLOR_FORCE / TERM=dumb
 unicode-width = "0.2"        # column width, not char count: `…` and `≥` are not 1 cell everywhere
-crossterm = { version = "0.29", default-features = false }   # terminal::size only
+crossterm = { version = "0.29", default-features = false, features = ["events"] }   # terminal::size + key input for `hex dash`
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 criterion = "0.7"
 # Dev-only: test the `hex` binary end-to-end.

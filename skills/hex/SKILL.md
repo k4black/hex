@@ -114,6 +114,7 @@ and cannot go stale mid-run.
 | `hex run <graph> --detach` | no | starts it, prints the run id |
 | `hex wait <run>` | yes | exits with the disposition code |
 | `hex status <run>` | no | current node, in-flight attempt + elapsed, queued steer, spend |
+| `hex dash [--interval MS]` | until you quit | live full-screen table of all runs (`top` for hex); `q`/`Esc`/`Ctrl-C` quits; needs a TTY |
 | `hex logs <run> [--node N] [--tail K] [--full] [--follow]` | `--follow` | what the agent said |
 | `hex watch <run> [--follow]` | `--follow` | the event stream |
 | `hex steer <run> "text"` | no | guidance for the **next** attempt |

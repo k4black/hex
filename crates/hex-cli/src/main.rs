@@ -21,6 +21,7 @@ use hex_runtime::{
 #[macro_use]
 mod out;
 mod agent_stream;
+mod dash;
 mod graph_export;
 mod graph_view;
 mod preview;
@@ -46,7 +47,7 @@ Examples:
   hex respond <run-id> \"approved\"      answer a waiting human node
   hex resume <run-id>                  continue a run after a pause or crash
 
-Add --json to any command for machine-readable output on stdout.
+Add --json to any command except `dash` for machine-readable output on stdout.
 Docs: https://github.com/k4black/hex";
 
 // The subcommand is optional so bare `hex` prints help to stderr (exit 2)
@@ -64,7 +65,11 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Emit machine-readable JSON on stdout instead of human-readable text
+    /// Emit machine-readable JSON on stdout, for every verb but `dash`, instead
+    /// of human-readable text.
+    ///
+    /// `dash` is a full-screen TUI with no machine mode; a machine consumer uses
+    /// `hex runs --json` for that view.
     #[arg(long, global = true)]
     json: bool,
 
@@ -145,6 +150,17 @@ enum Command {
     },
     /// List runs (newest activity first)
     Runs,
+    /// Live full-screen view of all runs
+    Dash {
+        /// Redraw interval in milliseconds (must be ≥ 1)
+        #[arg(
+            long,
+            value_name = "MS",
+            default_value_t = 1000,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        interval: u64,
+    },
     /// Show a run's projected status
     Status {
         /// Run id, as printed by `hex run`
@@ -292,6 +308,16 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         ),
         Command::Resume { run_id } => cmd_resume(&run_id, json, no_preview),
         Command::Runs => cmd_runs(json, ui::Ui::stdout(cli.color, json)),
+        Command::Dash { interval } => {
+            // `dash` is a TUI with no machine mode. Refuse `--json` before
+            // opening the runtime or the terminal, and point a machine consumer
+            // at the verb that does have one.
+            if json {
+                eprintln!("hex: dash has no machine mode; use `hex runs --json`");
+                return Ok(ExitCode::from(2));
+            }
+            dash::run(&open_runtime()?, interval, cli.color)
+        }
         Command::Status { run_id, usage } => {
             cmd_status(&run_id, usage, json, ui::Ui::stdout(cli.color, json))
         }
@@ -1193,7 +1219,7 @@ fn spend_line(t: &hex_runtime::Totals, ui: ui::Ui) -> String {
 }
 
 /// The glyph for a run's state — the column you scan before reading anything.
-fn mark_for(r: &hex_runtime::RunSummary) -> ui::Mark {
+pub(crate) fn mark_for(r: &hex_runtime::RunSummary) -> ui::Mark {
     use hex_runtime::{Disposition as D, Status};
     match (&r.status, r.disposition) {
         (None, _) => ui::Mark::Warn,
@@ -1210,7 +1236,7 @@ fn mark_for(r: &hex_runtime::RunSummary) -> ui::Mark {
 ///
 /// Left uncoloured on purpose: the mark in the first column already carries the
 /// colour, and colour must never be the only thing saying what happened.
-fn result_word(r: &hex_runtime::RunSummary) -> String {
+pub(crate) fn result_word(r: &hex_runtime::RunSummary) -> String {
     use hex_runtime::{Disposition as D, Status};
     match (&r.status, r.disposition) {
         (None, _) => "unreadable".to_owned(),
@@ -1226,7 +1252,7 @@ fn result_word(r: &hex_runtime::RunSummary) -> String {
 }
 
 /// A compact "how long ago" for a listing (`3m`, `2h`, `4d`).
-fn age(at_ms: u64) -> String {
+pub(crate) fn age(at_ms: u64) -> String {
     if at_ms == 0 {
         return "-".to_owned();
     }

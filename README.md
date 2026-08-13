@@ -383,7 +383,9 @@ the runtime routes a synthesized `done`. Nodes with more than one outcome still
 ## CLI surface
 
 The same verbs work from the CLI, MCP, and dashboard; all support `--json` /
-NDJSON, stable exit codes, and `capabilities` introspection.
+NDJSON, stable exit codes, and `capabilities` introspection. The one exception
+is `hex dash`, a full-screen TUI that has no machine mode — a machine consumer
+uses `hex runs --json` instead.
 
 ```text
 hex init                 scaffold `.hex/` + a starter config in this repo
@@ -398,6 +400,8 @@ hex run [<graph>]        start a NEW run (no graph → list what's runnable)
                          [--no-preview] disable the live in-flight pane
 hex resume <run>         continue the SAME run (after a pause or a crash)
 hex runs                 list runs, newest activity first
+hex dash                 live full-screen view of all runs (`top` for hex)
+                         [--interval MS] redraw cadence, default 1000
 hex status <run>         projected run status + what the run spent
 hex wait <run>           block until it finishes; exit with its disposition
 hex watch <run>          print the event stream ([--follow] until the run ends)
@@ -555,6 +559,11 @@ no count has not been reached. The strip rides the border rather than taking a
 line, and elides from the front on a narrow terminal, keeping the active node.
 The preview auto-disables for a non-TTY, `--json`, or `--no-preview`, falling
 back to plain event-line streaming.
+
+`hex dash` is the live counterpart of `hex runs`: a full-screen table of every
+run — same rows, same vocabulary — redrawn every `--interval` milliseconds
+(default 1000) until you quit with `q`, `Esc`, or `Ctrl-C`. Not-finished runs
+sort to the top. It needs a terminal; a machine consumer uses `hex runs --json`.
 
 ### Checking in on a live run, and steering it
 

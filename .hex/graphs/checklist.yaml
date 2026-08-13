@@ -1,0 +1,144 @@
+version: 1
+name: checklist
+description: "Work a checklist item by item on a worktree branch — commit + critique each, gate, then holistic review"
+example: "tasks/hex-dash.md: implement hex dash"
+
+# This project's gated fork of the built-in `checklist` preset, for delegating a
+# big job to an isolated worktree (`hex run checklist --worktree <base>`):
+#   - the implementer does ONE item per round and COMMITS it on the run's branch,
+#     so the branch is always mergeable and survives a reclaimed worktree slot;
+#   - a different model reviews that commit;
+#   - when every item is checked, hex's real gate (fmt + clippy + full test
+#     suite) runs once, and only a green tree reaches the holistic reviewer,
+#     which judges the whole branch as one change.
+#
+# Base branch is named in the final-review diff below; keep it in sync with the
+# `--worktree <base>` you launch with (here: feat/hex-dash).
+
+defaults:
+  role: implementer
+  context: fresh
+  budget:
+    attempts: 40
+    elapsed: 180m
+    attempt: 25m
+
+entry: implement
+
+nodes:
+  implement:
+    agent:
+      # Continues its own session: it keeps the codebase and the job in its head
+      # across items instead of re-deriving them. codex/claude can resume.
+      context: continue
+      prompt: |
+        You are working through a checklist on a dedicated worktree branch, one
+        item per round. The task below names the checklist file (a Markdown file
+        with `- [ ]` items). Read it and AGENTS.md before starting.
+
+        Task: {{prompt}}
+
+        Per-item reviewer's last message:
+        {{review.result}}
+
+        Gate / holistic-reviewer feedback on the finished branch (only set near
+        the end):
+        {{final_review.result}}
+
+        Follow this protocol exactly, first match wins:
+        1. If the per-item reviewer's message above requests changes, fix the
+           item you just committed (amend or add a follow-up commit), then run:
+           hex emit item_done
+        2. If the gate failed or the holistic reviewer requested changes that no
+           checklist item covers yet, append each such point to the checklist
+           file as a new `- [ ]` item, then continue with step 3.
+        3. If the checklist has an unchecked item: take the FIRST one and
+           implement only that item — the smallest change that satisfies it.
+           Before committing, run `cargo build --bin hex` (and
+           `cargo clippy -p hex-cli` if you touched lint-sensitive code) and only
+           proceed once it builds. Mark the item `[x]` in the checklist file,
+           commit everything with a Conventional Commits message
+           (`feat(cli): …`), then run:  hex emit item_done
+        4. Every item is checked and committed: run:  hex emit all_done
+
+        Never run destructive git commands (no reset --hard, no force-push, no
+        branch deletion); only add commits on the current branch.
+      may_propose: [item_done, all_done]
+    on:
+      item_done: review
+      all_done: verify
+
+  review:
+    agent:
+      role: reviewer
+      # Fresh every round: an independent pair of eyes on each item's commit.
+      prompt: |
+        Review the checklist item that was just committed.
+
+        The overall task (the file it names is the checklist):
+        {{prompt}}
+
+        The implementer's report on what it just did:
+        {{implement.result}}
+
+        Run `git show HEAD` (and `git log --oneline -5` for context) to see the
+        commit under review, and read the checklist file to see which item was
+        just checked. Judge only that item's change — review only, do not edit
+        files. If it is acceptable, run:
+          hex emit approved
+        Otherwise put concrete, actionable findings in your final message
+        (file:line + a failure scenario), then run:
+          hex emit changes_requested
+      may_propose: [approved, changes_requested]
+    budget:
+      visits: 24
+    on:
+      approved: implement
+      changes_requested: implement
+
+  verify:
+    command:
+      check: [fmt, clippy, test]
+      mode: parallel
+    on:
+      passed: final_review
+      failed: implement
+
+  final_review:
+    agent:
+      role: reviewer
+      # Fresh, and a separate node from `review`: this reviewer saw none of the
+      # per-item arguments, so it judges the sum — coherence across items,
+      # completeness against the checklist, seams between rounds.
+      prompt: |
+        Every checklist item has been implemented, committed and gated (fmt,
+        clippy and the full test suite already pass). Review the WHOLE branch as
+        one change.
+
+        The overall task (the file it names is the checklist):
+        {{prompt}}
+
+        Run `git diff feat/hex-dash...HEAD` and `git log --oneline feat/hex-dash..HEAD`
+        to see the entire change, and read the checklist file. Judge coherence,
+        completeness against the checklist, and whether it violates any invariant
+        in AGENTS.md — review only, do not edit files. If the complete branch is
+        acceptable, run:
+          hex emit approved
+        Otherwise put concrete findings in your final message (the implementer
+        turns them into new checklist items), then run:
+          hex emit changes_requested
+      may_propose: [approved, changes_requested]
+    budget:
+      visits: 3
+    on:
+      approved: done
+      changes_requested: implement
+
+  done:
+    terminal: succeeded
+
+accept:
+  require: [final_review.approved, verify.passed]
+  # If `done` is reached without a holistic approval and a green gate on record,
+  # go back and earn them rather than failing outright.
+  on_unmet: implement

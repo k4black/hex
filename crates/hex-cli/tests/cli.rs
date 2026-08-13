@@ -177,6 +177,8 @@ fn clap_rejects_bad_invocations_with_exit_2() {
         &["list", "--jsonn"][..],
         &["list", "extra"][..],
         &["run", "demo", "-p", "x", "-f", "y"][..],
+        // `dash` would busy-spin at a zero interval: reject it at parse time.
+        &["dash", "--interval", "0"][..],
     ] {
         let out = hex(dir.path(), args);
         assert_eq!(out.status.code(), Some(2), "expected exit 2 for {args:?}");
@@ -184,10 +186,32 @@ fn clap_rejects_bad_invocations_with_exit_2() {
 }
 
 #[test]
+fn dash_refuses_json_because_it_has_no_machine_mode() {
+    let dir = project();
+    // `--json` promises machine output, but `dash` is a TUI. It must refuse
+    // (exit 2) and point a machine consumer at `hex runs --json`, not open the
+    // TUI or silently ignore the flag.
+    let out = hex(dir.path(), &["dash", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = stderr(&out);
+    assert!(err.contains("no machine mode"), "stderr: {err}");
+    assert!(err.contains("hex runs --json"), "stderr: {err}");
+}
+
+#[test]
 fn help_and_version_exit_0() {
     let dir = project();
     assert!(hex(dir.path(), &["--help"]).status.success());
     assert!(hex(dir.path(), &["--version"]).status.success());
+    // The `--json` exception for `dash` must appear in the *short* help too, not
+    // only the long form, so `-h` cannot claim `dash` emits machine output.
+    let short = hex(dir.path(), &["dash", "-h"]);
+    assert!(short.status.success());
+    assert!(
+        stdout(&short).contains("every verb but `dash`"),
+        "short help states the json exception: {}",
+        stdout(&short)
+    );
 }
 
 #[test]
