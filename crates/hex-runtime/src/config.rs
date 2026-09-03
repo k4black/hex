@@ -83,6 +83,8 @@ pub enum WorkerKind {
     Claude,
     /// opencode (`opencode run`).
     Opencode,
+    /// Pi coding agent (`pi -p`).
+    Pi,
 }
 
 /// One role: the job a graph names, bound to a worker.
@@ -242,10 +244,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_has_codex_and_claude() {
+    fn builtin_has_codex_claude_and_pi() {
         let c = Config::builtin();
         assert!(c.workers.contains_key("codex"));
         assert!(c.workers.contains_key("claude"));
+        assert!(c.workers.contains_key("pi"));
     }
 
     #[test]

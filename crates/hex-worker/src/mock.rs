@@ -77,6 +77,9 @@ mod tests {
             read_only: false,
             extra_writable_dir: None,
             resume_session: None,
+            graph: "t".to_owned(),
+            project_root: PathBuf::from("."),
+            worktree_branch: None,
         }
     }
 

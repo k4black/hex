@@ -19,8 +19,8 @@ pub mod interrupt;
 pub mod mock;
 
 pub use agent::{
-    ClaudeWorker, CodexWorker, CommandWorker, OpencodeWorker, ResultCapture, logged_command,
-    wait_bounded,
+    ClaudeWorker, CodexWorker, CommandWorker, OpencodeWorker, PiWorker, ResultCapture,
+    logged_command, wait_bounded,
 };
 pub use mock::MockWorker;
 
@@ -60,6 +60,19 @@ pub struct WorkRequest {
     /// node's first visit. Only a worker declaring
     /// [`hex_proto::Capability::SessionResume`] ever receives one.
     pub resume_session: Option<String>,
+    /// The graph (workflow) name this run executes, injected as `HEX_GRAPH` so an
+    /// agent's `hex feedback` can record which workflow it was running under.
+    pub graph: String,
+    /// The main project root (the directory containing `.hex/`), injected as
+    /// `HEX_PROJECT_ROOT`. Distinct from `workdir`, which under worktree
+    /// isolation is the slot, not the project — `hex feedback` records both.
+    pub project_root: PathBuf,
+    /// The git branch a worktree-isolated run commits to (`hex/<run-id>`),
+    /// injected as `HEX_WORKTREE_BRANCH`. This is where a worktree run's code
+    /// actually lives — the `workdir` slot is reclaimable, the branch is not —
+    /// so feedback records it as the durable place to debug. `None` for a
+    /// shared-workspace run.
+    pub worktree_branch: Option<String>,
 }
 
 /// What the agent itself reported about an attempt: its session handle and what

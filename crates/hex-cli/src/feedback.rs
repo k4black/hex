@@ -1,0 +1,107 @@
+//! `hex feedback` — record a note about hex to the user-global feedback log.
+//!
+//! Any operator or agent can run `hex feedback "<message>"` to log an issue or a
+//! missing capability. It appends one JSON line to `~/.hex/feedback.jsonl` and
+//! auto-captures the context the runtime injected into the agent's environment
+//! (`HEX_RUN_ID`/`HEX_NODE_ID`/`HEX_GRAPH`/`HEX_AGENT`/`HEX_PROJECT_ROOT`) plus
+//! the working directory and the time. It needs no `.hex/` project and no
+//! Runtime — only `$HOME`, the environment and the cwd — so it works the same
+//! from inside a worktree slot, from another project, or from a bare shell.
+//!
+//! The schema is fixed: every line carries the same keys, with `null` where the
+//! context was absent (a call made outside a run), so a later consumer can read
+//! the log with one shape and tell "no run" from "empty run id".
+
+use std::io::Write;
+use std::process::ExitCode;
+
+/// A non-empty environment variable, or `None` — an unset *or* empty var both
+/// mean "no context".
+fn env_opt(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// The canonical (symlink-resolved, absolute) form of a path as a string, or the
+/// path as-is if it cannot be resolved — a feedback line must never fail to write
+/// just because a path could not be canonicalized.
+fn real(path: &std::path::Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+/// Append one feedback line to `~/.hex/feedback.jsonl`, creating the directory
+/// and file if needed.
+///
+/// # Errors
+/// Fails if the message is empty, `$HOME` is unset, or the file cannot be
+/// created/appended to.
+pub fn record(message: &str, kind: Option<&str>) -> Result<ExitCode, String> {
+    if message.trim().is_empty() {
+        return Err("feedback message is empty".to_owned());
+    }
+    let home = std::env::var_os("HOME").ok_or("HOME is not set, cannot locate ~/.hex")?;
+    let dir = std::path::Path::new(&home).join(".hex");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let path = dir.join("feedback.jsonl");
+
+    // Epoch millis fits u64 for the next ~half-billion years; serde_json has no
+    // native u128, so cast down rather than reach for arbitrary_precision.
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let cwd = std::env::current_dir().unwrap_or_default();
+    // `location` is the durable place to debug from: the real project root
+    // inside a run, else the cwd. `workdir` is where the attempt physically ran
+    // — under worktree isolation the reclaimable slot, which must not stand in
+    // for the real location. Both canonicalized so a reader gets a resolvable
+    // absolute path, not a symlink or a relative fragment.
+    let location = env_opt("HEX_PROJECT_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| cwd.clone());
+    let location = real(&location);
+    let workdir = real(&cwd);
+    let project = std::path::Path::new(&location)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty());
+
+    let entry = serde_json::json!({
+        "ts_ms": ts_ms,
+        "hex_version": env!("CARGO_PKG_VERSION"),
+        "kind": kind,
+        "message": message,
+        "project": project,
+        // The real project root — `cd` here to debug.
+        "location": location,
+        // Where the attempt ran (a worktree slot under isolation, else = location).
+        "workdir": workdir,
+        // For a worktree run, the branch holding the code: `git checkout` it in
+        // `location`. `null` for a shared-workspace run.
+        "branch": env_opt("HEX_WORKTREE_BRANCH"),
+        "run_id": env_opt("HEX_RUN_ID"),
+        "node": env_opt("HEX_NODE_ID"),
+        "graph": env_opt("HEX_GRAPH"),
+        "agent": env_opt("HEX_AGENT"),
+    });
+    let mut line = serde_json::to_string(&entry).map_err(|e| e.to_string())?;
+    line.push('\n');
+
+    // Append-only, one write per line. ponytail: a single `write_all` under
+    // `O_APPEND` is atomic for the short lines feedback produces; add an fs4 lock
+    // only if long concurrent messages are ever seen to interleave.
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("could not open {}: {e}", path.display()))?;
+    f.write_all(line.as_bytes())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+
+    // Diagnostic to stderr; stdout stays clean for a machine caller.
+    eprintln!("recorded feedback → {}", path.display());
+    Ok(ExitCode::SUCCESS)
+}

@@ -20,6 +20,8 @@ workers:
     kind: claude
   opencode:
     kind: opencode
+  pi:
+    kind: pi
 
 # Roles are the user-facing concept a graph names (`worker: reviewer`). A role
 # binds a worker to a model, a reasoning effort, a read-only policy, and a prompt
@@ -58,6 +60,14 @@ roles:
       You are researching. Gather evidence before concluding, prefer primary
       sources, and cite them. Separate what you verified from what you inferred,
       and say plainly when something could not be established.
+
+  pi:
+    worker: pi
+    prompt: |
+      You are a coding assistant. Work in the repository, use tools to read and
+      edit files, and follow the existing conventions. When finished, use the
+      `bash` tool to run `hex emit <signal>` where `<signal>` is one of the
+      outcomes you are allowed to propose.
 
 # Fallback compile defaults a graph inherits when it declares none.
 defaults:

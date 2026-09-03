@@ -633,6 +633,17 @@ impl<'a> Session<'a> {
             // worktree workspace — a path-sandboxed worker must keep it writable.
             extra_writable_dir: self.worktree.as_ref().map(|_| self.run_dir.clone()),
             resume_session,
+            graph: self.graph.name.clone(),
+            // run_dir is `<root>/.hex/runs/<id>` (the journal stays in the main
+            // `.hex` even under worktree isolation, gotcha 8), so the project
+            // root is three levels up.
+            project_root: self
+                .run_dir
+                .ancestors()
+                .nth(3)
+                .unwrap_or(&self.run_dir)
+                .to_path_buf(),
+            worktree_branch: self.worktree.as_ref().map(|w| w.branch.clone()),
         };
         let WorkOutcome {
             signal,

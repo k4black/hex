@@ -901,3 +901,110 @@ fn status_and_watch_reflect_a_finished_run() {
     let watch = hex(dir.path(), &["watch", run_id]);
     assert!(stdout(&watch).contains("run_finished"));
 }
+
+/// `hex feedback` inside a worktree run: the injected context is captured, and
+/// crucially `location` is the real project root (a durable place to debug)
+/// while `workdir` is the ephemeral slot and `branch` is where the code lives.
+#[test]
+fn feedback_records_a_json_line_with_run_context() {
+    let dir = TempDir::new().expect("tempdir");
+    let project = dir.path().join("myproj");
+    let slot = project.join(".hex").join("worktrees").join("0");
+    std::fs::create_dir_all(&slot).expect("mkdir slot");
+    Command::cargo_bin("hex")
+        .expect("bin")
+        .args([
+            "feedback",
+            "reviewer re-reads the whole repo",
+            "--kind",
+            "missing-capability",
+        ])
+        // Run *from* the worktree slot, as an isolated attempt would.
+        .current_dir(&slot)
+        .env("HOME", dir.path())
+        .env("HEX_RUN_ID", "2026-08-13-x")
+        .env("HEX_NODE_ID", "implement")
+        .env("HEX_GRAPH", "checklist")
+        .env("HEX_AGENT", "claude")
+        .env("HEX_PROJECT_ROOT", &project)
+        .env("HEX_WORKTREE_BRANCH", "hex/2026-08-13-x")
+        .assert()
+        .success();
+
+    let log = std::fs::read_to_string(dir.path().join(".hex").join("feedback.jsonl"))
+        .expect("feedback.jsonl written");
+    let v: serde_json::Value = serde_json::from_str(log.trim()).expect("one json line");
+    assert_eq!(v["message"], "reviewer re-reads the whole repo");
+    assert_eq!(v["kind"], "missing-capability");
+    assert_eq!(v["run_id"], "2026-08-13-x");
+    assert_eq!(v["node"], "implement");
+    assert_eq!(v["graph"], "checklist");
+    assert_eq!(v["agent"], "claude");
+    assert_eq!(v["branch"], "hex/2026-08-13-x");
+    assert_eq!(v["project"], "myproj", "named from the real project root");
+    // `location` is the real project, NOT the reclaimable slot — the whole point.
+    let location = v["location"].as_str().unwrap();
+    assert!(
+        location.ends_with("myproj"),
+        "location is the project: {location}"
+    );
+    assert!(
+        !location.contains("worktrees"),
+        "location must not be the slot: {location}"
+    );
+    let workdir = v["workdir"].as_str().unwrap();
+    assert!(
+        workdir.contains("worktrees"),
+        "workdir is where it ran: {workdir}"
+    );
+    assert!(v["ts_ms"].as_u64().unwrap() > 0, "timestamp recorded");
+    assert!(v["hex_version"].as_str().is_some(), "version recorded");
+}
+
+/// `hex feedback` outside a run works with no injected context (run fields and
+/// `branch` are `null`), and a second call appends rather than overwrites.
+#[test]
+fn feedback_works_outside_a_run_and_appends() {
+    let dir = TempDir::new().expect("tempdir");
+    for msg in ["first note", "second note"] {
+        Command::cargo_bin("hex")
+            .expect("bin")
+            .args(["feedback", msg])
+            .current_dir(dir.path())
+            .env("HOME", dir.path())
+            .env_remove("HEX_RUN_ID")
+            .env_remove("HEX_GRAPH")
+            .env_remove("HEX_WORKTREE_BRANCH")
+            .assert()
+            .success();
+    }
+    let log = std::fs::read_to_string(dir.path().join(".hex").join("feedback.jsonl")).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "appends, not overwrites");
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(first["message"], "first note");
+    assert!(first["run_id"].is_null(), "no run context outside a run");
+    assert!(first["graph"].is_null());
+    assert!(
+        first["branch"].is_null(),
+        "no branch outside a worktree run"
+    );
+    assert!(first["location"].as_str().is_some(), "cwd always recorded");
+}
+
+/// An empty message is a usage error, not a blank log line.
+#[test]
+fn feedback_rejects_an_empty_message() {
+    let dir = TempDir::new().expect("tempdir");
+    Command::cargo_bin("hex")
+        .expect("bin")
+        .args(["feedback", "   "])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .assert()
+        .failure();
+    assert!(
+        !dir.path().join(".hex").join("feedback.jsonl").exists(),
+        "no file created for a rejected empty message"
+    );
+}

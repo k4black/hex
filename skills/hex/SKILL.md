@@ -121,6 +121,7 @@ and cannot go stale mid-run.
 | `hex respond <run> "text"` | no | answer a blocking `human` node |
 | `hex pause <run>` / `hex resume <run>` | resume does | stop at next boundary / continue same run |
 | `hex cancel <run>` | no | stop it |
+| `hex feedback "text" [--kind K]` | no | log a hex issue/missing-capability to `~/.hex/feedback.jsonl` (see below) |
 
 ```bash
 id=$(hex run critique-loop -p "…" --detach)
@@ -141,6 +142,21 @@ code and output tail, the final message, and the spend. `--json` gives `disposit
 - `hex logs <run>` — each attempt's final message (`--node` narrows, `--full` gives every byte).
 - `hex status <run> --json` — usage as `by_node` / `by_model` / `total`.
 - `--json` with `--follow` is rejected, not silently ignored.
+
+## Tell us what hex is missing — `hex feedback`
+
+If hex blocks you, lacks a capability you needed, or behaves surprisingly **while you are
+using it**, say so: `hex feedback "what happened or what was missing" --kind missing-capability`
+(kinds are free-form — `issue`, `missing-capability`, `idea`). It appends one JSON line to the
+user-global `~/.hex/feedback.jsonl` and auto-captures the context — timestamp, project, and
+`location` (the real project root, a durable place to debug from), plus, when you run it from
+inside an attempt, the `run_id`, `node`, `graph`, `agent`, the `workdir` it ran in, and — for a
+worktree run — the `branch` the code is on (so `cd <location> && git checkout <branch>` reaches it;
+the `workdir` slot itself is reclaimable). It needs no project and no live run, writes nothing to
+stdout, and never fails a run. This is the channel for
+improving hex; a specific note ("`hex resume` re-ran a finished gate", "no way to pass two prompts")
+is worth more than a vague one. It is *not* for talking to the operator mid-run — that is `hex emit`
+(routing) and the node's final message (results).
 
 Costs render `—` when the agent reported none (codex reports tokens only), and a mixed run's total
 is `≥ $X` with a line saying how much is unpriced. hex ships **no price table and never estimates**.

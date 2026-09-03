@@ -2,10 +2,10 @@
 //! external coding-agent CLI.
 //!
 //! Every adapter shares the same spawn/log/emit/result plumbing (`run_agent`),
-//! but each concrete worker ([`CodexWorker`], [`ClaudeWorker`], [`OpencodeWorker`])
-//! encapsulates *its* agent's specifics — argv, final-message capture, and the
-//! read-only flag it maps to. [`CommandWorker`] is the generic escape hatch for a
-//! custom argv (and for tests). The runtime only ever sees `dyn Worker`.
+//! but each concrete worker ([`CodexWorker`], [`ClaudeWorker`], [`OpencodeWorker`],
+//! [`PiWorker`]) encapsulates *its* agent's specifics — argv, final-message capture,
+//! and the read-only flag it maps to. [`CommandWorker`] is the generic escape hatch
+//! for a custom argv (and for tests). The runtime only ever sees `dyn Worker`.
 //!
 //! Control channels the runtime injects: `HEX_EMIT_FILE` (the agent's routing
 //! signal via `hex emit`), `HEX_RESULT_FILE`/`{result}` (where a worker writes
@@ -57,6 +57,9 @@ pub enum ResultCapture {
     /// stdout is JSONL; take the `part.text` of the last `type == "text"` line
     /// (e.g. opencode `run --format json`).
     JsonlLastText,
+    /// stdout is JSONL from `pi --mode json`; extract the final assistant
+    /// message text and usage from `pi`'s structured event stream.
+    PiJsonl,
 }
 
 /// Cap on the bounded log tail kept as a *partial* result for an attempt that
@@ -92,6 +95,9 @@ pub enum UsageSource {
     /// `claude -p --output-format json`: one object with `session_id`,
     /// `total_cost_usd`, `duration_ms` and a per-model `modelUsage` map.
     ClaudeJson,
+    /// `pi --mode json` JSONL on stdout: `messageEnd` events carry usage and
+    /// cost; `message_update` with `textEnd` carries the final text.
+    PiJsonl,
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +370,80 @@ impl Worker for OpencodeWorker {
     }
 }
 
+/// Pi coding agent (`pi -p`).
+#[derive(Debug, Clone, Default)]
+pub struct PiWorker {
+    /// `--model provider/model` override, if any.
+    pub model: Option<String>,
+    /// Reasoning effort, mapped to pi's `--thinking` scale.
+    pub effort: Option<String>,
+}
+
+impl PiWorker {
+    #[must_use]
+    pub fn new(model: Option<String>) -> Self {
+        Self {
+            model,
+            effort: None,
+        }
+    }
+
+    /// Set the reasoning effort (builder style).
+    #[must_use]
+    pub fn with_effort(mut self, effort: Option<String>) -> Self {
+        self.effort = effort;
+        self
+    }
+
+    /// Build the argv template. `session_dir` is where pi stores its session
+    /// state so that `context: continue` works across attempts and resumes.
+    /// `resume` adds `--continue` to pick up the existing session in that dir.
+    #[must_use]
+    pub fn command(
+        &self,
+        session_dir: Option<&Path>,
+        resume: bool,
+    ) -> Vec<String> {
+        let mut argv = strs(&["pi", "-p", "{prompt}", "--mode", "json"]);
+        if let Some(dir) = session_dir {
+            argv.push("--session-dir".to_owned());
+            argv.push(dir.to_string_lossy().into_owned());
+        }
+        if resume {
+            argv.push("--continue".to_owned());
+        }
+        push_flag(&mut argv, "--model", self.model.as_deref());
+        push_flag(&mut argv, "--thinking", self.effort.as_deref());
+        argv
+    }
+}
+
+impl Worker for PiWorker {
+    fn program(&self) -> Option<&str> {
+        Some("pi")
+    }
+    fn capabilities(&self) -> CapabilityManifest {
+        resumable()
+    }
+    fn run(&self, request: &WorkRequest) -> WorkOutcome {
+        let session_dir = request
+            .project_root
+            .join(".hex")
+            .join("runs")
+            .join(&request.run_id)
+            .join("pi-sessions")
+            .join(&request.node_id);
+        run_agent(
+            "pi",
+            &self.command(Some(&session_dir), request.resume_session.is_some()),
+            Some(ResultCapture::PiJsonl),
+            Some(UsageSource::PiJsonl),
+            self.model.as_deref(),
+            request,
+        )
+    }
+}
+
 /// A generic worker driven by an explicit argv template (`{prompt}`/`{result}`
 /// tokens). The escape hatch for a custom CLI, a shell command, or a test stub.
 #[derive(Debug, Clone)]
@@ -473,6 +553,16 @@ fn run_agent(
     cmd.env("HEX_RUN_ID", &request.run_id)
         .env("HEX_NODE_ID", &request.node_id)
         .env("HEX_ATTEMPT_ID", &request.attempt_id)
+        .env("HEX_GRAPH", &request.graph)
+        .env("HEX_PROJECT_ROOT", &request.project_root)
+        // Empty string when not a worktree run; `hex feedback` treats "" as absent.
+        .env(
+            "HEX_WORKTREE_BRANCH",
+            request.worktree_branch.as_deref().unwrap_or(""),
+        )
+        // The program actually spawned, so `hex feedback` records the real agent
+        // (matches `AttemptReported.agent`, gotcha 39).
+        .env("HEX_AGENT", &command[0])
         .env(EMIT_FILE_ENV, &emit_file)
         .env(RESULT_FILE_ENV, &result_file)
         .env("HEX_MAY_PROPOSE", request.may_propose.join(","))
@@ -613,6 +703,7 @@ fn read_report(source: UsageSource, attempt_dir: &Path, model_hint: Option<&str>
     match source {
         UsageSource::CodexJsonl => codex_report(&stdout, model_hint),
         UsageSource::ClaudeJson => claude_report(&stdout),
+        UsageSource::PiJsonl => pi_report(&stdout, model_hint),
     }
 }
 
@@ -731,6 +822,157 @@ fn claude_report(path: &Path) -> AttemptReport {
     report
 }
 
+/// Parse `pi --mode json`'s JSONL.
+///
+/// Sums usage across all assistant `messageEnd` events and extracts the model
+/// name from the last one. Line-by-line so a killed attempt's torn tail does
+/// not lose the facts already written.
+fn pi_report(path: &Path, model_hint: Option<&str>) -> AttemptReport {
+    let Ok(file) = File::open(path) else {
+        return AttemptReport::default();
+    };
+    let cap = usize::try_from(MAX_STREAM_BYTES).unwrap_or(usize::MAX);
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    let mut usage = ModelUsage {
+        model: model_hint.unwrap_or("pi").to_owned(),
+        ..ModelUsage::default()
+    };
+    let mut saw_usage = false;
+    let mut total_cost: f64 = 0.0;
+    let mut model_name: Option<String> = None;
+    loop {
+        line.clear();
+        match read_line_bounded(&mut reader, &mut line, cap) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let Ok(text) = std::str::from_utf8(&line) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+            continue;
+        };
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("message_end") {
+            continue;
+        }
+        let Some(role) = v
+            .get("message")
+            .and_then(|m| m.get("role"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if role != "assistant" {
+            continue;
+        }
+        if let Some(model) = v
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(serde_json::Value::as_str)
+        {
+            model_name = Some(model.to_owned());
+        }
+        let Some(u) = v.get("message").and_then(|m| m.get("usage")) else {
+            continue;
+        };
+        saw_usage = true;
+        let n = |key: &str| u.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        usage.input_tokens = usage.input_tokens.saturating_add(n("input"));
+        usage.output_tokens = usage.output_tokens.saturating_add(n("output"));
+        usage.cache_read_tokens = usage.cache_read_tokens.saturating_add(n("cacheRead"));
+        usage.cache_write_tokens = usage.cache_write_tokens.saturating_add(n("cacheWrite"));
+        usage.reasoning_tokens = usage.reasoning_tokens.saturating_add(n("reasoning"));
+        if let Some(cost) = u
+            .get("cost")
+            .and_then(|c| c.get("total"))
+            .and_then(serde_json::Value::as_f64)
+        {
+            total_cost += cost;
+        }
+    }
+    if !saw_usage {
+        return AttemptReport::default();
+    }
+    usage.model = model_name.unwrap_or_else(|| model_hint.unwrap_or("pi").to_owned());
+    let cost_micro_usd = micro_usd(total_cost);
+    usage.cost_micro_usd = cost_micro_usd;
+    AttemptReport {
+        session_id: Some("pi-session".to_owned()),
+        agent: None,
+        models: vec![usage],
+        cost_micro_usd,
+        duration_ms: None,
+    }
+}
+
+/// Extract the final assistant text from a `pi --mode json` JSONL stream.
+/// Looks at `messageEnd` events with `role == "assistant"` and joins all
+/// `content` items of `type == "text"`. Falls back to `message_update`
+/// `textEnd` content if no full `messageEnd` is found (truncated stream).
+fn pi_result(path: &Path, max: u64) -> Result<Option<String>, String> {
+    let file = File::open(path).map_err(|e| format!("cannot read agent output: {e}"))?;
+    let mut reader = std::io::BufReader::new(file);
+    let cap = usize::try_from(max).unwrap_or(usize::MAX);
+    let mut line = Vec::new();
+    let mut last_text: Option<String> = None;
+    let mut fallback_text: Option<String> = None;
+    loop {
+        line.clear();
+        let n = read_line_bounded(&mut reader, &mut line, cap)
+            .map_err(|e| format!("cannot read agent output: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if line.len() >= cap && !line.ends_with(b"\n") {
+            return Err(format!("agent output line exceeds {max} bytes"));
+        }
+        let Ok(text) = std::str::from_utf8(&line) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+            continue;
+        };
+        // Fallback: text_end in a message_update carries the full text.
+        if let Some(event) = v.get("assistantMessageEvent")
+            && event.get("type").and_then(serde_json::Value::as_str) == Some("text_end")
+            && let Some(content) = event.get("content").and_then(serde_json::Value::as_str)
+        {
+            fallback_text = Some(content.to_owned());
+        }
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("message_end") {
+            continue;
+        }
+        let Some(role) = v
+            .get("message")
+            .and_then(|m| m.get("role"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if role != "assistant" {
+            continue;
+        }
+        let Some(content) = v.get("message").and_then(|m| m.get("content")).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let texts: Vec<String> = content
+            .iter()
+            .filter_map(|item| {
+                let t = item.get("type")?.as_str()?;
+                if t != "text" {
+                    return None;
+                }
+                item.get("text")?.as_str().map(ToOwned::to_owned)
+            })
+            .collect();
+        if !texts.is_empty() {
+            last_text = Some(texts.join(""));
+        }
+    }
+    Ok(last_text.or(fallback_text))
+}
+
 /// Dollars as an agent reported them, converted to exact micro-USD. `None` for a
 /// value that is not a sane amount of money, so a garbled field reads as "not
 /// reported" instead of an absurd bill.
@@ -830,6 +1072,9 @@ fn capture_result(
             // missed by a mid-file cap — a stale earlier text would misrepresent
             // the run. An over-long single line fails closed.
             last_jsonl_text_file(&attempt_dir.join("stdout.log"), MAX_STREAM_BYTES)?
+        }
+        Some(ResultCapture::PiJsonl) => {
+            pi_result(&attempt_dir.join("stdout.log"), MAX_STREAM_BYTES)?
         }
     };
     Ok(raw
@@ -1376,6 +1621,9 @@ mod tests {
             read_only: false,
             extra_writable_dir: None,
             resume_session: None,
+            graph: "t".to_owned(),
+            project_root: dir.to_path_buf(),
+            worktree_branch: None,
         }
     }
 
@@ -1423,6 +1671,35 @@ mod tests {
         assert_eq!(outcome.signal, None, "no emit → implicit completion");
         assert_eq!(outcome.result.as_deref(), Some("the plan"));
         assert_eq!(outcome.error, None);
+    }
+
+    #[test]
+    fn injects_graph_agent_and_project_root_into_the_child_env() {
+        // `hex feedback` reads these from the environment to record which
+        // workflow/agent/project a run was under; they must reach the child.
+        let dir = temp_dir("feedback-env");
+        let worker = CommandWorker::new(
+            "fake",
+            strs(&[
+                "sh",
+                "-c",
+                "printf '%s|%s|%s' \"$HEX_GRAPH\" \"$HEX_AGENT\" \"$HEX_PROJECT_ROOT\" > \"$HEX_RESULT_FILE\"",
+            ]),
+        )
+        .with_result_capture(Some(ResultCapture::File));
+        let outcome = worker.run(&request(&dir, &[]));
+        let got = outcome.result.expect("captured env");
+        let parts: Vec<&str> = got.split('|').collect();
+        assert_eq!(parts[0], "t", "HEX_GRAPH is the graph name");
+        assert_eq!(
+            parts[1], "sh",
+            "HEX_AGENT is the spawned program (command[0])"
+        );
+        assert_eq!(
+            parts[2],
+            dir.to_string_lossy(),
+            "HEX_PROJECT_ROOT is the request's project_root"
+        );
     }
 
     #[test]
@@ -1703,5 +1980,61 @@ mod tests {
         );
         // 16 input bytes; a truncated codepoint becomes the 3-byte `�`.
         assert!(got.len() <= 16 + 3, "byte-bounded read: {}", got.len());
+    }
+
+    /// A real `pi --mode json` run produces JSONL with `messageEnd` carrying
+    /// usage/cost and `message_update` `textEnd` carrying the final text.
+    #[test]
+    fn pi_report_reads_usage_and_cost_from_message_end() {
+        let r = pi_report(&fixture("pi-mode-json.jsonl"), Some("moonshotai/kimi-k2.6"));
+        assert_eq!(r.session_id.as_deref(), Some("pi-session"));
+        assert!(
+            !r.models.is_empty(),
+            "at least one assistant message reported usage"
+        );
+        let m = &r.models[0];
+        assert_eq!(m.model, "moonshotai/kimi-k2.6");
+        // The fixture should have positive output tokens and some cost.
+        assert!(m.output_tokens > 0, "output tokens reported");
+        assert!(
+            m.cost_micro_usd.is_some(),
+            "pi reports cost per message"
+        );
+    }
+
+    #[test]
+    fn pi_report_reads_model_from_the_stream() {
+        let r = pi_report(&fixture("pi-mode-json.jsonl"), None);
+        assert_eq!(r.models[0].model, "moonshotai/kimi-k2.6");
+    }
+
+    #[test]
+    fn pi_result_extracts_final_assistant_text() {
+        let text = pi_result(&fixture("pi-mode-json.jsonl"), MAX_STREAM_BYTES)
+            .expect("parses")
+            .expect("has text");
+        assert!(
+            text.to_lowercase().contains("hello"),
+            "expected greeting in result, got: {text}"
+        );
+    }
+
+    /// A torn JSONL tail still yields text from earlier message_update `text_end`
+    /// events when the final `message_end` is missing.
+    #[test]
+    fn pi_result_falls_back_to_text_end_when_message_end_is_truncated() {
+        let dir = temp_dir("pi-torn");
+        let whole = fs::read_to_string(fixture("pi-mode-json.jsonl")).expect("fixture");
+        // Cut off after the text_end but before the message_end.
+        let torn = &whole[..whole.rfind("text_end").unwrap() + 60];
+        let path = dir.join("stdout.log");
+        fs::write(&path, torn).expect("write");
+        let text = pi_result(&path, MAX_STREAM_BYTES)
+            .expect("parses")
+            .expect("fallback text");
+        assert!(
+            text.to_lowercase().contains("hello"),
+            "expected greeting in fallback, got: {text}"
+        );
     }
 }

@@ -213,10 +213,10 @@ sign-off, confirmation.
    edge (the validator allows `done` without a `may_propose` entry). Nodes with
    >1 outcome still emit. `read_signal` returning `Ok(None)` is *not* an error.
 5c. **Workers are typed adapters behind one trait.** Each agent CLI has its own
-   `Worker` impl in `hex-worker` (`CodexWorker`/`ClaudeWorker`/`OpencodeWorker`)
+   `Worker` impl in `hex-worker` (`CodexWorker`/`ClaudeWorker`/`PiWorker`/`OpencodeWorker`)
    owning its argv and result-capture mode; `CommandWorker` is the generic argv
    escape hatch (+ `MockWorker`). Config selects one via `kind:`
-   (`codex`/`claude`/`opencode`/`command`, default `command`); the runtime/CLI
+   (`codex`/`claude`/`pi`/`opencode`/`command`, default `command`); the runtime/CLI
    only ever see `dyn Worker`. A node's `read_only: bool` flows to
    `WorkRequest.read_only`, but is **advisory** today (prompt-enforced): a true
    read-only sandbox (codex `--sandbox read-only`) would also block the agent
@@ -666,4 +666,26 @@ sign-off, confirmation.
    and in raw mode the tty sends no SIGINT, so `Ctrl-C` arrives as a
    `KeyCode::Char('c')` + `CONTROL` key event, handled alongside `q`/`Esc`, not
    as a signal.
-47. _add new gotchas here as they are discovered_
+47. **`hex feedback` writes the *user-global* `~/.hex/`, not a project `.hex/`.**
+   `hex-cli/src/feedback.rs` appends one JSON line per call to
+   `$HOME/.hex/feedback.jsonl` so feedback from every project aggregates in one
+   place — do not confuse it with the project-local `.hex/` (runs, graphs,
+   config). It is a **pure CLI command with no Runtime**: only `$HOME`, the
+   environment and the cwd, so it works from a worktree slot or a bare shell. It
+   auto-captures run context from env the runtime injects into every agent
+   attempt (`run_agent`, `agent.rs`): `HEX_RUN_ID`/`HEX_NODE_ID` already existed;
+   this feature added `HEX_GRAPH` (from `WorkRequest.graph`), `HEX_PROJECT_ROOT`
+   (from `WorkRequest.project_root`, which the driver derives as
+   `run_dir.ancestors().nth(3)` since the journal is always at
+   `<root>/.hex/runs/<id>` even under worktree isolation), `HEX_WORKTREE_BRANCH`
+   (`hex/<run-id>` for a worktree run, else absent), and `HEX_AGENT` (the
+   spawned `command[0]`, the same program `AttemptReported.agent` records —
+   gotcha 39). The recorded **`location` is the real project root, never the
+   worktree slot** — the slot is reclaimable, so a debugger would chase a path
+   that no longer holds that run's code; the slot is recorded separately as
+   `workdir`, and `branch` says what to `git checkout` in `location`. Paths are
+   `canonicalize`d. Absent context is written as JSON `null`, never omitted, so
+   the log has one fixed schema. The write is append-only, one `write_all` under
+   `O_APPEND` — fine for short lines; add an fs4 lock only if long concurrent
+   messages ever interleave.
+48. _add new gotchas here as they are discovered_

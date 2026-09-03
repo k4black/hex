@@ -22,6 +22,7 @@ use hex_runtime::{
 mod out;
 mod agent_stream;
 mod dash;
+mod feedback;
 mod graph_export;
 mod graph_view;
 mod preview;
@@ -231,6 +232,16 @@ enum Command {
         /// Routing event to append (must be in the node's `may_propose`)
         event: String,
     },
+    /// Record feedback about hex to `~/.hex/feedback.jsonl` (issues, missing
+    /// capabilities); auto-captures the run/graph/agent/project context
+    Feedback {
+        /// The feedback text
+        #[arg(value_name = "MESSAGE")]
+        message: String,
+        /// Optional category, e.g. `issue`, `missing-capability`, `idea`
+        #[arg(long, value_name = "KIND")]
+        kind: Option<String>,
+    },
 }
 
 /// How `hex graph` renders. Every one of these goes to stdout and exits 0.
@@ -339,6 +350,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         }
         Command::Cancel { run_id } => cmd_cancel(&run_id, json),
         Command::Emit { event } => cmd_emit(&event),
+        Command::Feedback { message, kind } => feedback::record(&message, kind.as_deref()),
     }
 }
 

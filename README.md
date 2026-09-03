@@ -3,7 +3,7 @@
 **A thin, deterministic control plane for agentic loops and graphs.**
 
 `hex` compiles a human-readable graph, runs existing agent CLIs (Claude Code,
-Codex, Gemini, …) as opaque workers, records every transition in an append-only
+Codex, Pi, Gemini, …) as opaque workers, records every transition in an append-only
 journal, enforces hard limits and evidence gates, and exposes the *same*
 control protocol to humans and agents.
 
@@ -208,8 +208,8 @@ it survives a crash and a `hex resume`. It is scoped per node deliberately: a
 reviewer resuming the implementer's session would inherit its reasoning and stop
 being an independent judge. A node asking for it on a worker that cannot resume is
 refused at **compile** time rather than silently degrading to a fresh session every
-round — the exact cost `continue` exists to avoid; codex and claude can resume,
-opencode and the generic `command` adapter cannot.
+round — the exact cost `continue` exists to avoid; codex, claude, and pi can
+resume, opencode and the generic `command` adapter cannot.
 
 The shipped presets apply that per node, and the asymmetry is the point:
 `implement` continues its own session in `critique-loop`, `implement-until-green`,
@@ -228,7 +228,7 @@ until you set `context: fresh` on the named node, which the error says.
 Layered config, project wins: `~/.config/hex/config.yaml` (user) ←
 `.hex/config.yaml` (project). It holds the **worker registry** plus default
 budgets/context. Each worker has a `kind`: a typed built-in adapter
-(`codex`/`claude`/`opencode`) that encapsulates that agent's argv, output
+(`codex`/`claude`/`pi`/`opencode`) that encapsulates that agent's argv, output
 parsing, and read-only flag — you only override its `model` — or the generic
 `command` kind (an explicit argv template + a `result:` capture mode) for any
 other CLI. The CLI/runtime only ever see a uniform `Worker`:
@@ -238,6 +238,7 @@ other CLI. The CLI/runtime only ever see a uniform `Worker`:
 workers:
   codex:  { kind: codex }
   claude: { kind: claude }
+  pi:     { kind: pi }
 
 # Roles are what a graph names. Each binds a worker to a model, reasoning
 # effort, a read-only policy and a prompt preamble.
@@ -415,7 +416,17 @@ hex steer <run> <text>   add operator guidance to the next attempt
 hex respond <run> <text> answer a blocking `human` node
 hex cancel <run>         cancel, live or idle
 hex emit <event>         worker→runtime, scoped-token control
+hex feedback <text>      log a hex issue/missing-capability to ~/.hex/feedback.jsonl
 ```
+
+`hex feedback "<text>" [--kind K]` lets any operator or agent record a note about hex
+itself — an issue, a missing capability, an idea. It appends one JSON line to the
+user-global `~/.hex/feedback.jsonl` (distinct from a project's `.hex/`), auto-capturing
+the time, project, and `location` (the real project root — the durable place to debug),
+plus — when run inside an attempt — the `run_id`, `node`, `graph`, `agent`, the `workdir`
+it ran in, and, for a worktree run, the `branch` the code is on. It needs no project and
+no live run, so it works from a worktree slot or a bare shell; it is the dogfooding
+channel, not a way to talk to the operator mid-run.
 
 **Exit codes** encode the outcome, so a script or a driving agent branches without
 parsing output: `0` succeeded · `1` failed · `2` usage error · `3` timed out ·
@@ -455,7 +466,8 @@ Every number comes from the agent's own structured output and nowhere else. code
 runs `codex exec --json` and yields tokens only — its stream names no model and no
 cost, so the per-model split is labelled with the role's configured model; claude
 reports `modelUsage` per model with `costUSD`, plus `total_cost_usd`,
-`duration_ms` and a `session_id`. hex never estimates and ships **no price
+`duration_ms` and a `session_id`; pi reports per-message `usage` and `cost` in its
+`--mode json` JSONL stream. hex never estimates and ships **no price
 table**: prices drift, and a table in-tree is wrong the week a vendor changes
 one, so an agent that reports no money shows no money.
 
@@ -742,7 +754,7 @@ cargo test  --workspace
 cargo clippy --workspace --all-targets
 hex init                    # .hex/ + a starter config (safe to re-run)
 hex list
-hex doctor                  # is hex on PATH? codex/claude installed? checks runnable?
+hex doctor                  # is hex on PATH? codex/claude/pi installed? checks runnable?
 hex validate critique-loop
 hex run critique-loop -p "fix the flaky auth test"
 ```

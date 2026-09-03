@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use hex_worker::{ClaudeWorker, CodexWorker, CommandWorker, OpencodeWorker, Worker};
+use hex_worker::{ClaudeWorker, CodexWorker, CommandWorker, OpencodeWorker, PiWorker, Worker};
 
 use crate::config::{Config, WorkerKind, WorkerSpec};
 
@@ -84,6 +84,7 @@ fn build(
         WorkerKind::Codex => Box::new(CodexWorker::new(model).with_effort(effort)),
         WorkerKind::Claude => Box::new(ClaudeWorker::new(model).with_effort(effort)),
         WorkerKind::Opencode => Box::new(OpencodeWorker::new(model)),
+        WorkerKind::Pi => Box::new(PiWorker::new(model).with_effort(effort)),
         WorkerKind::Command => Box::new(
             CommandWorker::new(name.to_owned(), spec.command.clone())
                 .with_result_capture(spec.result),
