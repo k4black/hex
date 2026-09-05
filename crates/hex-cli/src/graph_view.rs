@@ -12,7 +12,8 @@
 
 use std::collections::BTreeMap;
 
-use hex_runtime::{Budget, EdgeClass, Graph, NodeKind, NodeSpec, Topology, Transition};
+use anstyle::Style;
+use hex_runtime::{Budget, EdgeClass, Graph, NodeSpec, Topology, Transition};
 
 use crate::ui::{Ui, style};
 
@@ -208,36 +209,25 @@ fn flows_from_any_prior(topo: &Topology, prior: &[String], id: &str) -> bool {
     prior.iter().any(|p| topo.flows_into(p, id))
 }
 
-/// The kind badge, coloured by what it is: a terminal's disposition is the one
-/// thing worth spotting without reading.
 fn badge_painted(graph: &Graph, id: &str, ui: Ui) -> String {
-    let sym = badge(graph, id, ui);
-    let paint = match graph.node(id).map(|n| n.spec.kind()) {
-        Some(NodeKind::Terminal) => match graph.node(id).map(|n| &n.spec) {
-            Some(NodeSpec::Terminal { disposition }) if disposition.as_str() == "succeeded" => {
-                style::OK
-            }
-            _ => style::FAIL,
-        },
-        Some(NodeKind::Command) if graph.is_gate(id) => style::HEADER,
-        Some(NodeKind::Human) => style::WARN,
-        _ => style::ID,
-    };
-    ui.paint(paint, sym).to_string()
+    let (glyph, style) = badge(graph, id, ui);
+    ui.paint(style, glyph).to_string()
 }
 
-fn badge(graph: &Graph, id: &str, ui: Ui) -> &'static str {
+/// The kind badge and the colour that goes with it, decided in one match — a
+/// terminal's disposition is the one thing worth spotting without reading.
+fn badge(graph: &Graph, id: &str, ui: Ui) -> (&'static str, Style) {
     let g = ui.glyphs();
-    match graph.node(id).map(|n| n.spec.kind()) {
-        Some(NodeKind::Agent) => g.agent,
-        Some(NodeKind::Command) if graph.is_gate(id) => g.gate,
-        Some(NodeKind::Command) => g.command,
-        Some(NodeKind::Human) => g.human,
-        Some(NodeKind::Terminal) => match graph.node(id).map(|n| &n.spec) {
-            Some(NodeSpec::Terminal { disposition }) if disposition.as_str() == "succeeded" => g.ok,
-            _ => g.fail,
-        },
-        None => " ",
+    match graph.node(id).map(|n| &n.spec) {
+        Some(NodeSpec::Agent { .. }) => (g.agent, style::ID),
+        Some(NodeSpec::Command { .. }) if graph.is_gate(id) => (g.gate, style::HEADER),
+        Some(NodeSpec::Command { .. }) => (g.command, style::ID),
+        Some(NodeSpec::Human { .. }) => (g.human, style::WARN),
+        Some(NodeSpec::Terminal { disposition }) if disposition.as_str() == "succeeded" => {
+            (g.ok, style::OK)
+        }
+        Some(NodeSpec::Terminal { .. }) => (g.fail, style::FAIL),
+        None => (" ", style::ID),
     }
 }
 

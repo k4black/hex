@@ -22,7 +22,7 @@ against the branch base; re-locate by symbol if they drifted. After each item:
   through ~10 signatures (graph_view.rs:27,51,95,124,220,236,255,325,359,411
   and main.rs:789), but it is exactly `ui.glyphs()` and `Ui` is `Copy`. Drop
   the parameter and call `ui.glyphs()` where needed.
-- [ ] graph_view.rs: `badge_painted` (graph_view.rs:220-248) re-matches
+- [x] graph_view.rs: `badge_painted` (graph_view.rs:220-248) re-matches
   `spec.kind()` and re-tests the terminal disposition that `badge` just
   matched. Refactor to one fn returning `(glyph, style)` — the shape
   `dash::mark_cell` already uses.
