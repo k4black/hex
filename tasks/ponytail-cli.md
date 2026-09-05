@@ -58,7 +58,7 @@ against the branch base; re-locate by symbol if they drifted. After each item:
   — into `dash_refuses_json_because_it_has_no_machine_mode` (cli.rs:189) and
   delete the rest of it (its `--help`/`--version` asserts are already made at
   cli.rs:162-167).
-- [ ] preview.rs: delete the file-shrank restart branch (preview.rs:514-518)
+- [x] preview.rs: delete the file-shrank restart branch (preview.rs:514-518)
   and the test pinning it (preview.rs:847-858) — the same module documents the
   case as impossible ("logs are created once at spawn and only appended",
   preview.rs:470-473). Then trim the `fmt_mmss` unit test (preview.rs:618-624)

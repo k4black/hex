@@ -469,8 +469,7 @@ fn fmt_mmss(d: Duration) -> String {
 /// across streams they appear in the tail's own poll order (stdout before
 /// stderr within a tick) — unspecified relative to real time. stderr is dimmed
 /// to keep the two distinguishable. Each attempt's logs are created once at
-/// spawn and only appended, so a source only grows; the shrink check below is a
-/// cheap defense, not general log-rotation support.
+/// spawn and only appended, so a source only grows.
 struct Tail {
     sources: Vec<Source>,
     ring: VecDeque<(String, bool)>, // (line, is_stderr)
@@ -511,11 +510,6 @@ impl Tail {
                 continue;
             };
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            if len < src.offset {
-                // The file shrank — it can't have been appended-to. Restart.
-                src.offset = 0;
-                src.pending.clear();
-            }
             if len <= src.offset {
                 continue;
             }
@@ -615,11 +609,11 @@ mod tests {
         }
     }
 
+    /// The shorter cases are re-made through the real caller by
+    /// `status_line_shows_node_worker_attempt_timer_and_countdown`; only the
+    /// hour rollover (minutes past 59) is unique to this function.
     #[test]
-    fn fmt_mmss_pads_and_rolls_over_minutes() {
-        assert_eq!(fmt_mmss(Duration::from_secs(0)), "0:00");
-        assert_eq!(fmt_mmss(Duration::from_secs(47)), "0:47");
-        assert_eq!(fmt_mmss(Duration::from_secs(90)), "1:30");
+    fn fmt_mmss_rolls_minutes_past_an_hour() {
         assert_eq!(fmt_mmss(Duration::from_secs(3600)), "60:00");
     }
 
@@ -842,18 +836,5 @@ mod tests {
         append(&out, &[0xA9, b'\n']);
         tail.poll();
         assert_eq!(tail.lines().last(), Some(("é", false)));
-    }
-
-    #[test]
-    fn tail_restarts_if_a_file_unexpectedly_shrinks() {
-        let out = tmp("trunc");
-        let mut tail = Tail::new(vec![(out.clone(), false)], 8);
-        append(&out, b"old line\n");
-        tail.poll();
-        // Rewrite shorter than the current offset (shouldn't happen for real
-        // append-only logs, but the guard must not read stale bytes).
-        std::fs::write(&out, b"fresh\n").unwrap();
-        tail.poll();
-        assert_eq!(tail.lines().last(), Some(("fresh", false)));
     }
 }
