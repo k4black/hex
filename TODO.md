@@ -868,6 +868,15 @@ reviewer via openrouter — the first real cross-model run on the pi worker).
       sites), `hex wait`/`hex runs` re-fold caching (real but invisible at
       current journal sizes — still listed under deferred efficiency).
 
+### Found dogfooding the ponytail pass (2026-09-05), not yet fixed
+
+- [ ] **A red gate at the branch base wedges a scoped checklist run** (gotcha
+      48): `verify` runs workspace-wide checks, so pre-existing debt outside the
+      run's scope fails the gate on files the prompt forbids touching, and the
+      loop burns attempts to `budget_exhausted`. Candidates: scope gate checks
+      to the branch diff; or a preflight that runs the gate once at the base and
+      refuses to start (or warns) when it is already red.
+
 ## Phase 2 — hardening & correctness
 
 The robustness cut from the MVP: make the kernel/runtime trustworthy before

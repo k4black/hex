@@ -689,4 +689,20 @@ sign-off, confirmation.
    the log has one fixed schema. The write is append-only, one `write_all` under
    `O_APPEND` — fine for short lines; add an fs4 lock only if long concurrent
    messages ever interleave.
-48. _add new gotchas here as they are discovered_
+48. **A red gate at the branch base wedges a scoped checklist run.** Dogfooded
+   2026-09-05 (`2026-09-05-ponytail-cli`, claude-opus implements / pi
+   gemini-3.8-flash reviews): the base commit carried unformatted
+   `hex-worker/agent.rs`, so the worktree run's `verify` gate (fmt over the
+   whole workspace) failed on files the checklist forbade touching; the
+   implementer could not reconcile "fix the gate" with "touch no other crate"
+   and the run burned to `budget_exhausted` — after all 11 items were
+   implemented, reviewed and committed, so the branch merged fine anyway.
+   Fix candidates are in `~/.hex/feedback.jsonl` and TODO.md: scope gate checks
+   to the branch diff, or refuse to start a gated run whose gate is already red
+   at the base. Cost datum from the same run: opus ≈ $2–3 per implemented item,
+   gemini-flash ≈ $0.04–0.08 per review — the pi reviewer is ~50× cheaper than
+   the codex reviewer this repo used before, with substantive verdicts.
+   Reviewer binding note: pi needs the provider in the model pattern
+   (`model: openrouter/google/gemini-3.8-flash`) because `PiWorker` passes only
+   `--model` and bare `gemini-3.8-flash` is ambiguous across providers.
+49. _add new gotchas here as they are discovered_
