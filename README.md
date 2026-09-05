@@ -33,14 +33,14 @@ records · cli / mcp / dashboard are windows.**
 |---|---|---|
 | [`hex-proto`](crates/hex-proto) | Versioned protocol: `Event`, `Command`, `Capability`. The one stable public surface, shared by kernel, workers, and clients. | — |
 | [`hex-kernel`](crates/hex-kernel) | **Pure, deterministic.** Graph IR, journal model, projections, and the three functions `reduce` / `schedule` / `accept`. No IO, no subprocess, no wall clock. | proto |
-| [`hex-worker`](crates/hex-worker) | Adapter for **one** opaque external agent/CLI behind the `Worker` trait + capability manifest (mock, subprocess/argv, coding-agent presets). Runs one worker, reports what happened. Never coordinates. | proto, kernel |
+| [`hex-worker`](crates/hex-worker) | Adapter for **one** opaque external agent/CLI behind the `Worker` trait + capability manifest (mock, subprocess/argv, coding-agent presets). Runs one worker, reports what happened. Never coordinates. | proto |
 | [`hex-runtime`](crates/hex-runtime) | Orchestration — the imperative shell. Drive loop, effect execution, journal writer, control-command ingestion, workspace isolation, run supervision. Exposes the `Runtime` API, down to the byte-level stream reads a live tail needs, so no client walks `.hex/`. | kernel, worker, proto |
 | [`hex-cli`](crates/hex-cli) | The `hex` binary — a **thin client** over `Runtime`. Arg parsing + rendering only. | runtime |
 | [`hex-mcp`](crates/hex-mcp) | *(later)* MCP transport — a thin client/peer of the CLI over the same `Runtime` API. Can start and control runs. | runtime |
 | [`hex-dashboard`](crates/hex-dashboard) | *(later)* TUI/web viewer — another thin client; also able to start runs. | runtime |
 
 Dependency direction stays strictly inward: `proto ← kernel ← runtime`,
-`proto,kernel ← worker`, `worker,kernel ← runtime`, all clients `← runtime`.
+`proto ← worker`, `worker,kernel ← runtime`, all clients `← runtime`.
 The kernel never imports a worker adapter, rendering, or any client.
 
 ### Execution model — functional core, imperative shell
@@ -396,7 +396,7 @@ hex list                 list runnable graphs (project > user > built-in)
 hex doctor               are `hex`, the configured workers and checks usable?
 hex validate <graph>     schema, references, bounded cycles, a reachable success
 hex graph <graph>        render a graph as text
-                         [--format text|json|mermaid|dot] paste it into a
+                         [--format text|json|mermaid|dot|source]: mermaid pastes into a
                          GitHub comment, or pipe it to `dot -Tsvg`
 hex run [<graph>]        start a NEW run (no graph → list what's runnable)
                          [--detach] return a run id immediately
@@ -737,8 +737,9 @@ would catch it are serialized, so **"parallel runs grow the pool" is currently a
 untested claim.**
 
 **Not built** (designed, decided, not yet shipped): stall detection, `hex config
-show`, `graph --format source`, `interactive` sessions, `templates:`/`extends:`,
+show`, `interactive` sessions, `templates:`/`extends:`,
 capability matching beyond the `context: continue` check, and the MCP client.
+(`graph --format source` shipped — the way to fork a preset.)
 The followers poll at 400ms rather than watching the filesystem, and there is no
 `hex logs --json --follow` (streaming NDJSON) yet. `hex-mcp` / `hex-dashboard` are
 still stubs. A **run digest** verb is off the list rather than pending: the end-of-run output and `hex status`

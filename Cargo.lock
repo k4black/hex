@@ -671,7 +671,6 @@ dependencies = [
 name = "hex-worker"
 version = "0.0.0"
 dependencies = [
- "hex-kernel",
  "hex-proto",
  "nix",
  "serde",

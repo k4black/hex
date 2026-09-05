@@ -18,7 +18,7 @@ runtime orchestrates and records · cli/mcp/dashboard are windows.*
 |---|---|---|
 | `hex-proto` | Versioned protocol: `Event`, `Command`, `Capability`. Only stable public surface. | — |
 | `hex-kernel` | **Pure**: Graph IR, journal model, projections, `reduce`/`schedule`/`accept`. No IO/subprocess/clock. | proto |
-| `hex-worker` | `Worker` trait + capability manifest + adapters (mock, subprocess, coding-agent presets). Runs **one** worker; never coordinates. | proto, kernel |
+| `hex-worker` | `Worker` trait + capability manifest + adapters (mock, subprocess, coding-agent presets). Runs **one** worker; never coordinates. | proto |
 | `hex-runtime` | Imperative shell: drive loop, effect execution, journal writer, control ingestion, workspace isolation, run supervision. Exposes the concrete `Runtime` — including `read_streams`, so tailing a live attempt needs no knowledge of `.hex/`. (The `RuntimeClient` trait it also exposed was deleted 2026-08-01: one impl, no callers.) | kernel, worker, proto |
 | `hex-cli` | The `hex` binary — thin client over `Runtime`; arg parsing + rendering only. | runtime |
 | `hex-mcp` | *(later)* MCP transport — a peer client of the CLI; can start/control runs. | runtime |

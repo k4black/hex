@@ -416,7 +416,7 @@ cycle only when its bound is actually enforced there.
       `hex status` renders the per-node/per-model breakdown — both off the same
       projection, so a third surface would only be somewhere for them to disagree.
       **`watch --follow` landed 2026-07-31** in the live-observability pass below,
-      together with `logs --follow`. Still open: `config show`, `graph --format source`.
+      together with `logs --follow`. Still open: `config show`. (`graph --format source` shipped and is how a preset is forked.)
 
 **(d) Presets & remaining cleanups**
 
@@ -426,14 +426,14 @@ cycle only when its bound is actually enforced there.
       research loop uses a deterministic content gate.
 - [~] Approved deletion batch — **done 2026-07-31**: `EventBody::BudgetExhausted`,
       `Journal::path()`, `hex_runtime::open()`, plus `Inbox::drain()` and
-      `Builder::commands()` found dead by the simplify pass. **Still open**:
-      the unadvertised `Capability` variants except `SessionResume`/`CostReporting`
-      (kept, and as of 2026-07-31 both are load-bearing: `context: continue` is
-      refused on a worker lacking `SessionResume`, and the two usage-reporting
-      adapters advertise `CostReporting`),
-      `hex-worker`'s unused `hex-kernel` dep, hardcoded
+      `Builder::commands()` found dead by the simplify pass. **Resolved 2026-09-05** (ponytail pass): the never-constructed
+      `Capability` variants (`StreamingOutput`/`GracefulCancel`/`ReadOnlyMode`)
+      and `Command::Status` deleted (`LiveSteering` kept — interactive sessions
+      are designed and the README names it); `hex-worker`'s unused `hex-kernel`
+      dep dropped. **Still open**: hardcoded
       `HEX_EMIT_FILE`/`HEX_MAY_PROPOSE` literals in the CLI;
-      drop `graph.sha256` (duplicates `RunCreated.graph_hash`); promote the
+      drop `graph.sha256` (duplicates `RunCreated.graph_hash`, but it is what
+      `verify_and_fold` checks today — needs a decision); promote the
       worktree lease out of `RunCreated.inputs` into a typed event (it stores an
       absolute path next to the operator prompt today). `supports()` and
       `Status::Paused` are **kept** — session resume and pause give them consumers.
@@ -832,6 +832,41 @@ Four decisions taken with the owner, then the findings of a second review round
 - [ ] Carried over, still open: the forged-journal attempt-id reuse hole and a run
       ending on a `human` node showing the last *agent* result (both in the payoff
       pass's "deliberately not fixed" list above).
+
+## Ponytail pass — landed 2026-09-05
+
+Whole-repo over-engineering audit (3 parallel reviewers), applied, plus the
+preset-library gaps. Dogfooded: the hex-cli half of the cuts was implemented by
+`hex run checklist --worktree` itself (claude-opus implementer, pi/gemini-3.8-flash
+reviewer via openrouter — the first real cross-model run on the pi worker).
+
+- [x] **New presets `code` / `research` / `pr`** — one-shot implementer, one-pass
+      sourced research, and critique-loop-then-open-a-PR (`gh`). All gate-free.
+- [x] **`hex-bench` deleted** — the one bench file moved to
+      `hex-runtime/benches/`; the crate was 8 lines of doc pulling three
+      non-dev deps.
+- [x] **Dead protocol surface cut** — `Command::Status` (no producer),
+      `Capability::{StreamingOutput,GracefulCancel,ReadOnlyMode}` (never
+      constructed or read), `ResultCapture::JsonResult` (+ its reader; no
+      in-tree producer since claude moved to stream-json), `hex-worker`'s
+      unused `hex-kernel` dep, `thiserror` (one derive → 7 lines of stdlib).
+- [x] **Test-suite shrink** — trivial/tautological tests deleted
+      (`replay_is_deterministic` folds a pure fn twice; clap-behaviour tests
+      assert clap, not hex), near-identical tests merged into tables
+      (proto wire shapes, interpolate cases, prompt sources), shared
+      helpers (`bounded()`/`rejects()`/`temp_dir()`/`answer_when_asked()`).
+      The kernel cost-fallback test now actually exercises the per-model-sum
+      path it names (it previously asserted 0 == 0).
+- [x] **Doc honesty** — README "Known broken" no longer lists the two
+      `on_unmet` cycle holes fixed 2026-08-08; `graph --format source` moved
+      off the not-built list; banned "pipeline" wording removed from
+      `plan-build-review`; gotcha 5b's result modes match the enum again.
+- [x] Declined, with reasons: `preset::list` single-map rewrite (couples into
+      `collect_yaml`, ~10 lines for real churn), `civil_from_days` → `time`
+      (dependency-free is deliberate), tempfile drop-guards (leaked temp dirs
+      are documented debug evidence), `Workers::new()` removal (~35 call
+      sites), `hex wait`/`hex runs` re-fold caching (real but invisible at
+      current journal sizes — still listed under deferred efficiency).
 
 ## Phase 2 — hardening & correctness
 

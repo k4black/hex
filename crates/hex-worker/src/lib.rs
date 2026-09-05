@@ -8,7 +8,7 @@
 //! runtime-scheduled graph constructs, or the external agent's own internal
 //! business — never logic in this crate.
 //!
-//! Depends on [`hex_proto`] and [`hex_kernel`], never the reverse.
+//! Depends on [`hex_proto`] only, never the reverse.
 
 use std::path::PathBuf;
 
