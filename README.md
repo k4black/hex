@@ -38,7 +38,6 @@ records · cli / mcp / dashboard are windows.**
 | [`hex-cli`](crates/hex-cli) | The `hex` binary — a **thin client** over `Runtime`. Arg parsing + rendering only. | runtime |
 | [`hex-mcp`](crates/hex-mcp) | *(later)* MCP transport — a thin client/peer of the CLI over the same `Runtime` API. Can start and control runs. | runtime |
 | [`hex-dashboard`](crates/hex-dashboard) | *(later)* TUI/web viewer — another thin client; also able to start runs. | runtime |
-| [`hex-bench`](crates/hex-bench) | Criterion benchmarks. | kernel, runtime |
 
 Dependency direction stays strictly inward: `proto ← kernel ← runtime`,
 `proto,kernel ← worker`, `worker,kernel ← runtime`, all clients `← runtime`.
@@ -165,7 +164,6 @@ accept:
 > you answer it with `hex respond <run> "…"`, from any terminal or from a driving
 > agent; the answer becomes that node's result, so a downstream prompt can
 > reference `{{clarify.result}}` exactly like an agent's.
-
 
 The kernel compiles any surface form to a flat, immutable Graph IR
 (nodes + typed edges + bounds); a run records the exact snapshot + hash. Every

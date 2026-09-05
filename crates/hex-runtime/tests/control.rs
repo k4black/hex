@@ -84,6 +84,37 @@ fn queue(json: &str) -> String {
 
 const FROM_OPERATOR: &str = r#""actor":{"kind":"human","id":"t"}"#;
 
+/// The operator side of a `human` node: a thread that waits for the run to ask
+/// (its journal records `human_requested`), then queues `commands` in order —
+/// the real sequence, and proof the driver is genuinely blocked rather than
+/// racing ahead.
+fn answer_when_asked(root: &Path, commands: Vec<Command>) -> std::thread::JoinHandle<()> {
+    let watched = root.to_path_buf();
+    std::thread::spawn(move || {
+        for _ in 0..200 {
+            let run_dir = std::fs::read_dir(watched.join(".hex").join("runs"))
+                .ok()
+                .and_then(|d| {
+                    d.filter_map(Result::ok)
+                        .map(|e| e.path())
+                        .find(|p| p.is_dir())
+                });
+            if let Some(dir) = run_dir
+                && std::fs::read_to_string(dir.join("events.jsonl"))
+                    .is_ok_and(|j| j.contains("human_requested"))
+            {
+                let inbox = Inbox::new(&dir);
+                for cmd in &commands {
+                    inbox.send(&Actor::human("t"), cmd).expect("send command");
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the run never asked for a human decision");
+    })
+}
+
 fn workers(scripts: &[(&str, String)]) -> Workers {
     let mut ws = Workers::new();
     for (name, script) in scripts {
@@ -302,36 +333,12 @@ fn a_human_node_blocks_until_answered_and_its_answer_becomes_the_node_result() {
     );
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), ws);
 
-    // The operator: waits for the question, then answers — the real sequence, and
-    // proof the driver is genuinely blocked rather than racing ahead.
-    let watched = root.clone();
-    let operator = std::thread::spawn(move || {
-        for _ in 0..200 {
-            let run_dir = std::fs::read_dir(watched.join(".hex").join("runs"))
-                .ok()
-                .and_then(|d| {
-                    d.filter_map(Result::ok)
-                        .map(|e| e.path())
-                        .find(|p| p.is_dir())
-                });
-            if let Some(dir) = run_dir
-                && std::fs::read_to_string(dir.join("events.jsonl"))
-                    .is_ok_and(|j| j.contains("human_requested"))
-            {
-                Inbox::new(&dir)
-                    .send(
-                        &Actor::human("t"),
-                        &Command::Respond {
-                            text: "SHIP-IT-BUT-RENAME-THE-FLAG".to_owned(),
-                        },
-                    )
-                    .expect("send respond");
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        panic!("the run never asked for a human decision");
-    });
+    let operator = answer_when_asked(
+        &root,
+        vec![Command::Respond {
+            text: "SHIP-IT-BUT-RENAME-THE-FLAG".to_owned(),
+        }],
+    );
 
     let report = runtime
         .start("ap", None, None, &Isolation::Shared)
@@ -398,43 +405,17 @@ fn a_respond_and_a_steer_queued_together_both_apply() {
     );
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), ws);
 
-    let watched = root.clone();
-    let operator = std::thread::spawn(move || {
-        for _ in 0..200 {
-            let run_dir = std::fs::read_dir(watched.join(".hex").join("runs"))
-                .ok()
-                .and_then(|d| {
-                    d.filter_map(Result::ok)
-                        .map(|e| e.path())
-                        .find(|p| p.is_dir())
-                });
-            if let Some(dir) = run_dir
-                && std::fs::read_to_string(dir.join("events.jsonl"))
-                    .is_ok_and(|j| j.contains("human_requested"))
-            {
-                let inbox = Inbox::new(&dir);
-                inbox
-                    .send(
-                        &Actor::human("t"),
-                        &Command::Steer {
-                            text: "USE-THE-V2-API".to_owned(),
-                        },
-                    )
-                    .expect("send steer");
-                inbox
-                    .send(
-                        &Actor::human("t"),
-                        &Command::Respond {
-                            text: "SHIP-IT".to_owned(),
-                        },
-                    )
-                    .expect("send respond");
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        panic!("the run never asked for a human decision");
-    });
+    let operator = answer_when_asked(
+        &root,
+        vec![
+            Command::Steer {
+                text: "USE-THE-V2-API".to_owned(),
+            },
+            Command::Respond {
+                text: "SHIP-IT".to_owned(),
+            },
+        ],
+    );
 
     let report = runtime
         .start("ap", None, None, &Isolation::Shared)

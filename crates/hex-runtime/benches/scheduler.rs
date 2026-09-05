@@ -37,7 +37,7 @@ fn bench_schedule(c: &mut Criterion) {
 }
 
 fn bench_load(c: &mut Criterion) {
-    let source = include_str!("../../hex-runtime/src/presets/critique-loop.yaml");
+    let source = include_str!("../src/presets/critique-loop.yaml");
     let config = Config::default();
     c.bench_function("runtime_load_critique_loop", |b| {
         b.iter(|| hex_runtime::loader::load(black_box(source), black_box(&config)).expect("loads"));

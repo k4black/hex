@@ -32,8 +32,6 @@ pub struct Finding {
     pub name: String,
     /// The executable that would be spawned, if the entry names one.
     pub program: Option<String>,
-    /// Where it resolved on `PATH`, when found.
-    pub found: Option<PathBuf>,
     /// Whether this entry is usable.
     pub ok: bool,
     /// Human-readable detail (why not, or what was found).
@@ -113,7 +111,6 @@ fn probe(kind: &'static str, name: &str, program: Option<&str>) -> Finding {
             kind,
             name: name.to_owned(),
             program: None,
-            found: None,
             // A worker that spawns nothing (the mock) is fine; it just isn't a
             // binary we can check.
             ok: true,
@@ -126,14 +123,12 @@ fn probe(kind: &'static str, name: &str, program: Option<&str>) -> Finding {
             name: name.to_owned(),
             program: Some(program.to_owned()),
             detail: path.display().to_string(),
-            found: Some(path),
             ok: true,
         },
         None => Finding {
             kind,
             name: name.to_owned(),
             program: Some(program.to_owned()),
-            found: None,
             ok: false,
             detail: format!("`{program}` not found on PATH"),
         },

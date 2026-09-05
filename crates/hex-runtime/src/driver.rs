@@ -360,9 +360,6 @@ impl<'a> Session<'a> {
                 )?;
                 return Ok(true);
             }
-            // A query, not a state change: status is projected from the journal
-            // by whoever asks, so there is nothing to queue.
-            Command::Status => {}
         }
         Ok(false)
     }
@@ -1207,13 +1204,7 @@ fn interpolate(
 #[must_use]
 pub fn graph_hash(source: &str) -> String {
     use sha2::{Digest, Sha256};
-    use std::fmt::Write as _;
-    let digest = Sha256::digest(source.as_bytes());
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    format!("{:x}", Sha256::digest(source.as_bytes()))
 }
 
 /// The session id to resume, given the recorded handle and the program that is
@@ -1427,10 +1418,47 @@ mod interpolate_tests {
         m
     }
 
+    /// One table over the pure text-in/text-out cases; the fencing and
+    /// re-interpretation guards keep their own tests below.
     #[test]
-    fn substitutes_operator_prompt_for_the_prompt_token() {
-        let out = interpolate(&graph(), "do: {{prompt}}", Some("build X"), &results());
-        assert_eq!(out, "do: build X");
+    fn interpolation_text_cases() {
+        // (case, template, operator prompt, expected)
+        let cases = [
+            (
+                "operator prompt substitutes",
+                "do: {{prompt}}",
+                Some("build X"),
+                "do: build X",
+            ),
+            (
+                "unknown result renders a placeholder",
+                "{{missing.result}}",
+                None,
+                "[missing.result: none yet]",
+            ),
+            (
+                "nested braces take the first terminator",
+                "{{ {{prompt}} }}",
+                Some("X"),
+                "{{ {{prompt}} }}",
+            ),
+            (
+                "unterminated token is literal",
+                "tail {{prompt",
+                Some("X"),
+                "tail {{prompt",
+            ),
+            (
+                "missing operator prompt preserves the token",
+                "{{prompt}}",
+                None,
+                "{{prompt}}",
+            ),
+        ];
+        for (name, template, prompt, expected) in cases {
+            let out = interpolate(&graph(), template, prompt, &results());
+            assert_eq!(out, expected, "{name}");
+        }
     }
 
     #[test]
@@ -1452,12 +1480,6 @@ mod interpolate_tests {
         assert!(!out.contains("untrusted agent output"), "{out}");
         assert!(out.contains("SHIP-IT"));
         assert!(out.contains("[end approve.result#"), "still fenced: {out}");
-    }
-
-    #[test]
-    fn unknown_result_reference_renders_a_placeholder() {
-        let out = interpolate(&graph(), "{{missing.result}}", None, &results());
-        assert_eq!(out, "[missing.result: none yet]");
     }
 
     #[test]
@@ -1485,25 +1507,5 @@ mod interpolate_tests {
         // The operator prompt is not leaked into the (later-inserted) result body.
         assert!(!out.contains("SECRET"));
         assert!(out.contains("see {{prompt}} and {{other.result}}"));
-    }
-
-    #[test]
-    fn nested_braces_in_template_take_the_first_terminator() {
-        // `{{ {{prompt}} }}` → the span `{{ {{prompt}}` is an unrecognized token
-        // (trimmed `{{prompt`), so it is preserved verbatim; nothing substitutes.
-        let out = interpolate(&graph(), "{{ {{prompt}} }}", Some("X"), &results());
-        assert_eq!(out, "{{ {{prompt}} }}");
-    }
-
-    #[test]
-    fn unterminated_template_token_is_emitted_literally() {
-        let out = interpolate(&graph(), "tail {{prompt", Some("X"), &results());
-        assert_eq!(out, "tail {{prompt");
-    }
-
-    #[test]
-    fn missing_operator_prompt_preserves_the_token() {
-        let out = interpolate(&graph(), "{{prompt}}", None, &results());
-        assert_eq!(out, "{{prompt}}");
     }
 }

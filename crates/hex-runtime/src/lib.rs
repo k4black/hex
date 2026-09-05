@@ -1469,11 +1469,7 @@ mod tests {
     /// is the case worth pinning: `10-x` must follow `9-x`.
     #[test]
     fn step_logs_are_ordered_by_declared_position_not_by_name() {
-        let dir = std::env::temp_dir().join(format!(
-            "hex-steplogs-{}-{}",
-            std::process::id(),
-            test_support::unique()
-        ));
+        let dir = test_support::temp_dir("steplogs");
         for (i, label) in ["9-clippy", "10-test", "1-fmt"].iter().enumerate() {
             let step = dir.join(label);
             std::fs::create_dir_all(&step).expect("mkdir");
@@ -1494,8 +1490,7 @@ mod tests {
     /// run resumable while a live one cannot be double-driven.
     #[test]
     fn run_lock_rejects_a_second_holder_and_releases_on_drop() {
-        let dir = std::env::temp_dir().join(format!("hex-runlock-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = test_support::temp_dir("runlock");
 
         let held = RunLock::acquire(&dir).expect("first acquire");
         assert!(

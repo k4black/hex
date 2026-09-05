@@ -37,7 +37,6 @@ nix = { version = "0.30", features = ["signal"] }
 # no `unsafe` and no async-signal-safety constraints). Already in the tree:
 # crossterm depends on it, so naming it directly adds no crates.
 signal-hook = "0.3"
-thiserror = "2"              # derive Display/Error on the runtime error type
 # inline-viewport TUI for the live run preview; unstable-rendered-line-info
 # provides Paragraph::line_count for wrapping inserted lines.
 # Terminal styling. All four are already in the tree (anstyle/anstyle-query via

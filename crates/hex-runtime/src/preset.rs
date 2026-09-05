@@ -274,7 +274,6 @@ fn user_graphs_dir() -> Option<PathBuf> {
 mod tests {
 
     use super::*;
-    use crate::test_support::unique;
 
     #[test]
     fn resolves_the_builtin_critique_loop() {
@@ -284,21 +283,20 @@ mod tests {
     }
 
     #[test]
-    fn unknown_name_errors() {
-        assert!(resolve("nope", Path::new("/nonexistent")).is_err());
-    }
-
-    #[test]
-    fn missing_path_is_a_hard_error() {
-        assert!(resolve("./missing.yaml", Path::new("/nonexistent")).is_err());
+    fn unknown_name_or_missing_path_is_a_hard_error() {
+        for reference in ["nope", "./missing.yaml"] {
+            assert!(
+                resolve(reference, Path::new("/nonexistent")).is_err(),
+                "{reference}"
+            );
+        }
     }
 
     #[test]
     fn a_yml_graph_is_both_listed_and_resolvable() {
         // Regression: `list` and `resolve` must agree on extensions, so a graph
         // shown by `hex list` is exactly what `hex run` executes.
-        let root =
-            std::env::temp_dir().join(format!("hex-yml-{}-{}", std::process::id(), unique()));
+        let root = crate::test_support::temp_dir("yml");
         let graphs = root.join(".hex").join("graphs");
         std::fs::create_dir_all(&graphs).expect("mkdir");
         std::fs::write(graphs.join("only-yml.yml"), "version: 1").expect("write");
@@ -310,8 +308,7 @@ mod tests {
 
     #[test]
     fn list_includes_builtins_and_project_graphs() {
-        let root =
-            std::env::temp_dir().join(format!("hex-list-{}-{}", std::process::id(), unique()));
+        let root = crate::test_support::temp_dir("list");
         let graphs = root.join(".hex").join("graphs");
         std::fs::create_dir_all(&graphs).expect("mkdir");
         std::fs::write(graphs.join("mine.yaml"), "version: 1").expect("write");

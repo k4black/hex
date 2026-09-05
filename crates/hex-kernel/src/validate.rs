@@ -792,6 +792,20 @@ mod tests {
             .build()
     }
 
+    /// A run-bounding budget, so cycle validation is not the thing under test.
+    fn bounded() -> Budget {
+        Budget {
+            attempts: Some(2),
+            ..Budget::default()
+        }
+    }
+
+    /// Assert `validate` rejects the graph with the given issue code.
+    fn rejects(g: &Graph, code: &str) {
+        let issues = validate(g).unwrap_err();
+        assert!(issues.iter().any(|i| i.code == code), "{code}: {issues:?}");
+    }
+
     #[test]
     fn bounded_cycle_is_valid() {
         let g = cyclic(Budget {
@@ -804,8 +818,7 @@ mod tests {
     #[test]
     fn unbounded_cycle_is_rejected() {
         let g = cyclic(Budget::default());
-        let issues = validate(&g).unwrap_err();
-        assert!(issues.iter().any(|i| i.code == "E-unbounded-cycle"));
+        rejects(&g, "E-unbounded-cycle");
     }
 
     /// `implement --ready|blocked--> done`, acceptance requiring `implement.ready`
@@ -879,11 +892,7 @@ mod tests {
             .on_unmet("implement")
             .max_visits("done", 3)
             .build();
-        let issues = validate(&g).unwrap_err();
-        assert!(
-            issues.iter().any(|i| i.code == "E-unbounded-cycle"),
-            "{issues:?}"
-        );
+        rejects(&g, "E-unbounded-cycle");
     }
 
     /// A human response spends no attempt, so `budget.attempts` cannot stop a
@@ -899,10 +908,7 @@ mod tests {
                 .terminal("done", Disposition::Succeeded)
                 .edge("ask", "answered", "confirm")
                 .edge("confirm", "answered", "ask")
-                .budget(Budget {
-                    attempts: Some(2),
-                    ..Budget::default()
-                });
+                .budget(bounded());
             if let Some(v) = visits {
                 b = b.max_visits("ask", v);
             }
@@ -944,13 +950,9 @@ mod tests {
         let g = Graph::builder("t", "a")
             .agent("a", "w", "p", &["go"])
             .edge("a", "go", "nowhere")
-            .budget(Budget {
-                attempts: Some(2),
-                ..Budget::default()
-            })
+            .budget(bounded())
             .build();
-        let issues = validate(&g).unwrap_err();
-        assert!(issues.iter().any(|i| i.code == "E-edge-to"));
+        rejects(&g, "E-edge-to");
     }
 
     #[test]
@@ -959,13 +961,9 @@ mod tests {
             .agent("a", "w", "p", &["go", "stop"])
             .terminal("done", Disposition::Succeeded)
             .edge("a", "go", "done")
-            .budget(Budget {
-                attempts: Some(2),
-                ..Budget::default()
-            })
+            .budget(bounded())
             .build();
-        let issues = validate(&g).unwrap_err();
-        assert!(issues.iter().any(|i| i.code == "E-proposal-no-edge"));
+        rejects(&g, "E-proposal-no-edge");
     }
 
     fn ev(seq: u64, node: Option<&str>, attempt: Option<&str>, body: EventBody) -> Event {
@@ -1128,14 +1126,10 @@ mod tests {
             .agent("a", "w", "p", &["go"])
             .terminal("done", Disposition::Succeeded)
             .edge("a", "go", "done")
-            .budget(Budget {
-                attempts: Some(2),
-                ..Budget::default()
-            })
+            .budget(bounded())
             .require("a", "nope")
             .build();
-        let issues = validate(&g).unwrap_err();
-        assert!(issues.iter().any(|i| i.code == "E-accept-unsatisfiable"));
+        rejects(&g, "E-accept-unsatisfiable");
     }
 
     #[test]
@@ -1144,13 +1138,9 @@ mod tests {
             .agent("a", "w", "p", &["Go Now"])
             .terminal("done", Disposition::Succeeded)
             .edge("a", "Go Now", "done")
-            .budget(Budget {
-                attempts: Some(2),
-                ..Budget::default()
-            })
+            .budget(bounded())
             .build();
-        let issues = validate(&g).unwrap_err();
-        assert!(issues.iter().any(|i| i.code == "E-bad-signal-name"));
+        rejects(&g, "E-bad-signal-name");
     }
 
     #[test]
@@ -1179,16 +1169,9 @@ mod tests {
             .agent("a", "w", "use {{ghost.result}}", &["go"])
             .terminal("done", Disposition::Succeeded)
             .edge("a", "go", "done")
-            .budget(Budget {
-                attempts: Some(2),
-                ..Budget::default()
-            })
+            .budget(bounded())
             .build();
-        let issues = validate(&g).unwrap_err();
-        assert!(
-            issues.iter().any(|i| i.code == "E-result-ref"),
-            "{issues:?}"
-        );
+        rejects(&g, "E-result-ref");
     }
 
     #[test]
@@ -1207,11 +1190,7 @@ mod tests {
             })
             .require("check", "passed")
             .build();
-        let issues = validate(&g).unwrap_err();
-        assert!(
-            issues.iter().any(|i| i.code == "E-result-ref"),
-            "{issues:?}"
-        );
+        rejects(&g, "E-result-ref");
     }
 
     #[test]
@@ -1220,16 +1199,9 @@ mod tests {
             .agent("a", "w", "look at {{ghost.result and go", &["go"])
             .terminal("done", Disposition::Succeeded)
             .edge("a", "go", "done")
-            .budget(Budget {
-                attempts: Some(2),
-                ..Budget::default()
-            })
+            .budget(bounded())
             .build();
-        let issues = validate(&g).unwrap_err();
-        assert!(
-            issues.iter().any(|i| i.code == "E-result-ref"),
-            "{issues:?}"
-        );
+        rejects(&g, "E-result-ref");
     }
 
     #[test]
@@ -1239,10 +1211,7 @@ mod tests {
             .agent("a", "w", "p", &[])
             .terminal("fin", Disposition::Succeeded)
             .edge("a", "done", "fin")
-            .budget(Budget {
-                attempts: Some(2),
-                ..Budget::default()
-            })
+            .budget(bounded())
             .require("a", "done")
             .build();
         assert!(validate(&g).is_ok(), "{:?}", validate(&g));
@@ -1254,16 +1223,9 @@ mod tests {
             .agent("a", "w", "p", &["done"])
             .terminal("fin", Disposition::Succeeded)
             .edge("a", "done", "fin")
-            .budget(Budget {
-                attempts: Some(2),
-                ..Budget::default()
-            })
+            .budget(bounded())
             .build();
-        let issues = validate(&g).unwrap_err();
-        assert!(
-            issues.iter().any(|i| i.code == "E-done-reserved"),
-            "{issues:?}"
-        );
+        rejects(&g, "E-done-reserved");
     }
 
     /// A `human` node with the edges it needs: `hex validate` used to accept
@@ -1275,44 +1237,26 @@ mod tests {
             .terminal("fin", Disposition::Succeeded)
             .terminal("stop", Disposition::Failed)
             .edge("plan", "done", "approve");
+        builder = builder.human("approve", "approve: {{plan.result}}");
         for (on, to) in edges {
             builder = builder.edge("approve", on, to);
         }
-        let mut graph = builder.build();
-        // The builder has no `human` arm; the IR is public, so insert directly.
-        graph.nodes.insert(
-            "approve".to_owned(),
-            crate::graph::Node::new(
-                "approve",
-                NodeSpec::Human {
-                    prompt: "approve: {{plan.result}}".to_owned(),
-                },
-            ),
-        );
-        graph
+        builder.build()
     }
 
     /// An approval node's answer is a first-class result: `{{approve.result}}`
     /// must resolve, exactly as an agent's captured message does.
     #[test]
     fn a_human_node_with_one_edge_is_valid_and_can_hand_on_its_answer() {
-        let mut g = Graph::builder("t", "plan")
+        let g = Graph::builder("t", "plan")
             .agent("plan", "w", "make a plan", &[])
             .agent("note", "w", "the operator said {{approve.result}}", &[])
+            .human("approve", "approve: {{plan.result}}")
             .terminal("fin", Disposition::Succeeded)
             .edge("plan", "done", "approve")
             .edge("approve", "done", "note")
             .edge("note", "done", "fin")
             .build();
-        g.nodes.insert(
-            "approve".to_owned(),
-            crate::graph::Node::new(
-                "approve",
-                NodeSpec::Human {
-                    prompt: "approve: {{plan.result}}".to_owned(),
-                },
-            ),
-        );
         assert!(validate(&g).is_ok(), "{:?}", validate(&g));
     }
 
@@ -1768,12 +1712,8 @@ mod tests {
             .terminal("done", Disposition::Succeeded)
             .terminal("orphan", Disposition::Failed)
             .edge("a", "go", "done")
-            .budget(Budget {
-                attempts: Some(2),
-                ..Budget::default()
-            })
+            .budget(bounded())
             .build();
-        let issues = validate(&g).unwrap_err();
-        assert!(issues.iter().any(|i| i.code == "E-unreachable"));
+        rejects(&g, "E-unreachable");
     }
 }

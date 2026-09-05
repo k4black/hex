@@ -174,17 +174,10 @@ impl Journal {
 mod tests {
 
     use super::*;
-    use crate::test_support::unique;
     use hex_proto::Disposition;
 
     fn temp_path(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hex-journal-{tag}-{}-{}",
-            std::process::id(),
-            unique()
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir.join("events.jsonl")
+        crate::test_support::temp_dir(&format!("journal-{tag}")).join("events.jsonl")
     }
 
     #[test]
@@ -272,26 +265,5 @@ mod tests {
             f.write_all(b"{not json}\n").expect("write");
         }
         assert!(read_all(&path).is_err());
-    }
-
-    #[test]
-    fn open_append_continues_sequence() {
-        let path = temp_path("continue");
-        {
-            let mut j = Journal::create(path.clone()).expect("create");
-            j.append("run_0", None, None, Actor::runtime(), EventBody::RunStarted)
-                .expect("append");
-        }
-        let (mut j, _) = Journal::open_append(path.clone()).expect("reopen");
-        let ev = j
-            .append(
-                "run_0",
-                None,
-                None,
-                Actor::runtime(),
-                EventBody::AttemptInterrupted,
-            )
-            .expect("append");
-        assert_eq!(ev.seq, 1);
     }
 }

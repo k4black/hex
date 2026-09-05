@@ -23,7 +23,6 @@ runtime orchestrates and records · cli/mcp/dashboard are windows.*
 | `hex-cli` | The `hex` binary — thin client over `Runtime`; arg parsing + rendering only. | runtime |
 | `hex-mcp` | *(later)* MCP transport — a peer client of the CLI; can start/control runs. | runtime |
 | `hex-dashboard` | *(later)* TUI/web viewer — another thin client. | runtime |
-| `hex-bench` | Cross-crate criterion benchmarks. | kernel, runtime |
 
 ## Commands
 
@@ -32,7 +31,7 @@ cargo build --workspace
 cargo test  --workspace
 cargo clippy --workspace --all-targets   # workspace lints: unsafe forbidden, clippy::all warn
 cargo run   --bin hex                     # NOT `cargo run -p hex` — package is hex-cli, binary is hex
-cargo bench                               # criterion, in hex-bench
+cargo bench                               # criterion, in hex-runtime/benches
 ```
 
 ## Core rules
@@ -202,8 +201,10 @@ sign-off, confirmation.
    reach the `hex` binary. `may_propose` is enforced both at emit and at ingest.
 5b. **Result capture & implicit completion.** The runtime also injects
    `HEX_RESULT_FILE` and a `{result}` argv token; a worker's `result:`
-   (`file`|`json_result`) says how to capture its final message (codex
-   `--output-last-message {result}`, claude `--output-format json` → `.result`).
+   (`file`|`jsonl_result`|`jsonl_last_text`|`pi_jsonl`) says how to capture its
+   final message (codex `--output-last-message {result}`, claude stream-json's
+   last `result` line; `json_result` — a single JSON object — was deleted
+   2026-09-05 with no producer left in-tree).
    The capture is recorded as `EventBody::NodeResult` and folded into
    `RunState.results`; a downstream prompt references it as `{{node.result}}`,
    interpolated **at attempt-start** in the driver (not compile-time) and wrapped

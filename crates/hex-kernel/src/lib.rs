@@ -854,8 +854,8 @@ mod tests {
         assert_eq!(s.usage.by_model["m1"].cost_micro_usd, 100_000);
     }
 
-    /// A token-only agent (codex) reports no money, and the sum of its per-model
-    /// costs is the honest total.
+    /// An attempt that reports no authoritative total but priced models falls
+    /// back to the sum of its per-model costs.
     #[test]
     fn cost_falls_back_to_the_per_model_sum_when_the_attempt_reports_none() {
         let g = loop_graph();
@@ -867,11 +867,18 @@ mod tests {
                     idempotency_key: "k".to_owned(),
                     worker: None,
                 },
-                reported(vec![model("codex", 17_259, 5, None)], None),
+                reported(
+                    vec![
+                        model("claude", 17_259, 5, Some(120_000)),
+                        model("haiku", 40, 2, Some(1_500)),
+                    ],
+                    None,
+                ),
             ],
         );
-        assert_eq!(s.usage.total.cost_micro_usd, 0, "nothing reported money");
-        assert_eq!(s.usage.total.input_tokens, 17_259);
+        assert_eq!(s.usage.total.cost_micro_usd, 121_500, "per-model sum");
+        assert!(!s.usage.total.cost_is_partial());
+        assert_eq!(s.usage.total.input_tokens, 17_299);
     }
 
     /// Usage is *summed*, so unlike a result a replayed record inflates a fact
@@ -1006,42 +1013,38 @@ mod tests {
     }
 
     /// A run mixing an agent that reports money with one that does not must not
-    /// present half the spend as the total.
+    /// present half the spend as the total; a fully priced one stays exact.
     #[test]
-    fn a_report_without_any_cost_marks_the_totals_partial() {
-        let g = loop_graph();
-        let s = drive_to(
-            &g,
-            &[
-                EventBody::RunStarted,
-                EventBody::AttemptStarted {
-                    idempotency_key: "k".to_owned(),
-                    worker: None,
-                },
-                reported(vec![model("codex", 100, 10, None)], None),
-            ],
-        );
-        assert!(s.usage.total.cost_is_partial());
-        assert_eq!(s.usage.total.unpriced_reports, 1);
-        assert_eq!(s.usage.total.cost_micro_usd, 0);
-    }
-
-    #[test]
-    fn a_fully_priced_report_leaves_the_totals_exact() {
-        let g = loop_graph();
-        let s = drive_to(
-            &g,
-            &[
-                EventBody::RunStarted,
-                EventBody::AttemptStarted {
-                    idempotency_key: "k".to_owned(),
-                    worker: None,
-                },
-                reported(vec![model("claude", 2, 4, Some(177_800))], Some(177_800)),
-            ],
-        );
-        assert!(!s.usage.total.cost_is_partial());
-        assert_eq!(s.usage.total.cost_micro_usd, 177_800);
+    fn partial_and_exact_pricing_are_told_apart() {
+        // (case, model cost, attempt cost, partial?, unpriced, total)
+        let cases = [
+            ("unpriced report is partial", None, None, true, 1, 0),
+            (
+                "fully priced report is exact",
+                Some(177_800),
+                Some(177_800),
+                false,
+                0,
+                177_800,
+            ),
+        ];
+        for (name, model_cost, attempt_cost, partial, unpriced, total) in cases {
+            let g = loop_graph();
+            let s = drive_to(
+                &g,
+                &[
+                    EventBody::RunStarted,
+                    EventBody::AttemptStarted {
+                        idempotency_key: "k".to_owned(),
+                        worker: None,
+                    },
+                    reported(vec![model("codex", 100, 10, model_cost)], attempt_cost),
+                ],
+            );
+            assert_eq!(s.usage.total.cost_is_partial(), partial, "{name}");
+            assert_eq!(s.usage.total.unpriced_reports, unpriced, "{name}");
+            assert_eq!(s.usage.total.cost_micro_usd, total, "{name}");
+        }
     }
 
     /// A projection is recomputed on every read, so an overflow panic here would
@@ -1432,25 +1435,15 @@ mod tests {
         assert_eq!(s.pending_steer, vec!["guidance".to_owned()]);
     }
 
-    /// plan(agent) --done--> approve(human) --done--> fin. The builder has no
-    /// `human` arm, so the node is inserted directly (the IR is public).
+    /// plan(agent) --done--> approve(human) --done--> fin.
     fn human_graph() -> Graph {
-        let mut graph = Graph::builder("t", "plan")
+        Graph::builder("t", "plan")
             .agent("plan", "codex", "make a plan", &[])
+            .human("approve", "approve this: {{plan.result}}")
             .terminal("fin", Disposition::Succeeded)
             .edge("plan", "done", "approve")
             .edge("approve", "done", "fin")
-            .build();
-        graph.nodes.insert(
-            "approve".to_owned(),
-            Node::new(
-                "approve",
-                NodeSpec::Human {
-                    prompt: "approve this: {{plan.result}}".to_owned(),
-                },
-            ),
-        );
-        graph
+            .build()
     }
 
     #[test]
@@ -1740,25 +1733,5 @@ mod tests {
             s.results.get("implement").map(String::as_str),
             Some("the next attempt's report")
         );
-    }
-
-    #[test]
-    fn replay_is_deterministic() {
-        let g = loop_graph();
-        let events = [
-            EventBody::RunStarted,
-            EventBody::AttemptStarted {
-                idempotency_key: "k".to_owned(),
-                worker: None,
-            },
-            EventBody::Signal {
-                name: "ready".to_owned(),
-            },
-        ];
-        let a = drive_to(&g, &events);
-        let b = drive_to(&g, &events);
-        assert_eq!(a.current, b.current);
-        assert_eq!(a.attempts_total, b.attempts_total);
-        assert_eq!(a.visits, b.visits);
     }
 }

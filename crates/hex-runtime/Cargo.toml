@@ -21,7 +21,14 @@ sha2 = { workspace = true }
 fs4 = { workspace = true }
 uuid = { workspace = true }
 humantime = { workspace = true }
-thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "scheduler"
+harness = false
 
 [lints]
 workspace = true

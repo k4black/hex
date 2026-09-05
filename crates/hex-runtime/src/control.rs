@@ -368,13 +368,7 @@ mod tests {
     use super::*;
 
     fn temp_run_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hex-control-{tag}-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir
+        crate::test_support::temp_dir(&format!("control-{tag}"))
     }
 
     /// `queued` is what lets `hex status` distinguish "sent, nobody has looked at

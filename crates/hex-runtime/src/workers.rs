@@ -81,10 +81,10 @@ fn build(
     effort: Option<String>,
 ) -> Box<dyn Worker> {
     match spec.kind {
-        WorkerKind::Codex => Box::new(CodexWorker::new(model).with_effort(effort)),
-        WorkerKind::Claude => Box::new(ClaudeWorker::new(model).with_effort(effort)),
+        WorkerKind::Codex => Box::new(CodexWorker::new(model, effort)),
+        WorkerKind::Claude => Box::new(ClaudeWorker::new(model, effort)),
         WorkerKind::Opencode => Box::new(OpencodeWorker::new(model)),
-        WorkerKind::Pi => Box::new(PiWorker::new(model).with_effort(effort)),
+        WorkerKind::Pi => Box::new(PiWorker::new(model, effort)),
         WorkerKind::Command => Box::new(
             CommandWorker::new(name.to_owned(), spec.command.clone())
                 .with_result_capture(spec.result),

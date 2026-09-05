@@ -77,8 +77,7 @@ pub enum ActorKind {
 
 impl ActorKind {
     /// The canonical snake_case name — the same spelling serde uses on the wire.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             ActorKind::Runtime => "runtime",
             ActorKind::Agent => "agent",
@@ -350,9 +349,8 @@ impl ModelUsage {
     /// Every token this model consumed, however the agent classified it.
     ///
     /// Saturating: these are numbers an agent reported and a journal replayed, so
-    /// nothing here is trusted arithmetic. An unchecked sum would panic in debug
-    /// on a garbled value, and a projection recomputed on every read turns that
-    /// panic into a permanently unreadable run.
+    /// nothing here is trusted arithmetic (gotcha: an unchecked sum panics in
+    /// debug on a garbled value and wraps in release).
     #[must_use]
     pub fn tokens(&self) -> u64 {
         self.input_tokens
@@ -374,8 +372,6 @@ impl ModelUsage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
-    /// Report the projected run status.
-    Status,
     /// Stop scheduling new attempts.
     Pause,
     /// Continue the same run from its journal (after pause *or* crash).
@@ -399,7 +395,6 @@ impl Command {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
-            Command::Status => "status",
             Command::Pause => "pause",
             Command::Resume => "resume",
             Command::Cancel => "cancel",
@@ -417,20 +412,14 @@ impl Command {
 pub enum Capability {
     /// Emits structured events rather than only prose on stdout.
     StructuredEvents,
-    /// Streams output incrementally.
-    StreamingOutput,
     /// Can start a fresh agent session per attempt.
     FreshSessions,
     /// Can resume a prior agent session.
     SessionResume,
     /// Accepts mid-attempt steering input (required for interactive sessions).
     LiveSteering,
-    /// Supports graceful cancellation.
-    GracefulCancel,
     /// Reports token/cost usage per attempt.
     CostReporting,
-    /// Can run the agent in a read-only mode.
-    ReadOnlyMode,
 }
 
 #[cfg(test)]
@@ -450,30 +439,72 @@ mod tests {
         }
     }
 
+    /// One table over the wire shapes: each case serializes, checks the strings
+    /// that must (and must not) appear, and round-trips back to `Eq`.
     #[test]
-    fn protocol_version_is_pinned() {
-        assert_eq!(PROTOCOL_VERSION, 1);
-    }
-
-    #[test]
-    fn signal_event_roundtrips_flat() {
-        let ev = event(EventBody::Signal {
-            name: "passed".to_owned(),
+    fn event_wire_shapes() {
+        let mut human = event(EventBody::HumanResponded {
+            text: "ship it".to_owned(),
+            signal: "done".to_owned(),
         });
-        let json = serde_json::to_string(&ev).expect("serializes");
-        assert!(json.contains("\"kind\":\"signal\""));
-        assert!(json.contains("\"name\":\"passed\""));
-        let back: Event = serde_json::from_str(&json).expect("deserializes");
-        assert_eq!(back, ev);
-    }
-
-    #[test]
-    fn run_finished_carries_disposition() {
-        let ev = event(EventBody::RunFinished {
-            disposition: Disposition::Succeeded,
-        });
-        let json = serde_json::to_string(&ev).expect("serializes");
-        assert!(json.contains("\"disposition\":\"succeeded\""));
+        human.actor = Actor::human("kc");
+        let cases: &[(&str, Event, &[&str], &[&str])] = &[
+            (
+                "signal is flat",
+                event(EventBody::Signal {
+                    name: "passed".to_owned(),
+                }),
+                &["\"kind\":\"signal\"", "\"name\":\"passed\""],
+                &[],
+            ),
+            (
+                "run_finished carries disposition",
+                event(EventBody::RunFinished {
+                    disposition: Disposition::Succeeded,
+                }),
+                &["\"disposition\":\"succeeded\""],
+                &[],
+            ),
+            (
+                "human_responded carries actor and routing signal",
+                human,
+                &[
+                    "\"kind\":\"human_responded\"",
+                    "\"signal\":\"done\"",
+                    "\"kind\":\"human\"",
+                ],
+                &[],
+            ),
+            (
+                "a token-only report omits absent cost and session",
+                event(EventBody::AttemptReported {
+                    session_id: None,
+                    agent: None,
+                    models: vec![],
+                    cost_micro_usd: None,
+                    duration_ms: None,
+                }),
+                &[],
+                &["cost_micro_usd", "session_id", "models"],
+            ),
+            (
+                "absent envelope fields are omitted",
+                event(EventBody::RunStarted),
+                &[],
+                &["node_id", "attempt_id"],
+            ),
+        ];
+        for (name, ev, contains, omits) in cases {
+            let json = serde_json::to_string(ev).expect(name);
+            for s in *contains {
+                assert!(json.contains(s), "{name}: missing {s} in {json}");
+            }
+            for s in *omits {
+                assert!(!json.contains(s), "{name}: unexpected {s} in {json}");
+            }
+            let back: Event = serde_json::from_str(&json).expect(name);
+            assert_eq!(&back, ev, "{name}");
+        }
     }
 
     /// The control inbox persists commands as files, so their wire shape is a
@@ -495,24 +526,6 @@ mod tests {
             let back: Command = serde_json::from_str(&json).expect("deserializes");
             assert_eq!(back, cmd, "{json}");
         }
-    }
-
-    #[test]
-    fn human_events_carry_actor_and_routing_signal() {
-        let mut ev = event(EventBody::HumanResponded {
-            text: "ship it".to_owned(),
-            signal: "done".to_owned(),
-        });
-        ev.actor = Actor::human("kc");
-        let json = serde_json::to_string(&ev).expect("serializes");
-        assert!(json.contains("\"kind\":\"human_responded\""), "{json}");
-        assert!(json.contains("\"signal\":\"done\""), "{json}");
-        assert!(
-            json.contains("\"kind\":\"human\""),
-            "actor recorded: {json}"
-        );
-        let back: Event = serde_json::from_str(&json).expect("deserializes");
-        assert_eq!(back, ev);
     }
 
     /// Usage is journaled, so its wire shape is a compatibility surface — and a
@@ -540,31 +553,5 @@ mod tests {
         assert!(json.contains("\"cost_micro_usd\":177800"), "{json}");
         let back: Event = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back, ev, "exact after a round trip");
-    }
-
-    /// A token-only agent (codex reports no money) must not be forced to invent
-    /// a cost, and an older journal without the field must still read.
-    #[test]
-    fn attempt_report_omits_absent_cost_and_session() {
-        let ev = event(EventBody::AttemptReported {
-            session_id: None,
-            agent: None,
-            models: vec![],
-            cost_micro_usd: None,
-            duration_ms: None,
-        });
-        let json = serde_json::to_string(&ev).expect("serializes");
-        assert!(!json.contains("cost_micro_usd"), "{json}");
-        assert!(!json.contains("session_id"), "{json}");
-        assert!(!json.contains("models"), "{json}");
-        let back: Event = serde_json::from_str(&json).expect("deserializes");
-        assert_eq!(back, ev);
-    }
-
-    #[test]
-    fn optional_envelope_fields_are_omitted_when_absent() {
-        let json = serde_json::to_string(&event(EventBody::RunStarted)).expect("serializes");
-        assert!(!json.contains("node_id"));
-        assert!(!json.contains("attempt_id"));
     }
 }

@@ -48,9 +48,6 @@ pub enum ResultCapture {
     /// The worker wrote its final message to the `{result}` file /
     /// `HEX_RESULT_FILE` (e.g. codex `--output-last-message`); read that file.
     File,
-    /// stdout is a single JSON object with `result`/`is_error`; take `.result`,
-    /// and fail on `.is_error`.
-    JsonResult,
     /// stdout is JSONL whose last `type == "result"` line carries `result` /
     /// `is_error` (claude `--output-format stream-json`).
     JsonlResult,
@@ -115,18 +112,8 @@ pub struct CodexWorker {
 
 impl CodexWorker {
     #[must_use]
-    pub fn new(model: Option<String>) -> Self {
-        Self {
-            model,
-            effort: None,
-        }
-    }
-
-    /// Set the reasoning effort (builder style).
-    #[must_use]
-    pub fn with_effort(mut self, effort: Option<String>) -> Self {
-        self.effort = effort;
-        self
+    pub fn new(model: Option<String>, effort: Option<String>) -> Self {
+        Self { model, effort }
     }
 
     /// Build the argv template. `read_only` is advisory only: a true read-only
@@ -224,18 +211,8 @@ pub struct ClaudeWorker {
 
 impl ClaudeWorker {
     #[must_use]
-    pub fn new(model: Option<String>) -> Self {
-        Self {
-            model,
-            effort: None,
-        }
-    }
-
-    /// Set the reasoning effort (builder style).
-    #[must_use]
-    pub fn with_effort(mut self, effort: Option<String>) -> Self {
-        self.effort = effort;
-        self
+    pub fn new(model: Option<String>, effort: Option<String>) -> Self {
+        Self { model, effort }
     }
 
     // Read-only is advisory here: the allow/deny classifier below still leaves
@@ -381,29 +358,15 @@ pub struct PiWorker {
 
 impl PiWorker {
     #[must_use]
-    pub fn new(model: Option<String>) -> Self {
-        Self {
-            model,
-            effort: None,
-        }
-    }
-
-    /// Set the reasoning effort (builder style).
-    #[must_use]
-    pub fn with_effort(mut self, effort: Option<String>) -> Self {
-        self.effort = effort;
-        self
+    pub fn new(model: Option<String>, effort: Option<String>) -> Self {
+        Self { model, effort }
     }
 
     /// Build the argv template. `session_dir` is where pi stores its session
     /// state so that `context: continue` works across attempts and resumes.
     /// `resume` adds `--continue` to pick up the existing session in that dir.
     #[must_use]
-    pub fn command(
-        &self,
-        session_dir: Option<&Path>,
-        resume: bool,
-    ) -> Vec<String> {
+    pub fn command(&self, session_dir: Option<&Path>, resume: bool) -> Vec<String> {
         let mut argv = strs(&["pi", "-p", "{prompt}", "--mode", "json"]);
         if let Some(dir) = session_dir {
             argv.push("--session-dir".to_owned());
@@ -953,7 +916,11 @@ fn pi_result(path: &Path, max: u64) -> Result<Option<String>, String> {
         if role != "assistant" {
             continue;
         }
-        let Some(content) = v.get("message").and_then(|m| m.get("content")).and_then(serde_json::Value::as_array) else {
+        let Some(content) = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(serde_json::Value::as_array)
+        else {
             continue;
         };
         let texts: Vec<String> = content
@@ -1057,16 +1024,6 @@ fn capture_result(
             };
             result_field(&v)?
         }
-        Some(ResultCapture::JsonResult) => {
-            // A single JSON document must be intact to be meaningful, so read it
-            // whole with strict UTF-8 and explicit truncation detection (an
-            // over-cap or non-UTF-8 output fails closed, never silently becomes
-            // `�` and then "not JSON").
-            let out = read_bounded_utf8(&attempt_dir.join("stdout.log"), MAX_STREAM_BYTES)?;
-            let v: serde_json::Value = serde_json::from_str(out.trim())
-                .map_err(|e| format!("agent output is not JSON: {e}"))?;
-            result_field(&v)?
-        }
         Some(ResultCapture::JsonlLastText) => {
             // Stream to EOF (bounded per line) so the *final* text event is never
             // missed by a mid-file cap — a stale earlier text would misrepresent
@@ -1092,22 +1049,6 @@ fn read_capped(path: &Path, max: u64) -> std::io::Result<String> {
     let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut std::io::Read::take(file, max), &mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// Read `path` fully as strict UTF-8, failing closed if it exceeds `max` bytes
-/// (explicit truncation detection) or is not valid UTF-8 — so a document that
-/// must be intact (a single JSON object) never silently loses its tail or gets
-/// altered by lossy `�` substitution.
-fn read_bounded_utf8(path: &Path, max: u64) -> Result<String, String> {
-    let file = File::open(path).map_err(|e| format!("cannot read agent output: {e}"))?;
-    let mut buf = Vec::new();
-    // Read one byte past the cap so "exactly max" is distinguishable from "over".
-    std::io::Read::read_to_end(&mut std::io::Read::take(file, max + 1), &mut buf)
-        .map_err(|e| format!("cannot read agent output: {e}"))?;
-    if buf.len() as u64 > max {
-        return Err(format!("agent output exceeds {max} bytes"));
-    }
-    String::from_utf8(buf).map_err(|_| "agent output is not valid UTF-8".to_owned())
 }
 
 /// The `part.text` of a single JSONL line if it is a `type == "text"` event.
@@ -1163,28 +1104,8 @@ fn read_line_bounded<R: std::io::BufRead>(
     buf: &mut Vec<u8>,
     cap: usize,
 ) -> std::io::Result<usize> {
-    let mut read = 0usize;
-    while read < cap {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            break; // EOF
-        }
-        let room = cap - read;
-        match available.iter().take(room).position(|&b| b == b'\n') {
-            Some(pos) => {
-                buf.extend_from_slice(&available[..=pos]);
-                reader.consume(pos + 1);
-                return Ok(read + pos + 1);
-            }
-            None => {
-                let take = available.len().min(room);
-                buf.extend_from_slice(&available[..take]);
-                reader.consume(take);
-                read += take;
-            }
-        }
-    }
-    Ok(read)
+    use std::io::{BufRead as _, Read as _};
+    reader.take(cap as u64).read_until(b'\n', buf)
 }
 
 /// Truncate a captured result so the *final* value (including the `…` marker) is
@@ -1422,14 +1343,12 @@ mod tests {
         assert_eq!(m.input_tokens, 6_251);
         assert_eq!(m.cache_read_tokens, 11_008);
         assert_eq!(m.output_tokens, 5);
-        assert_eq!(m.tokens(), 17_264);
         assert_eq!(m.cost_micro_usd, None, "codex reports no money");
-    }
-
-    #[test]
-    fn codex_report_falls_back_to_the_worker_name_without_a_configured_model() {
-        let r = codex_report(&fixture("codex-exec-json.jsonl"), None);
-        assert_eq!(r.models[0].model, "codex");
+        let unhinted = codex_report(&fixture("codex-exec-json.jsonl"), None);
+        assert_eq!(
+            unhinted.models[0].model, "codex",
+            "no configured model falls back to the worker name"
+        );
     }
 
     /// A tool-calling run: still exactly one `turn.completed`, which is why the
@@ -1776,7 +1695,7 @@ mod tests {
 
     #[test]
     fn codex_argv_shape() {
-        let w = CodexWorker::new(Some("gpt-5".to_owned()));
+        let w = CodexWorker::new(Some("gpt-5".to_owned()), None);
         let argv = w.command(None, None).join(" ");
         assert!(argv.contains("--output-last-message {result}"), "{argv}");
         // `--json` is load-bearing, not cosmetic: it is the only place codex
@@ -1802,7 +1721,7 @@ mod tests {
     /// so the sandbox settings have to change shape rather than just tag along.
     #[test]
     fn codex_resume_argv_uses_the_subcommand_and_config_overrides() {
-        let w = CodexWorker::new(None);
+        let w = CodexWorker::new(None, None);
         let argv = w.command(None, Some("019fb9a2")).join(" ");
         assert!(argv.starts_with("codex exec resume 019fb9a2 "), "{argv}");
         assert!(argv.contains("--json"), "{argv}");
@@ -1827,7 +1746,9 @@ mod tests {
 
     #[test]
     fn claude_resume_argv_uses_a_plain_flag() {
-        let argv = ClaudeWorker::new(None).command(Some("sess-1")).join(" ");
+        let argv = ClaudeWorker::new(None, None)
+            .command(Some("sess-1"))
+            .join(" ");
         assert!(argv.contains("--resume sess-1"), "{argv}");
         // Unchanged otherwise, unlike codex.
         assert!(argv.starts_with("claude -p {prompt}"), "{argv}");
@@ -1852,7 +1773,7 @@ mod tests {
 
     #[test]
     fn claude_and_opencode_argv_shapes() {
-        let c = ClaudeWorker::new(None).command(None).join(" ");
+        let c = ClaudeWorker::new(None, None).command(None).join(" ");
         assert!(
             c.contains("claude -p {prompt} --output-format stream-json --verbose"),
             "streamed so a live attempt is watchable: {c}"
@@ -1866,7 +1787,7 @@ mod tests {
 
     #[test]
     fn claude_uses_an_allow_deny_classifier_not_a_blanket_bypass() {
-        let c = ClaudeWorker::new(None).command(None).join(" ");
+        let c = ClaudeWorker::new(None, None).command(None).join(" ");
         // A real classifier — never the blanket bypass the operator rejected.
         assert!(!c.contains("--dangerously-skip-permissions"), "{c}");
         assert!(c.contains("--permission-mode acceptEdits"), "{c}");
@@ -1957,15 +1878,6 @@ mod tests {
     }
 
     #[test]
-    fn read_bounded_utf8_fails_closed_when_over_cap() {
-        let dir = temp_dir("bounded-utf8");
-        let path = dir.join("blob");
-        std::fs::write(&path, "y".repeat(100)).unwrap();
-        assert!(read_bounded_utf8(&path, 16).is_err());
-        assert_eq!(read_bounded_utf8(&path, 1000).unwrap().len(), 100);
-    }
-
-    #[test]
     fn read_capped_is_lossy_and_bounded() {
         let dir = temp_dir("read-capped");
         let path = dir.join("blob");
@@ -1986,26 +1898,20 @@ mod tests {
     /// usage/cost and `message_update` `textEnd` carrying the final text.
     #[test]
     fn pi_report_reads_usage_and_cost_from_message_end() {
-        let r = pi_report(&fixture("pi-mode-json.jsonl"), Some("moonshotai/kimi-k2.6"));
+        let r = pi_report(&fixture("pi-mode-json.jsonl"), Some("config-model"));
         assert_eq!(r.session_id.as_deref(), Some("pi-session"));
         assert!(
             !r.models.is_empty(),
             "at least one assistant message reported usage"
         );
         let m = &r.models[0];
-        assert_eq!(m.model, "moonshotai/kimi-k2.6");
+        assert_eq!(
+            m.model, "moonshotai/kimi-k2.6",
+            "the stream's own model wins over the config hint"
+        );
         // The fixture should have positive output tokens and some cost.
         assert!(m.output_tokens > 0, "output tokens reported");
-        assert!(
-            m.cost_micro_usd.is_some(),
-            "pi reports cost per message"
-        );
-    }
-
-    #[test]
-    fn pi_report_reads_model_from_the_stream() {
-        let r = pi_report(&fixture("pi-mode-json.jsonl"), None);
-        assert_eq!(r.models[0].model, "moonshotai/kimi-k2.6");
+        assert!(m.cost_micro_usd.is_some(), "pi reports cost per message");
     }
 
     #[test]

@@ -349,37 +349,23 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
     }
 }
 
+/// A signal outside the node's `may_propose` fails the attempt and the run.
+/// (Start/finish bracketing on the failure path is the same `FinishGuard::drop`
+/// the panic test below pins — the unwind case strictly subsumes this one.)
 #[test]
-fn progress_sink_pairs_start_and_finish_even_when_an_attempt_fails() {
+fn an_out_of_allowlist_proposal_fails_the_run() {
     let root = temp_root("progress-fail");
     write_graph(&root);
 
-    // implement emits a signal outside its may_propose → the attempt fails and
-    // the run ends. The start hook must still be closed by a finish hook.
     let mock = MockWorker::new().on("implement", &["nope"]);
     let mut workers = Workers::new();
     workers.insert("mock", Box::new(mock));
 
-    let rec = Recorder::default();
-    let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers)
-        .with_progress(Box::new(rec.clone()));
+    let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers);
     let report = runtime
         .start("test-critique", Some("x"), None, &Isolation::Shared)
         .expect("run");
     assert_eq!(report.disposition, Some(Disposition::Failed));
-
-    let log = rec.log.lock().unwrap();
-    let brackets: Vec<&Entry> = log
-        .iter()
-        .filter(|e| matches!(e, Entry::Start { .. } | Entry::Finish))
-        .collect();
-    assert_eq!(
-        brackets.len(),
-        2,
-        "one failed attempt still brackets start+finish"
-    );
-    assert!(matches!(brackets[0], Entry::Start { .. }), "start first");
-    assert_eq!(*brackets[1], Entry::Finish, "then finish");
 }
 
 /// A worker that panics inside `run`, to prove the finish hook still fires while

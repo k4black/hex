@@ -603,16 +603,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hex-bench"
-version = "0.0.0"
-dependencies = [
- "criterion",
- "hex-kernel",
- "hex-proto",
- "hex-runtime",
-]
-
-[[package]]
 name = "hex-cli"
 version = "0.0.0"
 dependencies = [
@@ -661,6 +651,7 @@ dependencies = [
 name = "hex-runtime"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "fs4",
  "hex-kernel",
  "hex-proto",
@@ -671,7 +662,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "signal-hook",
- "thiserror",
+ "tempfile",
  "uuid",
  "yaml_serde",
 ]

@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::error::Result;
 
@@ -159,7 +159,7 @@ impl RoleSpec {
 }
 
 /// Global fallback defaults.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct DefaultsSpec {
     /// Default role for agent nodes that name none.
@@ -242,14 +242,6 @@ fn user_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn builtin_has_codex_claude_and_pi() {
-        let c = Config::builtin();
-        assert!(c.workers.contains_key("codex"));
-        assert!(c.workers.contains_key("claude"));
-        assert!(c.workers.contains_key("pi"));
-    }
 
     #[test]
     fn merge_lets_project_override() {

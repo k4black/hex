@@ -41,12 +41,6 @@ impl NodeKind {
     }
 }
 
-impl std::fmt::Display for NodeKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// Per-node context policy: whether each attempt gets a fresh worker session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Context {
