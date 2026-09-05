@@ -26,7 +26,7 @@ against the branch base; re-locate by symbol if they drifted. After each item:
   `spec.kind()` and re-tests the terminal disposition that `badge` just
   matched. Refactor to one fn returning `(glyph, style)` — the shape
   `dash::mark_cell` already uses.
-- [ ] dash.rs: `hue_to_ratatui` (dash.rs:221-240) maps all 16 `AnsiColor`
+- [x] dash.rs: `hue_to_ratatui` (dash.rs:221-240) maps all 16 `AnsiColor`
   variants, but its only caller feeds it `Mark::hue()`, which only ever
   returns Green/Red/Yellow/Cyan. Keep those 4 arms plus a `_ => Color::Reset`
   fallback.
