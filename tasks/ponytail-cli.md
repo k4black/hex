@@ -41,7 +41,7 @@ against the branch base; re-locate by symbol if they drifted. After each item:
   subcommands only, and drop the global threading (main.rs:280,317,320). A
   flag a command accepts and ignores is worse than one it rejects. Keep
   `hex run --help` showing it.
-- [ ] main.rs tests: delete the 6 trivial clap-behaviour unit tests (they
+- [x] main.rs tests: delete the 6 trivial clap-behaviour unit tests (they
   assert clap-derive config, not hex logic; written against a hand-rolled
   parser deleted long ago): main.rs:2168, 2187, 2193, 2239, 2247, 2252 —
   the "-p needs a value", "-p+-f conflict", "ls alias", "bare hex has no

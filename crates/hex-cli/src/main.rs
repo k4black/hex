@@ -2149,81 +2149,44 @@ mod tests {
         Cli::try_parse_from(v)
     }
 
+    /// Every way an operator supplies the one prompt channel (`-p`, `--prompt`,
+    /// `-f`, or nothing), through the same parse → `resolve_prompt` path.
     #[test]
-    fn parses_positional_prompt_and_json() {
-        // `--json` is global, so it parses after the subcommand.
-        let cli = parse(&["run", "critique-loop", "--json", "-p", "fix the bug"]).unwrap();
-        assert!(cli.json);
-        let Some(Command::Run {
-            graph,
-            prompt,
-            file,
-            ..
-        }) = cli.command
-        else {
-            panic!("expected run command");
-        };
-        assert_eq!(graph.as_deref(), Some("critique-loop"));
-        assert_eq!(
-            resolve_prompt(&prompt, &file).unwrap().as_deref(),
-            Some("fix the bug")
-        );
-    }
-
-    #[test]
-    fn global_json_also_parses_before_the_subcommand() {
-        let cli = parse(&["--json", "run", "g"]).unwrap();
-        assert!(cli.json);
-    }
-
-    #[test]
-    fn long_prompt_flag_works() {
-        let cli = parse(&["run", "g", "--prompt", "do the thing"]).unwrap();
-        assert!(!cli.json);
-        let Some(Command::Run { prompt, file, .. }) = cli.command else {
-            panic!("expected run command");
-        };
-        assert_eq!(
-            resolve_prompt(&prompt, &file).unwrap().as_deref(),
-            Some("do the thing")
-        );
-    }
-
-    #[test]
-    fn prompt_and_file_together_is_an_error() {
-        // Mutually exclusive at parse time (clap `conflicts_with`).
-        assert!(parse(&["run", "g", "-p", "x", "-f", "prompt.md"]).is_err());
-    }
-
-    #[test]
-    fn prompt_flag_requires_a_value() {
-        assert!(parse(&["run", "g", "-p"]).is_err());
-    }
-
-    #[test]
-    fn no_prompt_resolves_to_none() {
-        let cli = parse(&["run", "g"]).unwrap();
-        let Some(Command::Run { prompt, file, .. }) = cli.command else {
-            panic!("expected run command");
-        };
-        assert_eq!(resolve_prompt(&prompt, &file).unwrap(), None);
-    }
-
-    #[test]
-    fn file_flag_reads_the_prompt_from_disk() {
+    fn a_prompt_comes_from_a_flag_a_file_or_nowhere() {
         let dir =
             std::env::temp_dir().join(format!("hex-cli-p-{}-{}", std::process::id(), unique()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("prompt.md");
         std::fs::write(&path, "prompt from file").unwrap();
-        let cli = parse(&["run", "g", "-f", path.to_str().unwrap()]).unwrap();
-        let Some(Command::Run { prompt, file, .. }) = cli.command else {
-            panic!("expected run command");
-        };
-        assert_eq!(
-            resolve_prompt(&prompt, &file).unwrap().as_deref(),
-            Some("prompt from file")
-        );
+
+        for (case, args, want) in [
+            (
+                "-p",
+                vec!["run", "critique-loop", "-p", "fix the bug"],
+                Some("fix the bug"),
+            ),
+            (
+                "--prompt",
+                vec!["run", "g", "--prompt", "do the thing"],
+                Some("do the thing"),
+            ),
+            (
+                "-f",
+                vec!["run", "g", "-f", path.to_str().unwrap()],
+                Some("prompt from file"),
+            ),
+            ("none", vec!["run", "g"], None),
+        ] {
+            let cli = parse(&args).unwrap_or_else(|e| panic!("{case}: {e}"));
+            let Some(Command::Run { prompt, file, .. }) = cli.command else {
+                panic!("{case}: expected run command");
+            };
+            assert_eq!(
+                resolve_prompt(&prompt, &file).unwrap().as_deref(),
+                want,
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -2239,24 +2202,5 @@ mod tests {
         assert_eq!(run_id, "run_1");
         assert_eq!(node.as_deref(), Some("build"));
         assert!(full);
-    }
-
-    #[test]
-    fn list_has_an_ls_alias() {
-        assert!(matches!(
-            parse(&["ls"]).unwrap().command,
-            Some(Command::List)
-        ));
-    }
-
-    #[test]
-    fn bare_invocation_has_no_command() {
-        assert!(parse(&[]).unwrap().command.is_none());
-    }
-
-    #[test]
-    fn prompt_and_file_are_rejected_only_on_run() {
-        // Structural verbs don't accept -p/-f at all.
-        assert!(parse(&["validate", "g", "-p", "x"]).is_err());
     }
 }
