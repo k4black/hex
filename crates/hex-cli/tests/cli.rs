@@ -196,15 +196,8 @@ fn dash_refuses_json_because_it_has_no_machine_mode() {
     let err = stderr(&out);
     assert!(err.contains("no machine mode"), "stderr: {err}");
     assert!(err.contains("hex runs --json"), "stderr: {err}");
-}
-
-#[test]
-fn help_and_version_exit_0() {
-    let dir = project();
-    assert!(hex(dir.path(), &["--help"]).status.success());
-    assert!(hex(dir.path(), &["--version"]).status.success());
-    // The `--json` exception for `dash` must appear in the *short* help too, not
-    // only the long form, so `-h` cannot claim `dash` emits machine output.
+    // The exception must appear in the *short* help too, not only the long form,
+    // so `-h` cannot claim `dash` emits machine output.
     let short = hex(dir.path(), &["dash", "-h"]);
     assert!(short.status.success());
     assert!(
@@ -283,24 +276,18 @@ fn run_without_a_needed_prompt_fails_clearly() {
 }
 
 #[test]
-fn run_with_prompt_flag_succeeds() {
-    let dir = project();
-    let out = hex(dir.path(), &["run", "promptdemo", "-p", "the task"]);
-    assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert!(stdout(&out).contains("succeeded"));
-}
-
-#[test]
-fn run_with_prompt_file_succeeds() {
+fn run_takes_its_prompt_from_a_flag_or_a_file() {
     let dir = project();
     let pf = dir.path().join("prompt.md");
     std::fs::write(&pf, "task from a file").expect("prompt file");
-    let out = hex(
-        dir.path(),
-        &["run", "promptdemo", "-f", pf.to_str().unwrap()],
-    );
-    assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert!(stdout(&out).contains("succeeded"));
+    for args in [
+        &["run", "promptdemo", "-p", "the task"][..],
+        &["run", "promptdemo", "-f", pf.to_str().unwrap()][..],
+    ] {
+        let out = hex(dir.path(), args);
+        assert!(out.status.success(), "{args:?} stderr: {}", stderr(&out));
+        assert!(stdout(&out).contains("succeeded"), "{args:?}");
+    }
 }
 
 #[test]

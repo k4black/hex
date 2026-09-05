@@ -51,7 +51,7 @@ against the branch base; re-locate by symbol if they drifted. After each item:
   — positional / `--prompt` / none / `-f` file, identical
   parse→resolve_prompt→assert shape) into one table-driven test with the case
   name in the assert message.
-- [ ] tests/cli.rs: merge `run_with_prompt_flag_succeeds` and
+- [x] tests/cli.rs: merge `run_with_prompt_flag_succeeds` and
   `run_with_prompt_file_succeeds` (cli.rs:285-304, same assertions, only the
   prompt source varies) into one table-driven test. Fold the one unique assert
   of `help_and_version_exit_0` (cli.rs:201-215) — the `dash -h` json-exception
