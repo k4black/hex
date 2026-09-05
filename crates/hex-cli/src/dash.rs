@@ -219,23 +219,14 @@ fn mark_cell(ui: ui::Ui, m: ui::Mark) -> (&'static str, Style) {
 /// Map a four-bit ANSI hue (the backend-neutral colour `ui` exposes) to its
 /// ratatui equivalent, so `hex dash` and `hex runs` render the same palette.
 fn hue_to_ratatui(c: AnsiColor) -> Color {
+    // Only the four hues a [`ui::Mark`] can carry; anything else keeps the
+    // terminal's own foreground rather than inventing a colour.
     match c {
-        AnsiColor::Black => Color::Black,
-        AnsiColor::Red => Color::Red,
         AnsiColor::Green => Color::Green,
+        AnsiColor::Red => Color::Red,
         AnsiColor::Yellow => Color::Yellow,
-        AnsiColor::Blue => Color::Blue,
-        AnsiColor::Magenta => Color::Magenta,
         AnsiColor::Cyan => Color::Cyan,
-        AnsiColor::White => Color::Gray,
-        AnsiColor::BrightBlack => Color::DarkGray,
-        AnsiColor::BrightRed => Color::LightRed,
-        AnsiColor::BrightGreen => Color::LightGreen,
-        AnsiColor::BrightYellow => Color::LightYellow,
-        AnsiColor::BrightBlue => Color::LightBlue,
-        AnsiColor::BrightMagenta => Color::LightMagenta,
-        AnsiColor::BrightCyan => Color::LightCyan,
-        AnsiColor::BrightWhite => Color::White,
+        _ => Color::Reset,
     }
 }
 

@@ -38,33 +38,34 @@ pub struct Ui {
 }
 
 impl Ui {
-    /// Resolve for stdout.
-    #[must_use]
-    pub fn stdout(color: When, json: bool) -> Self {
+    /// The two streams differ only in which one is probed for TTY-ness.
+    fn for_stream(color: When, json: bool, is_tty: bool) -> Self {
         Self {
-            color: paint(
-                color,
-                json,
-                std::io::IsTerminal::is_terminal(&std::io::stdout()),
-            ),
+            color: paint(color, json, is_tty),
             unicode: unicode_ok(),
             width: width(),
         }
+    }
+
+    /// Resolve for stdout.
+    #[must_use]
+    pub fn stdout(color: When, json: bool) -> Self {
+        Self::for_stream(
+            color,
+            json,
+            std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        )
     }
 
     /// Resolve for stderr. Its own answer: piping stdout to another program is
     /// no reason to strip colour from a diagnostic the human still sees.
     #[must_use]
     pub fn stderr(color: When, json: bool) -> Self {
-        Self {
-            color: paint(
-                color,
-                json,
-                std::io::IsTerminal::is_terminal(&std::io::stderr()),
-            ),
-            unicode: unicode_ok(),
-            width: width(),
-        }
+        Self::for_stream(
+            color,
+            json,
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        )
     }
 
     /// A fixed policy for tests — no environment, no ioctl. Env mutation races
@@ -382,8 +383,7 @@ fn width() -> Option<usize> {
 ///
 /// Not `chars().count()`: `…` and `≥` are East-Asian *Ambiguous* and occupy two
 /// cells in a CJK locale, which silently shifts every column to their right.
-#[must_use]
-pub fn cells(s: &str) -> usize {
+fn cells(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
@@ -573,8 +573,6 @@ mod tests {
             }
         }
     }
-
-    /// No glyph may carry emoji presentation: a font that substitutes a colour
 
     #[test]
     fn an_explicit_choice_beats_everything() {

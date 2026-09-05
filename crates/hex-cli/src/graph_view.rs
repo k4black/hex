@@ -12,9 +12,10 @@
 
 use std::collections::BTreeMap;
 
-use hex_runtime::{Budget, EdgeClass, Graph, NodeKind, NodeSpec, Topology, Transition};
+use anstyle::Style;
+use hex_runtime::{Budget, EdgeClass, Graph, NodeSpec, Topology, Transition};
 
-use crate::ui::{Glyphs, Ui, style};
+use crate::ui::{Ui, style};
 
 /// Render `graph` as text. `origin` is where it came from (a path, or
 /// `built-in:<name>`), shown because "which of the three layers am I looking
@@ -24,16 +25,15 @@ pub fn render(
     origin: &str,
     description: Option<&str>,
     bindings: &BTreeMap<String, String>,
-    g: &Glyphs,
     ui: Ui,
 ) -> String {
     let topo = Topology::of(graph);
     let mut out = String::new();
 
-    header(&mut out, graph, origin, description, g, ui);
-    flow(&mut out, graph, &topo, bindings, g, ui);
-    cycles(&mut out, &topo, g, ui);
-    summary(&mut out, graph, &topo, g, ui);
+    header(&mut out, graph, origin, description, ui);
+    flow(&mut out, graph, &topo, bindings, ui);
+    cycles(&mut out, &topo, ui);
+    summary(&mut out, graph, &topo, ui);
     out
 }
 
@@ -43,14 +43,7 @@ pub fn render(
 /// are **bold, never dim** — dim reads as "you may skip this", and a label is a
 /// signpost. Dim is reserved for text whose deletion would not change a
 /// decision: provenance, descriptions, commentary.
-fn header(
-    out: &mut String,
-    graph: &Graph,
-    origin: &str,
-    description: Option<&str>,
-    g: &Glyphs,
-    ui: Ui,
-) {
+fn header(out: &mut String, graph: &Graph, origin: &str, description: Option<&str>, ui: Ui) {
     out.push_str(&format!(
         "{}   {}\n",
         ui.paint(style::ID, &graph.name),
@@ -62,9 +55,9 @@ fn header(
     out.push_str(&format!(
         "\n{}{}\n",
         ui.field(style::HEADER, "Limits", 9),
-        budget_line(&graph.budget, g)
+        budget_line(&graph.budget, ui)
     ));
-    if let Some(contract) = accept_line(graph, g, ui) {
+    if let Some(contract) = accept_line(graph, ui) {
         out.push_str(&format!(
             "{}{contract}\n",
             ui.field(style::HEADER, "Accept", 9)
@@ -76,10 +69,11 @@ fn header(
 ///
 /// `require:`/`on_unmet:` were YAML keys leaking into a human view, with a
 /// sentence of prose explaining what an arrow says on its own.
-fn accept_line(graph: &Graph, g: &Glyphs, ui: Ui) -> Option<String> {
+fn accept_line(graph: &Graph, ui: Ui) -> Option<String> {
     if graph.accept.require.is_empty() && graph.accept.on_unmet.is_none() {
         return None;
     }
+    let g = ui.glyphs();
     let mut parts: Vec<String> = graph
         .accept
         .require
@@ -92,7 +86,7 @@ fn accept_line(graph: &Graph, g: &Glyphs, ui: Ui) -> Option<String> {
     Some(parts.join(&format!(" {} ", g.sep)))
 }
 
-fn budget_line(budget: &Budget, g: &Glyphs) -> String {
+fn budget_line(budget: &Budget, ui: Ui) -> String {
     let mut parts = Vec::new();
     if let Some(a) = budget.attempts {
         parts.push(format!("{a} attempts"));
@@ -112,7 +106,7 @@ fn budget_line(budget: &Budget, g: &Glyphs) -> String {
     if parts.is_empty() {
         return "unbounded".to_owned();
     }
-    parts.join(&format!(" {} ", g.sep))
+    parts.join(&format!(" {} ", ui.glyphs().sep))
 }
 
 /// The flow: every node in reading order with its policy and transitions.
@@ -121,9 +115,9 @@ fn flow(
     graph: &Graph,
     topo: &Topology,
     bindings: &BTreeMap<String, String>,
-    g: &Glyphs,
     ui: Ui,
 ) {
+    let g = ui.glyphs();
     out.push_str(&format!("\n{}\n", ui.paint(style::HEADER, "Flow")));
     for (i, id) in topo.order.iter().enumerate() {
         let Some(node) = graph.node(id) else { continue };
@@ -150,17 +144,17 @@ fn flow(
         out.push_str(&format!(
             "  {} {} {} {}\n",
             ui.paint(style::DIM, gutter),
-            badge_painted(graph, id, g, ui),
+            badge_painted(graph, id, ui),
             ui.field(style::ID, id, 12),
             // The policy is dim (deletable context); a visit bound is not — it is
             // the thing that stops this node looping forever.
             match node.max_visits {
                 Some(v) => format!(
                     "{}   max {v} visits",
-                    ui.paint(style::DIM, &policy(graph, node, bindings, g))
+                    ui.paint(style::DIM, &policy(graph, node, bindings, ui))
                 ),
                 None => ui
-                    .paint(style::DIM, &policy(graph, node, bindings, g))
+                    .paint(style::DIM, &policy(graph, node, bindings, ui))
                     .to_string(),
             }
         ));
@@ -185,7 +179,7 @@ fn flow(
             out.push_str(&format!(
                 "  {}     {}\n",
                 ui.paint(style::DIM, cont),
-                transition(t, topo, g, ui)
+                transition(t, topo, ui)
             ));
         }
         if more {
@@ -204,7 +198,7 @@ fn flow(
             ui.paint(style::FAIL, "Unreachable (validation rejects these)")
         ));
         for id in &topo.unreachable {
-            out.push_str(&format!("    {} {id}\n", badge_painted(graph, id, g, ui)));
+            out.push_str(&format!("    {} {id}\n", badge_painted(graph, id, ui)));
         }
     }
 }
@@ -215,35 +209,25 @@ fn flows_from_any_prior(topo: &Topology, prior: &[String], id: &str) -> bool {
     prior.iter().any(|p| topo.flows_into(p, id))
 }
 
-/// The kind badge, coloured by what it is: a terminal's disposition is the one
-/// thing worth spotting without reading.
-fn badge_painted(graph: &Graph, id: &str, g: &Glyphs, ui: Ui) -> String {
-    let sym = badge(graph, id, g);
-    let paint = match graph.node(id).map(|n| n.spec.kind()) {
-        Some(NodeKind::Terminal) => match graph.node(id).map(|n| &n.spec) {
-            Some(NodeSpec::Terminal { disposition }) if disposition.as_str() == "succeeded" => {
-                style::OK
-            }
-            _ => style::FAIL,
-        },
-        Some(NodeKind::Command) if graph.is_gate(id) => style::HEADER,
-        Some(NodeKind::Human) => style::WARN,
-        _ => style::ID,
-    };
-    ui.paint(paint, sym).to_string()
+fn badge_painted(graph: &Graph, id: &str, ui: Ui) -> String {
+    let (glyph, style) = badge(graph, id, ui);
+    ui.paint(style, glyph).to_string()
 }
 
-fn badge(graph: &Graph, id: &str, g: &Glyphs) -> &'static str {
-    match graph.node(id).map(|n| n.spec.kind()) {
-        Some(NodeKind::Agent) => g.agent,
-        Some(NodeKind::Command) if graph.is_gate(id) => g.gate,
-        Some(NodeKind::Command) => g.command,
-        Some(NodeKind::Human) => g.human,
-        Some(NodeKind::Terminal) => match graph.node(id).map(|n| &n.spec) {
-            Some(NodeSpec::Terminal { disposition }) if disposition.as_str() == "succeeded" => g.ok,
-            _ => g.fail,
-        },
-        None => " ",
+/// The kind badge and the colour that goes with it, decided in one match — a
+/// terminal's disposition is the one thing worth spotting without reading.
+fn badge(graph: &Graph, id: &str, ui: Ui) -> (&'static str, Style) {
+    let g = ui.glyphs();
+    match graph.node(id).map(|n| &n.spec) {
+        Some(NodeSpec::Agent { .. }) => (g.agent, style::ID),
+        Some(NodeSpec::Command { .. }) if graph.is_gate(id) => (g.gate, style::HEADER),
+        Some(NodeSpec::Command { .. }) => (g.command, style::ID),
+        Some(NodeSpec::Human { .. }) => (g.human, style::WARN),
+        Some(NodeSpec::Terminal { disposition }) if disposition.as_str() == "succeeded" => {
+            (g.ok, style::OK)
+        }
+        Some(NodeSpec::Terminal { .. }) => (g.fail, style::FAIL),
+        None => (" ", style::ID),
     }
 }
 
@@ -252,8 +236,9 @@ fn policy(
     graph: &Graph,
     node: &hex_runtime::Node,
     bindings: &BTreeMap<String, String>,
-    g: &Glyphs,
+    ui: Ui,
 ) -> String {
+    let g = ui.glyphs();
     let mut parts: Vec<String> = Vec::new();
     match &node.spec {
         NodeSpec::Agent {
@@ -322,7 +307,8 @@ fn steps(node: &hex_runtime::Node) -> Vec<String> {
 }
 
 /// One outgoing transition, with its signal and — for a loop — its bound.
-fn transition(t: &Transition, topo: &Topology, g: &Glyphs, ui: Ui) -> String {
+fn transition(t: &Transition, topo: &Topology, ui: Ui) -> String {
+    let g = ui.glyphs();
     let (arrow, note, arrow_style) = match (t.class, t.is_reroute()) {
         (EdgeClass::Back, true) => (g.reroute, "   accept fallback".to_owned(), style::LOOP),
         (EdgeClass::Back, false) => (g.back, cycle_note(topo, t), style::LOOP),
@@ -356,10 +342,11 @@ fn cycle_note(topo: &Topology, t: &Transition) -> String {
 /// The highest-value section in a design whose central rule is that every cycle
 /// is bounded: the validator already knows this and used to throw it away, so a
 /// reader could see that a graph loops but not what stops it looping.
-fn cycles(out: &mut String, topo: &Topology, g: &Glyphs, ui: Ui) {
+fn cycles(out: &mut String, topo: &Topology, ui: Ui) {
     if topo.cycles.is_empty() {
         return;
     }
+    let g = ui.glyphs();
     let unbounded = topo
         .cycles
         .iter()
@@ -408,7 +395,7 @@ fn cycles(out: &mut String, topo: &Topology, g: &Glyphs, ui: Ui) {
 /// One line of counts. The legend is gone: eight symbols explaining themselves
 /// cost more attention than they returned, and the shapes are learned in one
 /// reading.
-fn summary(out: &mut String, graph: &Graph, topo: &Topology, g: &Glyphs, ui: Ui) {
+fn summary(out: &mut String, graph: &Graph, topo: &Topology, ui: Ui) {
     let gates = graph.nodes.keys().filter(|id| graph.is_gate(id)).count();
     let reroutes = topo.transitions.iter().filter(|t| t.is_reroute()).count();
     let mut parts = vec![
@@ -423,7 +410,7 @@ fn summary(out: &mut String, graph: &Graph, topo: &Topology, g: &Glyphs, ui: Ui)
     }
     out.push_str(&format!(
         "\n{}\n",
-        ui.paint(style::DIM, &parts.join(&format!(" {} ", g.sep)))
+        ui.paint(style::DIM, &parts.join(&format!(" {} ", ui.glyphs().sep)))
     ));
 }
 

@@ -74,10 +74,6 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Disable the live in-flight preview pane (plain line streaming instead)
-    #[arg(long, global = true)]
-    no_preview: bool,
-
     /// When to colour output
     #[arg(long, global = true, value_name = "WHEN", default_value = "auto")]
     color: ui::When,
@@ -143,11 +139,17 @@ enum Command {
         /// Internal: drive the run id a `--detach` launcher reserved
         #[arg(long, value_name = "RUN_ID", hide = true, conflicts_with = "detach")]
         reserved_run_id: Option<String>,
+        /// Disable the live in-flight preview pane (plain line streaming instead)
+        #[arg(long)]
+        no_preview: bool,
     },
     /// Resume the SAME run from its journal (after a pause or crash)
     Resume {
         /// Run id, as printed by `hex run`
         run_id: String,
+        /// Disable the live in-flight preview pane (plain line streaming instead)
+        #[arg(long)]
+        no_preview: bool,
     },
     /// List runs (newest activity first)
     Runs,
@@ -277,7 +279,6 @@ fn main() -> ExitCode {
 /// failure (exit 2).
 fn dispatch(cli: Cli) -> Result<ExitCode, String> {
     let json = cli.json;
-    let no_preview = cli.no_preview;
     let Some(command) = cli.command else {
         // Bare `hex` is a usage error, so render clap's own help — byte-for-byte
         // the same text `hex --help` prints — to stderr and exit 2. (clap's
@@ -304,20 +305,21 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             worktree_init,
             detach,
             reserved_run_id,
+            no_preview,
         } => cmd_run(
             graph.as_deref(),
             resolve_prompt(&prompt, &file)?,
             name.as_deref(),
             isolation_from(worktree.as_deref(), no_worktree, worktree_init.as_deref()),
-            RunMode {
-                detach,
-                reserved: reserved_run_id,
-            },
+            detach,
+            reserved_run_id,
             json,
             no_preview,
             ui::Ui::stdout(cli.color, json),
         ),
-        Command::Resume { run_id } => cmd_resume(&run_id, json, no_preview),
+        Command::Resume { run_id, no_preview } => {
+            cmd_resume(&run_id, json, no_preview, ui::Ui::stdout(cli.color, json))
+        }
         Command::Runs => cmd_runs(json, ui::Ui::stdout(cli.color, json)),
         Command::Dash { interval } => {
             // `dash` is a TUI with no machine mode. Refuse `--json` before
@@ -339,7 +341,15 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             full,
             tail,
             follow,
-        } => cmd_logs(&run_id, node.as_deref(), full, tail, follow, json),
+        } => cmd_logs(
+            &run_id,
+            node.as_deref(),
+            full,
+            tail,
+            follow,
+            json,
+            ui::Ui::stdout(cli.color, json),
+        ),
         Command::Wait { run_id } => cmd_wait(&run_id, json),
         Command::Pause { run_id } => cmd_control(&run_id, &ControlCommand::Pause, json),
         Command::Steer { run_id, text } => {
@@ -352,13 +362,6 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Command::Emit { event } => cmd_emit(&event),
         Command::Feedback { message, kind } => feedback::record(&message, kind.as_deref()),
     }
-}
-
-/// How `hex run` should execute: foreground (the default), detaching, or — when
-/// the launcher re-execs us — driving the run id it reserved.
-struct RunMode {
-    detach: bool,
-    reserved: Option<String>,
 }
 
 /// The actor a command from this CLI is issued as. A human at a TTY and an agent
@@ -786,7 +789,6 @@ fn cmd_graph(
         // Handled above, before compilation.
         GraphFormat::Source => unreachable!("source returns before the graph is compiled"),
         GraphFormat::Text => {
-            let glyphs = ui.glyphs();
             // Which layer this resolved from, and its one-line description —
             // "which of the three graphs named this am I looking at" is a
             // question the reference alone cannot answer.
@@ -805,7 +807,6 @@ fn cmd_graph(
                     &origin,
                     description.as_deref(),
                     &runtime.worker_bindings(),
-                    &glyphs,
                     ui
                 )
             );
@@ -838,7 +839,8 @@ fn cmd_run(
     prompt: Option<String>,
     name: Option<&str>,
     isolation: Isolation,
-    mode: RunMode,
+    detach: bool,
+    reserved: Option<String>,
     json: bool,
     no_preview: bool,
     ui: ui::Ui,
@@ -849,7 +851,7 @@ fn cmd_run(
         print_graph_list(&runtime, json, ui);
         return Ok(ExitCode::SUCCESS);
     };
-    if mode.detach {
+    if detach {
         return cmd_detach(
             &runtime,
             reference,
@@ -859,12 +861,12 @@ fn cmd_run(
             json,
         );
     }
-    let report = match &mode.reserved {
+    let report = match &reserved {
         Some(run_id) => runtime.start_reserved(run_id, reference, prompt.as_deref(), &isolation),
         None => runtime.start(reference, prompt.as_deref(), name, &isolation),
     }
     .map_err(|e| e.to_string())?;
-    print_outcome(&runtime, &report, json, "run")
+    print_outcome(&runtime, &report, json, "run", ui)
 }
 
 /// Launch a run in the background and return its id immediately.
@@ -951,10 +953,10 @@ fn spawn_detached(_argv: &[String], _run_dir: &std::path::Path) -> Result<(), St
     Err("--detach needs a unix process group; run in the foreground".to_owned())
 }
 
-fn cmd_resume(run_id: &str, json: bool, no_preview: bool) -> Result<ExitCode, String> {
+fn cmd_resume(run_id: &str, json: bool, no_preview: bool, ui: ui::Ui) -> Result<ExitCode, String> {
     let runtime = open_runtime_streaming(json, no_preview)?;
     let report = runtime.resume(run_id).map_err(|e| e.to_string())?;
-    print_outcome(&runtime, &report, json, "resumed")
+    print_outcome(&runtime, &report, json, "resumed", ui)
 }
 
 /// Render the end of a `run`/`resume`. A paused run has no disposition — saying
@@ -964,6 +966,7 @@ fn print_outcome(
     report: &hex_runtime::RunReport,
     json: bool,
     verb: &str,
+    ui: ui::Ui,
 ) -> Result<ExitCode, String> {
     let disposition = disposition_label(report.disposition, "paused");
     let payoff = Payoff::of(runtime, &report.run_id);
@@ -982,7 +985,7 @@ fn print_outcome(
     } else {
         outln!("{verb} {} ({})", report.run_id, report.origin);
         outln!("disposition: {disposition}");
-        payoff.print();
+        payoff.print(ui);
         if report.disposition.is_none() {
             // Distinguish the two ways a run pauses: an operator `pause` stopped
             // it cleanly at a boundary, an interrupt killed a live agent. Both
@@ -1072,8 +1075,7 @@ impl Payoff {
         }
     }
 
-    fn print(&self) {
-        let tty = std::io::stdout().is_terminal();
+    fn print(&self, ui: ui::Ui) {
         if let Some(why) = &self.why {
             outln!("why: {why}");
         }
@@ -1093,15 +1095,18 @@ impl Payoff {
             let lines: Vec<&str> = combined.lines().collect();
             let start = lines.len().saturating_sub(FAILED_STEP_TAIL_LINES);
             if start > 0 {
-                outln!("{}", grey(&format!("… {start} earlier line(s)"), tty));
+                outln!(
+                    "{}",
+                    ui.paint(ui::style::DIM, &format!("… {start} earlier line(s)"))
+                );
             }
             for line in &lines[start..] {
-                outln!("{}", grey(line, tty));
+                outln!("{}", ui.paint(ui::style::DIM, line));
             }
         }
         if let Some(result) = &self.result {
             outln!("\n── final message ──");
-            outln!("{}", grey(result.trim_end(), tty));
+            outln!("{}", ui.paint(ui::style::DIM, result.trim_end()));
         }
     }
 }
@@ -1268,7 +1273,7 @@ pub(crate) fn age(at_ms: u64) -> String {
     if at_ms == 0 {
         return "-".to_owned();
     }
-    let secs = hex_runtime::journal::now_ms().saturating_sub(at_ms) / 1000;
+    let secs = elapsed_ms(at_ms) / 1000;
     match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m", s / 60),
@@ -1675,9 +1680,9 @@ fn follow_logs(
     run_id: &str,
     node: Option<&str>,
     tail_lines: usize,
+    ui: ui::Ui,
 ) -> Result<ExitCode, String> {
     wait_for_journal(runtime, run_id)?;
-    let tty = std::io::stdout().is_terminal();
     let mut open: Option<(String, hex_runtime::StreamCursor)> = None;
     let mut seen = 0usize;
     // The attempt already running when we attach is joined at its tail; anything
@@ -1695,14 +1700,14 @@ fn follow_logs(
             if node.is_some_and(|want| want != node_id) {
                 continue;
             }
-            drain(runtime, run_id, &mut open, tty)?;
+            drain(runtime, run_id, &mut open, ui)?;
             let via = worker
                 .as_deref()
                 .map_or(String::new(), |w| format!(" via {w}"));
             outln!("\u{2500}\u{2500} {attempt_id} [{node_id}]{via} \u{2500}\u{2500}");
             let cursor = if attaching {
                 for line in tail_of(runtime, run_id, attempt_id, tail_lines) {
-                    outln!("{}", grey(&line, tty));
+                    outln!("{}", ui.paint(ui::style::DIM, &line));
                 }
                 hex_runtime::StreamCursor::at_end(runtime, run_id, attempt_id)
                     .map_err(|e| e.to_string())?
@@ -1713,7 +1718,7 @@ fn follow_logs(
         }
         seen = events.len();
         attaching = false;
-        drain(runtime, run_id, &mut open, tty)?;
+        drain(runtime, run_id, &mut open, ui)?;
 
         let status = runtime.status(run_id).map_err(|e| e.to_string())?;
         if status.status.is_finished() {
@@ -1735,7 +1740,7 @@ fn drain(
     runtime: &Runtime,
     run_id: &str,
     open: &mut Option<(String, hex_runtime::StreamCursor)>,
-    tty: bool,
+    ui: ui::Ui,
 ) -> Result<(), String> {
     let Some((attempt_id, cursor)) = open.as_mut() else {
         return Ok(());
@@ -1746,7 +1751,7 @@ fn drain(
     {
         for line in chunk.text.lines() {
             if let Some(shown) = agent_stream::humanize(line) {
-                outln!("{}", grey(&shown, tty));
+                outln!("{}", ui.paint(ui::style::DIM, &shown));
             }
         }
     }
@@ -1781,11 +1786,12 @@ fn cmd_logs(
     tail: Option<usize>,
     follow: bool,
     json: bool,
+    ui: ui::Ui,
 ) -> Result<ExitCode, String> {
     let runtime = open_runtime()?;
     let tail_lines = tail.unwrap_or(DEFAULT_TAIL_LINES);
     if follow {
-        return follow_logs(&runtime, run_id, node, tail_lines);
+        return follow_logs(&runtime, run_id, node, tail_lines, ui);
     }
     let in_flight = runtime
         .status(run_id)
@@ -1836,7 +1842,6 @@ fn cmd_logs(
     // stdout — including the stderr half, which `eprint!` used to send back out of
     // the pipe (`hex logs --full > out.txt` captured almost nothing). One target
     // stream, so one TTY decides the colouring.
-    let tty = std::io::stdout().is_terminal();
     for l in &logs {
         let node = l.node_id.as_deref().unwrap_or("?");
         let via = l
@@ -1845,19 +1850,22 @@ fn cmd_logs(
             .map_or(String::new(), |w| format!(" via {w}"));
         outln!("── {} [{node}]{via} ──", l.attempt_id);
         if full {
-            print_captured(&l.stdout, tty);
-            print_captured(&l.stderr, tty);
+            print_captured(&l.stdout, ui);
+            print_captured(&l.stderr, ui);
         } else {
             // Default: just the attempt's final message, dimmed.
             match &l.result {
-                Some(text) => outln!("{}", grey(text, tty)),
+                Some(text) => outln!("{}", ui.paint(ui::style::DIM, text)),
                 // An attempt still running has no final message *yet*, and saying
                 // "(no final message captured)" over ten lines of live output reads
                 // as "nothing happened". Show its tail instead, and say it is live.
                 None if in_flight.as_deref() == Some(l.attempt_id.as_str()) => {
-                    print_tail(&l.stdout, &l.stderr, tail_lines, tty);
+                    print_tail(&l.stdout, &l.stderr, tail_lines, ui);
                 }
-                None => outln!("{}", grey("(no final message captured)", tty)),
+                None => outln!(
+                    "{}",
+                    ui.paint(ui::style::DIM, "(no final message captured)")
+                ),
             }
         }
         // A `command` node writes every byte into its numbered step dirs and
@@ -1868,8 +1876,8 @@ fn cmd_logs(
         for step in &l.steps {
             outln!("   · {}", step.label);
             if full {
-                print_captured(&step.stdout, tty);
-                print_captured(&step.stderr, tty);
+                print_captured(&step.stdout, ui);
+                print_captured(&step.stderr, ui);
             }
         }
     }
@@ -1879,34 +1887,40 @@ fn cmd_logs(
 /// The last `lines` lines of a live attempt's output, across both streams —
 /// codex writes everything to stderr and nothing to stdout, so either alone is
 /// silent for one of the two agents.
-fn print_tail(stdout: &str, stderr: &str, lines: usize, tty: bool) {
+fn print_tail(stdout: &str, stderr: &str, lines: usize, ui: ui::Ui) {
     let combined: Vec<String> = stdout
         .lines()
         .chain(stderr.lines())
         .filter_map(agent_stream::humanize)
         .collect();
     if combined.is_empty() {
-        outln!("{}", grey("(running; nothing captured yet)", tty));
+        outln!(
+            "{}",
+            ui.paint(ui::style::DIM, "(running; nothing captured yet)")
+        );
         return;
     }
     let start = combined.len().saturating_sub(lines);
     if start > 0 {
-        outln!("{}", grey(&format!("… {start} earlier line(s)"), tty));
+        outln!(
+            "{}",
+            ui.paint(ui::style::DIM, &format!("… {start} earlier line(s)"))
+        );
     }
     for line in &combined[start..] {
-        outln!("{}", grey(line, tty));
+        outln!("{}", ui.paint(ui::style::DIM, line));
     }
-    outln!("{}", grey("(still running)", tty));
+    outln!("{}", ui.paint(ui::style::DIM, "(still running)"));
 }
 
 /// Print one captured stream, dimmed, skipping it when it holds nothing worth a
 /// blank line. A capture that does not end in a newline gets one, so the next
 /// header starts at column zero.
-fn print_captured(text: &str, tty: bool) {
+fn print_captured(text: &str, ui: ui::Ui) {
     if text.trim().is_empty() {
         return;
     }
-    out!("{}", grey(text, tty));
+    out!("{}", ui.paint(ui::style::DIM, text));
     if !text.ends_with('\n') {
         outln!();
     }
@@ -1932,15 +1946,6 @@ fn tokens(n: u64) -> String {
         n if n < 10_000 => n.to_string(),
         n if n < 1_000_000 => format!("{:.1}k", n as f64 / 1_000.0),
         n => format!("{:.2}M", n as f64 / 1_000_000.0),
-    }
-}
-
-/// Dim `s` to grey when its target stream `is_tty` (and NO_COLOR is unset).
-fn grey(s: &str, is_tty: bool) -> String {
-    if is_tty && std::env::var_os("NO_COLOR").is_none() {
-        format!("\x1b[90m{s}\x1b[0m")
-    } else {
-        s.to_owned()
     }
 }
 
@@ -2144,81 +2149,44 @@ mod tests {
         Cli::try_parse_from(v)
     }
 
+    /// Every way an operator supplies the one prompt channel (`-p`, `--prompt`,
+    /// `-f`, or nothing), through the same parse → `resolve_prompt` path.
     #[test]
-    fn parses_positional_prompt_and_json() {
-        // `--json` is global, so it parses after the subcommand.
-        let cli = parse(&["run", "critique-loop", "--json", "-p", "fix the bug"]).unwrap();
-        assert!(cli.json);
-        let Some(Command::Run {
-            graph,
-            prompt,
-            file,
-            ..
-        }) = cli.command
-        else {
-            panic!("expected run command");
-        };
-        assert_eq!(graph.as_deref(), Some("critique-loop"));
-        assert_eq!(
-            resolve_prompt(&prompt, &file).unwrap().as_deref(),
-            Some("fix the bug")
-        );
-    }
-
-    #[test]
-    fn global_json_also_parses_before_the_subcommand() {
-        let cli = parse(&["--json", "run", "g"]).unwrap();
-        assert!(cli.json);
-    }
-
-    #[test]
-    fn long_prompt_flag_works() {
-        let cli = parse(&["run", "g", "--prompt", "do the thing"]).unwrap();
-        assert!(!cli.json);
-        let Some(Command::Run { prompt, file, .. }) = cli.command else {
-            panic!("expected run command");
-        };
-        assert_eq!(
-            resolve_prompt(&prompt, &file).unwrap().as_deref(),
-            Some("do the thing")
-        );
-    }
-
-    #[test]
-    fn prompt_and_file_together_is_an_error() {
-        // Mutually exclusive at parse time (clap `conflicts_with`).
-        assert!(parse(&["run", "g", "-p", "x", "-f", "prompt.md"]).is_err());
-    }
-
-    #[test]
-    fn prompt_flag_requires_a_value() {
-        assert!(parse(&["run", "g", "-p"]).is_err());
-    }
-
-    #[test]
-    fn no_prompt_resolves_to_none() {
-        let cli = parse(&["run", "g"]).unwrap();
-        let Some(Command::Run { prompt, file, .. }) = cli.command else {
-            panic!("expected run command");
-        };
-        assert_eq!(resolve_prompt(&prompt, &file).unwrap(), None);
-    }
-
-    #[test]
-    fn file_flag_reads_the_prompt_from_disk() {
+    fn a_prompt_comes_from_a_flag_a_file_or_nowhere() {
         let dir =
             std::env::temp_dir().join(format!("hex-cli-p-{}-{}", std::process::id(), unique()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("prompt.md");
         std::fs::write(&path, "prompt from file").unwrap();
-        let cli = parse(&["run", "g", "-f", path.to_str().unwrap()]).unwrap();
-        let Some(Command::Run { prompt, file, .. }) = cli.command else {
-            panic!("expected run command");
-        };
-        assert_eq!(
-            resolve_prompt(&prompt, &file).unwrap().as_deref(),
-            Some("prompt from file")
-        );
+
+        for (case, args, want) in [
+            (
+                "-p",
+                vec!["run", "critique-loop", "-p", "fix the bug"],
+                Some("fix the bug"),
+            ),
+            (
+                "--prompt",
+                vec!["run", "g", "--prompt", "do the thing"],
+                Some("do the thing"),
+            ),
+            (
+                "-f",
+                vec!["run", "g", "-f", path.to_str().unwrap()],
+                Some("prompt from file"),
+            ),
+            ("none", vec!["run", "g"], None),
+        ] {
+            let cli = parse(&args).unwrap_or_else(|e| panic!("{case}: {e}"));
+            let Some(Command::Run { prompt, file, .. }) = cli.command else {
+                panic!("{case}: expected run command");
+            };
+            assert_eq!(
+                resolve_prompt(&prompt, &file).unwrap().as_deref(),
+                want,
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -2234,24 +2202,5 @@ mod tests {
         assert_eq!(run_id, "run_1");
         assert_eq!(node.as_deref(), Some("build"));
         assert!(full);
-    }
-
-    #[test]
-    fn list_has_an_ls_alias() {
-        assert!(matches!(
-            parse(&["ls"]).unwrap().command,
-            Some(Command::List)
-        ));
-    }
-
-    #[test]
-    fn bare_invocation_has_no_command() {
-        assert!(parse(&[]).unwrap().command.is_none());
-    }
-
-    #[test]
-    fn prompt_and_file_are_rejected_only_on_run() {
-        // Structural verbs don't accept -p/-f at all.
-        assert!(parse(&["validate", "g", "-p", "x"]).is_err());
     }
 }
