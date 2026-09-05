@@ -13,14 +13,14 @@ example: "tasks/hex-dash.md: implement hex dash"
 #     which judges the whole branch as one change.
 #
 # Base branch is named in the final-review diff below; keep it in sync with the
-# `--worktree <base>` you launch with (here: feat/hex-dash).
+# `--worktree <base>` you launch with (here: main).
 
 defaults:
   role: implementer
   context: fresh
   budget:
-    attempts: 40
-    elapsed: 180m
+    attempts: 26
+    elapsed: 120m
     attempt: 25m
 
 entry: implement
@@ -91,7 +91,7 @@ nodes:
           hex emit changes_requested
       may_propose: [approved, changes_requested]
     budget:
-      visits: 24
+      visits: 14
     on:
       approved: implement
       changes_requested: implement
@@ -118,7 +118,7 @@ nodes:
         The overall task (the file it names is the checklist):
         {{prompt}}
 
-        Run `git diff feat/hex-dash...HEAD` and `git log --oneline feat/hex-dash..HEAD`
+        Run `git diff main...HEAD` and `git log --oneline main..HEAD`
         to see the entire change, and read the checklist file. Judge coherence,
         completeness against the checklist, and whether it violates any invariant
         in AGENTS.md — review only, do not edit files. If the complete branch is

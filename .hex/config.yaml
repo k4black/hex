@@ -4,11 +4,12 @@
 # only the keys below differ, and each key set here wins for this project.
 
 roles:
-  # codex reviews what claude wrote: a different model reviews than wrote the
-  # code (rationale and the study to A/B it against are in TODO.md).
+  # pi (gemini flash via openrouter) reviews what claude wrote: a different
+  # model reviews than wrote the code (rationale: TODO.md; was codex before
+  # the 2026-09-05 dogfood pass).
   reviewer:
-    worker: codex
-    effort: high
+    worker: pi
+    model: openrouter/google/gemini-3.8-flash
     prompt_append: |
       This is a Rust workspace with hard architectural invariants in AGENTS.md —
       read it before judging a design choice, and say so if a change violates one.
@@ -16,6 +17,7 @@ roles:
 
   implementer:
     worker: claude
+    model: opus
     effort: high
 
 # What "green" means here. Referenced by graphs as `command: { check: <name> }`.
