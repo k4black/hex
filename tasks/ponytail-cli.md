@@ -36,7 +36,7 @@ against the branch base; re-locate by symbol if they drifted. After each item:
   the two fields as parameters. Also: `age()` (main.rs:1186) re-derives
   `now_ms().saturating_sub(at_ms)` which is exactly `elapsed_ms` (main.rs
   a few functions above) — call it instead.
-- [ ] main.rs: `--no-preview` is declared `global = true` (main.rs:78-79), so
+- [x] main.rs: `--no-preview` is declared `global = true` (main.rs:78-79), so
   13 verbs accept and silently ignore it. Move it onto the `run` and `resume`
   subcommands only, and drop the global threading (main.rs:280,317,320). A
   flag a command accepts and ignores is worse than one it rejects. Keep

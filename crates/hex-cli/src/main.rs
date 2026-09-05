@@ -74,10 +74,6 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Disable the live in-flight preview pane (plain line streaming instead)
-    #[arg(long, global = true)]
-    no_preview: bool,
-
     /// When to colour output
     #[arg(long, global = true, value_name = "WHEN", default_value = "auto")]
     color: ui::When,
@@ -143,11 +139,17 @@ enum Command {
         /// Internal: drive the run id a `--detach` launcher reserved
         #[arg(long, value_name = "RUN_ID", hide = true, conflicts_with = "detach")]
         reserved_run_id: Option<String>,
+        /// Disable the live in-flight preview pane (plain line streaming instead)
+        #[arg(long)]
+        no_preview: bool,
     },
     /// Resume the SAME run from its journal (after a pause or crash)
     Resume {
         /// Run id, as printed by `hex run`
         run_id: String,
+        /// Disable the live in-flight preview pane (plain line streaming instead)
+        #[arg(long)]
+        no_preview: bool,
     },
     /// List runs (newest activity first)
     Runs,
@@ -277,7 +279,6 @@ fn main() -> ExitCode {
 /// failure (exit 2).
 fn dispatch(cli: Cli) -> Result<ExitCode, String> {
     let json = cli.json;
-    let no_preview = cli.no_preview;
     let Some(command) = cli.command else {
         // Bare `hex` is a usage error, so render clap's own help — byte-for-byte
         // the same text `hex --help` prints — to stderr and exit 2. (clap's
@@ -304,6 +305,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             worktree_init,
             detach,
             reserved_run_id,
+            no_preview,
         } => cmd_run(
             graph.as_deref(),
             resolve_prompt(&prompt, &file)?,
@@ -315,7 +317,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             no_preview,
             ui::Ui::stdout(cli.color, json),
         ),
-        Command::Resume { run_id } => {
+        Command::Resume { run_id, no_preview } => {
             cmd_resume(&run_id, json, no_preview, ui::Ui::stdout(cli.color, json))
         }
         Command::Runs => cmd_runs(json, ui::Ui::stdout(cli.color, json)),
