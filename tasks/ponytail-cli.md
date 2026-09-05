@@ -5,7 +5,7 @@ shrink: same behavior, less code. Do NOT touch any other crate. Line numbers are
 against the branch base; re-locate by symbol if they drifted. After each item:
 `cargo build --bin hex` and `cargo test -p hex-cli` must pass.
 
-- [ ] ui.rs: `Ui::stdout()` and `Ui::stderr()` (ui.rs:43-68) are byte-identical
+- [x] ui.rs: `Ui::stdout()` and `Ui::stderr()` (ui.rs:43-68) are byte-identical
   except which stream is probed for TTY-ness. Collapse into one private
   `fn for_stream(color, json, is_tty) -> Ui` with two 1-line public callers.
 - [ ] ui.rs: `pub fn cells` (ui.rs:385-388) has no caller outside its module —

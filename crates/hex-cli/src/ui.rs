@@ -38,33 +38,34 @@ pub struct Ui {
 }
 
 impl Ui {
-    /// Resolve for stdout.
-    #[must_use]
-    pub fn stdout(color: When, json: bool) -> Self {
+    /// The two streams differ only in which one is probed for TTY-ness.
+    fn for_stream(color: When, json: bool, is_tty: bool) -> Self {
         Self {
-            color: paint(
-                color,
-                json,
-                std::io::IsTerminal::is_terminal(&std::io::stdout()),
-            ),
+            color: paint(color, json, is_tty),
             unicode: unicode_ok(),
             width: width(),
         }
+    }
+
+    /// Resolve for stdout.
+    #[must_use]
+    pub fn stdout(color: When, json: bool) -> Self {
+        Self::for_stream(
+            color,
+            json,
+            std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        )
     }
 
     /// Resolve for stderr. Its own answer: piping stdout to another program is
     /// no reason to strip colour from a diagnostic the human still sees.
     #[must_use]
     pub fn stderr(color: When, json: bool) -> Self {
-        Self {
-            color: paint(
-                color,
-                json,
-                std::io::IsTerminal::is_terminal(&std::io::stderr()),
-            ),
-            unicode: unicode_ok(),
-            width: width(),
-        }
+        Self::for_stream(
+            color,
+            json,
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        )
     }
 
     /// A fixed policy for tests — no environment, no ioctl. Env mutation races
