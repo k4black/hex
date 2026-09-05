@@ -30,7 +30,7 @@ against the branch base; re-locate by symbol if they drifted. After each item:
   variants, but its only caller feeds it `Mark::hue()`, which only ever
   returns Green/Red/Yellow/Cyan. Keep those 4 arms plus a `_ => Color::Reset`
   fallback.
-- [ ] main.rs: `RunMode` (main.rs:359-362) is a 2-field struct with one
+- [x] main.rs: `RunMode` (main.rs:359-362) is a 2-field struct with one
   construction site and one read (main.rs:832-841), existing only to shorten
   an arg list that is already `#[allow(clippy::too_many_arguments)]`. Inline
   the two fields as parameters. Also: `age()` (main.rs:1186) re-derives

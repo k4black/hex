@@ -309,10 +309,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             resolve_prompt(&prompt, &file)?,
             name.as_deref(),
             isolation_from(worktree.as_deref(), no_worktree, worktree_init.as_deref()),
-            RunMode {
-                detach,
-                reserved: reserved_run_id,
-            },
+            detach,
+            reserved_run_id,
             json,
             no_preview,
             ui::Ui::stdout(cli.color, json),
@@ -362,13 +360,6 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Command::Emit { event } => cmd_emit(&event),
         Command::Feedback { message, kind } => feedback::record(&message, kind.as_deref()),
     }
-}
-
-/// How `hex run` should execute: foreground (the default), detaching, or — when
-/// the launcher re-execs us — driving the run id it reserved.
-struct RunMode {
-    detach: bool,
-    reserved: Option<String>,
 }
 
 /// The actor a command from this CLI is issued as. A human at a TTY and an agent
@@ -846,7 +837,8 @@ fn cmd_run(
     prompt: Option<String>,
     name: Option<&str>,
     isolation: Isolation,
-    mode: RunMode,
+    detach: bool,
+    reserved: Option<String>,
     json: bool,
     no_preview: bool,
     ui: ui::Ui,
@@ -857,7 +849,7 @@ fn cmd_run(
         print_graph_list(&runtime, json, ui);
         return Ok(ExitCode::SUCCESS);
     };
-    if mode.detach {
+    if detach {
         return cmd_detach(
             &runtime,
             reference,
@@ -867,7 +859,7 @@ fn cmd_run(
             json,
         );
     }
-    let report = match &mode.reserved {
+    let report = match &reserved {
         Some(run_id) => runtime.start_reserved(run_id, reference, prompt.as_deref(), &isolation),
         None => runtime.start(reference, prompt.as_deref(), name, &isolation),
     }
@@ -1279,7 +1271,7 @@ pub(crate) fn age(at_ms: u64) -> String {
     if at_ms == 0 {
         return "-".to_owned();
     }
-    let secs = hex_runtime::journal::now_ms().saturating_sub(at_ms) / 1000;
+    let secs = elapsed_ms(at_ms) / 1000;
     match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m", s / 60),
