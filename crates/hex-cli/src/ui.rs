@@ -383,8 +383,7 @@ fn width() -> Option<usize> {
 ///
 /// Not `chars().count()`: `…` and `≥` are East-Asian *Ambiguous* and occupy two
 /// cells in a CJK locale, which silently shifts every column to their right.
-#[must_use]
-pub fn cells(s: &str) -> usize {
+fn cells(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
@@ -574,8 +573,6 @@ mod tests {
             }
         }
     }
-
-    /// No glyph may carry emoji presentation: a font that substitutes a colour
 
     #[test]
     fn an_explicit_choice_beats_everything() {

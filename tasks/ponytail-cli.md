@@ -8,7 +8,7 @@ against the branch base; re-locate by symbol if they drifted. After each item:
 - [x] ui.rs: `Ui::stdout()` and `Ui::stderr()` (ui.rs:43-68) are byte-identical
   except which stream is probed for TTY-ness. Collapse into one private
   `fn for_stream(color, json, is_tty) -> Ui` with two 1-line public callers.
-- [ ] ui.rs: `pub fn cells` (ui.rs:385-388) has no caller outside its module —
+- [x] ui.rs: `pub fn cells` (ui.rs:385-388) has no caller outside its module —
   make it private. Also delete the orphaned doc-comment sentence at ui.rs:577
   that documents a test (`no_glyph_is_an_emoji_presentation_codepoint`) which no
   longer exists.
