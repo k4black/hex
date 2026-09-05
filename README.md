@@ -333,7 +333,11 @@ model reviews than wrote the code):
 | `critique-loop` | implement → review, until approved (the flagship) | no |
 | `checklist` | work a `- [ ]` checklist file item by item, critique loop per item, then one holistic review of the whole change | no |
 | `plan-build-review` | plan → implement → review | no |
+| `pr` | implement → review until approved → commit, push, open a PR with `gh` | no |
 | `review` | reviewer over the current `git diff`, no implementer | no |
+| `code` | one bounded implementer pass — no review, no gate | no |
+| `research` | one research pass — answer with sources in the final message | no |
+| `autoresearch` | research → critic judges sufficiency → revise → report | no |
 | `implement-until-green` | implement → test (the Ralph loop) | **`checks.test`** |
 | `tdd` | write-failing-test → prove red → implement → prove green | **`checks.test`** |
 
@@ -719,20 +723,16 @@ reported usage saturates; a follower reads exactly the bytes it accounts for
 `--node` and rejects `--json`; and an unreadable control inbox is an error rather
 than a report of "nothing queued".
 
+Landed 2026-08-02 → 2026-09-05: Ctrl-C stops the agent and pauses the run
+(exit 6, resumable); both `accept.on_unmet` unbounded-cycle validation holes
+closed (a terminal's `visits` bound and a human-only cycle no longer count as
+cycle breakers — both graphs are `E-unbounded-cycle` at compile time now);
+`hex dash`; the `checklist` preset; the `pi` worker; `hex feedback`; and the
+`code` / `research` / `pr` presets.
+
 ### Known broken
 
-Two unbounded-loop holes, found by hex reviewing its own diff and **not yet
-fixed** — both in the `accept.on_unmet` cycle validation added 2026-07-31, so
-fixing one unbounded cycle opened two more. Avoid `on_unmet` and `human` cycles in
-an unattended run until these land:
-
-- A terminal's `budget: { visits: N }` satisfies cycle validation but is never
-  enforced — `schedule` settles terminals before it checks visit budgets, so
-  `implement → done → implement` with the bound on `done` alone loops forever.
-- `budget.attempts` does not bound a **human-only** cycle: a human response spends
-  no attempt, so `human A → human B → human A` spins forever while validating.
-
-Also unexplained: an fs4/flock flake where a just-released lock still reads as
+Unexplained: an fs4/flock flake where a just-released lock still reads as
 busy. Seen on both worktree-slot and run locks; its user-visible symptom is
 `hex cancel` right after a run ends queuing instead of recording. The tests that
 would catch it are serialized, so **"parallel runs grow the pool" is currently an

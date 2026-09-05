@@ -1,9 +1,9 @@
 version: 1
 name: plan-build-review
-description: "Full pipeline — plan, then implement, then a different model reviews"
+description: "Plan, then implement, then a different model reviews"
 example: "refactor the auth module to use middleware"
 
-# The full pipeline: plan → implement → review. The planner's result is handed to
+# Plan → implement → review. The planner's result is handed to
 # the implementer and reviewer as {{plan.result}}, and the `reviewer` role runs a
 # different agent from `implementer`. plan/implement finish without emitting
 # (implicit `done`); review emits its verdict.

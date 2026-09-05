@@ -1,0 +1,39 @@
+version: 1
+name: code
+description: "One bounded implementer pass — no review loop, no gate"
+example: "rename ResultKind to ResultCapture across the workspace"
+
+# The simplest preset: one implementer, one pass, done. No reviewer and no
+# check, so it runs in any repo with no setup. What it adds over invoking the
+# agent CLI directly is hex's envelope: a journal, a hard time/attempt bound,
+# `hex steer`/`hex pause`, crash-resume, `--worktree` isolation and `--detach`.
+#
+# For anything that deserves a second pair of eyes, use `critique-loop`;
+# for "loop until the tests pass", `implement-until-green`.
+# Run it with:  hex run code -p "…"   (or -f task.md)
+
+defaults:
+  role: implementer
+  context: fresh
+  budget:
+    attempts: 2
+    elapsed: 30m
+
+entry: implement
+
+nodes:
+  implement:
+    agent:
+      prompt: |
+        Task: {{prompt}}
+
+        Implement the smallest change that fully does the job, following the
+        conventions already present in the files you touch. Verify your work
+        the way this project verifies work (run its tests or checks if it has
+        them). Summarize what you changed in your final message. Just finish
+        when you are done; no command is needed.
+    on:
+      done: done
+
+  done:
+    terminal: succeeded

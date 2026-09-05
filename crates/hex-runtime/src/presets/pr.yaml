@@ -1,0 +1,88 @@
+version: 1
+name: pr
+description: "Implement → cross-model review until approved → commit, push, open a PR"
+example: "add rate limiting to the webhook endpoint"
+
+# The critique loop, finished properly: once the reviewer approves, a final
+# node commits the work, pushes a branch, and opens a pull request with `gh`.
+# The PR URL is the run's final message.
+#
+# Needs the GitHub CLI (`gh`) authenticated in this repo. Pairs well with
+# `--worktree`: the run then works on branch `hex/<run-id>` without touching
+# your working copy, and that is the branch the PR is opened from.
+# Run it with:  hex run pr -p "…"   (or -f task.md)
+
+defaults:
+  role: implementer
+  context: fresh
+  budget:
+    attempts: 14
+    elapsed: 40m
+
+entry: implement
+
+nodes:
+  implement:
+    agent:
+      # Revisited every round, so it continues its own agent session; the
+      # reviewer below stays `fresh` so each verdict is an independent read of
+      # the current diff. (A `continue` node needs a worker that can resume —
+      # codex, claude and pi can; set `context: fresh` here otherwise.)
+      context: continue
+      prompt: |
+        Task: {{prompt}}
+
+        If a reviewer sent it back, address this feedback (empty on the first
+        pass):
+        {{review.result}}
+
+        Implement the smallest change that satisfies the task. Do not commit —
+        a later step does. When you are done, run:  hex emit ready_for_review
+      may_propose: [ready_for_review]
+    on:
+      ready_for_review: review
+
+  review:
+    agent:
+      role: reviewer
+      prompt: |
+        Review the current working-tree changes against this task: {{prompt}}
+
+        Run `git diff` (and `git status`) to see them. If the change is
+        acceptable, run:
+          hex emit approved
+        Otherwise put concrete, actionable feedback in your final message (it is
+        handed back to the implementer) and run:
+          hex emit changes_requested
+      may_propose: [approved, changes_requested]
+    budget:
+      visits: 4
+    on:
+      approved: publish
+      changes_requested: implement
+
+  publish:
+    agent:
+      prompt: |
+        The working-tree changes for this task were approved by review:
+        {{prompt}}
+
+        Ship them as a pull request:
+        1. If you are on the default branch, create a descriptively named
+           branch; otherwise stay on the current one.
+        2. Commit the changes with a message describing the task, then push the
+           branch with `git push -u`.
+        3. If a PR for this branch already exists, update it; otherwise open one
+           with `gh pr create`, with a body summarizing what changed and why.
+
+        Put the PR URL in your final message. Just finish when it is open; no
+        command is needed.
+    on:
+      done: done
+
+  done:
+    terminal: succeeded
+
+accept:
+  require: [review.approved]
+  on_unmet: implement

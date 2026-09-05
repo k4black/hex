@@ -19,6 +19,9 @@ const TDD: &str = include_str!("presets/tdd.yaml");
 const PLAN_BUILD_REVIEW: &str = include_str!("presets/plan-build-review.yaml");
 const REVIEW: &str = include_str!("presets/review.yaml");
 const AUTORESEARCH: &str = include_str!("presets/autoresearch.yaml");
+const CODE: &str = include_str!("presets/code.yaml");
+const RESEARCH: &str = include_str!("presets/research.yaml");
+const PR: &str = include_str!("presets/pr.yaml");
 
 /// One graph shipped in the binary.
 pub struct Builtin {
@@ -57,6 +60,18 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "autoresearch",
         source: AUTORESEARCH,
+    },
+    Builtin {
+        name: "code",
+        source: CODE,
+    },
+    Builtin {
+        name: "research",
+        source: RESEARCH,
+    },
+    Builtin {
+        name: "pr",
+        source: PR,
     },
 ];
 
