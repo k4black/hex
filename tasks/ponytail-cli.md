@@ -18,7 +18,7 @@ against the branch base; re-locate by symbol if they drifted. After each item:
   1882, 1905), and it ignores `--color`. Replace each use with the existing
   `Ui` dim-paint path (`ui.paint(...)` with the dim style, as the rest of the
   file does) and delete `grey()` and the threaded `tty` parameters.
-- [ ] graph_view.rs: a `g: &Glyphs` parameter is threaded beside `ui: Ui`
+- [x] graph_view.rs: a `g: &Glyphs` parameter is threaded beside `ui: Ui`
   through ~10 signatures (graph_view.rs:27,51,95,124,220,236,255,325,359,411
   and main.rs:789), but it is exactly `ui.glyphs()` and `Ui` is `Copy`. Drop
   the parameter and call `ui.glyphs()` where needed.

@@ -796,7 +796,6 @@ fn cmd_graph(
         // Handled above, before compilation.
         GraphFormat::Source => unreachable!("source returns before the graph is compiled"),
         GraphFormat::Text => {
-            let glyphs = ui.glyphs();
             // Which layer this resolved from, and its one-line description —
             // "which of the three graphs named this am I looking at" is a
             // question the reference alone cannot answer.
@@ -815,7 +814,6 @@ fn cmd_graph(
                     &origin,
                     description.as_deref(),
                     &runtime.worker_bindings(),
-                    &glyphs,
                     ui
                 )
             );
