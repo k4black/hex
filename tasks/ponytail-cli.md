@@ -12,7 +12,7 @@ against the branch base; re-locate by symbol if they drifted. After each item:
   make it private. Also delete the orphaned doc-comment sentence at ui.rs:577
   that documents a test (`no_glyph_is_an_emoji_presentation_codepoint`) which no
   longer exists.
-- [ ] main.rs: `grey()` (main.rs:1939) is a second, hand-rolled color policy —
+- [x] main.rs: `grey()` (main.rs:1939) is a second, hand-rolled color policy —
   raw `\x1b[90m` plus its own `NO_COLOR` read — threaded as a `tty: bool`
   through ~6 signatures and ~12 call sites (main.rs:1076, 1680, 1738, 1839,
   1882, 1905), and it ignores `--color`. Replace each use with the existing
