@@ -8,14 +8,15 @@ edition = "2024"
 rust-version = "1.88"        # floor set by ratatui 0.30 (the live-preview TUI)
 license = "MIT"
 repository = "https://github.com/k4black/hex"
+homepage = "https://github.com/k4black/hex"
 
 [workspace.dependencies]
 # Internal crates (dependencies point strictly inward: proto <- kernel,
 # proto/kernel <- worker, kernel/worker <- runtime, clients <- runtime).
-hex-proto = { path = "crates/hex-proto" }
-hex-kernel = { path = "crates/hex-kernel" }
-hex-worker = { path = "crates/hex-worker" }
-hex-runtime = { path = "crates/hex-runtime" }
+hex-proto = { path = "crates/hex-proto", version = "0.1.0" }
+hex-kernel = { path = "crates/hex-kernel", version = "0.1.0" }
+hex-worker = { path = "crates/hex-worker", version = "0.1.0" }
+hex-runtime = { path = "crates/hex-runtime", version = "0.1.0" }
 
 # External, shared across the workspace so versions stay aligned.
 clap = { version = "4", features = ["derive"] }
@@ -64,4 +65,9 @@ all = { level = "warn", priority = -1 }
 
 # Thin release profile; tune later once there is real code to measure.
 [profile.release]
+lto = "thin"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
 lto = "thin"

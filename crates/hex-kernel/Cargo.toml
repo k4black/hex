@@ -1,12 +1,12 @@
 [package]
 name = "hex-kernel"
-description = "hex: pure deterministic kernel — graph IR, journal model, projections, reduce + schedule"
+description = "Internal crate of hex: pure deterministic kernel (graph IR, journal, reduce + schedule). No stable API; install hex-cli instead."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+homepage.workspace = true
 
 [dependencies]
 hex-proto = { workspace = true }
