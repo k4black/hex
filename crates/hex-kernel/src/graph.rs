@@ -62,14 +62,15 @@ pub enum NodeSpec {
         worker: String,
         /// Node prompt (with the operator prompt already interpolated).
         prompt: String,
-        /// The routing events this agent is allowed to emit.
+        /// The routing events this agent is allowed to propose (as the
+        /// `VERDICT:` line of its final message).
         may_propose: Vec<String>,
         /// Context policy.
         context: Context,
         /// Whether the agent should not modify the workspace (a reviewer).
-        /// Advisory only: workers cannot enforce a hard read-only sandbox
-        /// without also blocking the `hex emit` control channel, so this is
-        /// conveyed via the node's prompt, not an OS boundary (see the worker).
+        /// Advisory only: a hard read-only sandbox would also stop the agent
+        /// writing the final message the run routes on, so this is conveyed via
+        /// the node's prompt, not an OS boundary (see the worker).
         read_only: bool,
     },
     /// Run one or more deterministic commands; produces `passed`/`failed`. Acts
@@ -162,10 +163,11 @@ pub struct Node {
     pub spec: NodeSpec,
     /// How many times this node may be entered (`budget: { visits: N }`).
     ///
-    /// Bounds *one* loop rather than every loop: a graph with a cheap lint cycle
-    /// and an expensive review cycle can cap the review at 3 without also
-    /// capping the lint. The run-level [`Budget::cycle_visits`] still applies as
-    /// a blanket backstop; whichever is tighter bites first.
+    /// The only visit bound there is: the loader defaults every non-terminal
+    /// node to [`DEFAULT_NODE_VISITS`], so a node with no declared `visits` is
+    /// still bounded. Bounds *one* loop rather than every loop: a graph with a
+    /// cheap lint cycle and an expensive review cycle can cap the review at 3
+    /// without also capping the lint.
     pub max_visits: Option<u32>,
 }
 
@@ -202,10 +204,14 @@ pub struct Edge {
 
 /// Durable limits bounding the run. A limit is one field of a budget; a budget
 /// never resets on resume.
+///
+/// There is deliberately no run-wide retry count: bounding one node
+/// ([`Node::max_visits`]) says *which* loop is allowed to churn, whereas a
+/// whole-run attempt budget only said how long the burn lasts. `elapsed_ms`,
+/// `attempt_elapsed_ms` and `output_tokens` remain run-wide because time and
+/// generation are genuinely global resources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Budget {
-    /// Maximum attempts across the whole run.
-    pub attempts: Option<u32>,
     /// Maximum wall-clock time for the whole run (milliseconds).
     pub elapsed_ms: Option<u64>,
     /// Maximum wall-clock time for a *single* attempt (milliseconds).
@@ -216,8 +222,6 @@ pub struct Budget {
     /// process consumed the entire run budget — or blocked indefinitely when the
     /// graph declared no `elapsed` at all.
     pub attempt_elapsed_ms: Option<u64>,
-    /// Maximum visits to any single node (per-cycle bound).
-    pub cycle_visits: Option<u32>,
     /// Maximum **generation** tokens across the whole run — what the agents
     /// produced, summed from `AttemptReported`.
     ///
@@ -237,6 +241,14 @@ pub struct Budget {
 /// (30 minutes). A backstop against an agent that hangs forever, not a tuning
 /// knob — declare `budget.attempt` to override.
 pub const DEFAULT_ATTEMPT_ELAPSED_MS: u64 = 30 * 60 * 1000;
+
+/// How many times a non-terminal node may be entered when it declares no
+/// `budget: { visits: N }`.
+///
+/// Applied by the loader, so every cycle is bounded by construction. Terminal
+/// nodes keep `None`: `schedule` settles a terminal before any budget check, so
+/// a bound there is recorded but never enforced (gotcha 18).
+pub const DEFAULT_NODE_VISITS: u32 = 5;
 
 /// The run's acceptance contract: the evidence a success terminal requires, and
 /// optionally where to go when it is missing.

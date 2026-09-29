@@ -7,11 +7,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
-use hex_proto::Capability;
-
 use crate::{CapabilityManifest, WorkOutcome, WorkRequest, Worker};
 
-/// A worker that emits prescribed signals for tests.
+/// A worker that produces prescribed verdicts for tests.
 #[derive(Debug, Default)]
 pub struct MockWorker {
     scripts: Mutex<BTreeMap<String, VecDeque<String>>>,
@@ -39,7 +37,12 @@ impl MockWorker {
 
 impl Worker for MockWorker {
     fn capabilities(&self) -> CapabilityManifest {
-        CapabilityManifest::from(&[Capability::StructuredEvents, Capability::FreshSessions])
+        CapabilityManifest::default()
+    }
+
+    /// The mock synthesizes a final message, so it can carry a verdict.
+    fn captures_result(&self) -> bool {
+        true
     }
 
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
@@ -50,7 +53,7 @@ impl Worker for MockWorker {
             .get_mut(&request.node_id)
             .and_then(VecDeque::pop_front);
         match next {
-            Some(signal) => WorkOutcome::signal(signal),
+            Some(signal) => WorkOutcome::verdict(&signal),
             None => WorkOutcome::error(format!(
                 "mock: no scripted signal for `{}`",
                 request.node_id
@@ -70,7 +73,6 @@ mod tests {
             node_id: node.to_owned(),
             attempt_id: "att_1".to_owned(),
             prompt: String::new(),
-            may_propose: vec![],
             workdir: PathBuf::from("."),
             attempt_dir: PathBuf::from("."),
             deadline_ms: None,
@@ -84,13 +86,13 @@ mod tests {
     }
 
     #[test]
-    fn emits_scripted_signals_in_order() {
+    fn a_scripted_verdict_becomes_a_final_message() {
         let w = MockWorker::new().on("review", &["changes_requested", "approved"]);
         assert_eq!(
             w.run(&request("review")),
-            WorkOutcome::signal("changes_requested")
+            WorkOutcome::verdict("changes_requested")
         );
-        assert_eq!(w.run(&request("review")), WorkOutcome::signal("approved"));
+        assert_eq!(w.run(&request("review")), WorkOutcome::verdict("approved"));
         assert!(w.run(&request("review")).error.is_some());
     }
 }

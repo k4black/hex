@@ -79,9 +79,9 @@ fn ensure_gitignored_is_idempotent() {
 fn lease_creates_then_reuses_the_same_slot_when_clean() {
     let _gate = pool_shape_gate();
     let root = temp_repo("reuse");
-    let (base_ref, sha) = worktree::resolve_base(&root, None).unwrap();
+    let (_, sha) = worktree::resolve_base(&root, None).unwrap();
 
-    let first = worktree::lease(&root, "hex/r1", &base_ref, &sha).unwrap();
+    let first = worktree::lease(&root, "hex/r1", &sha).unwrap();
     assert!(first.warmup_needed, "fresh slot wants warmup");
     assert!(first.reclaimed.is_none());
     assert_eq!(first.dir, root.join(".hex/worktrees/0"));
@@ -94,7 +94,7 @@ fn lease_creates_then_reuses_the_same_slot_when_clean() {
 
     // A clean slot is reused in place on the next run: same dir, new branch, no
     // warmup (deps would still be warm).
-    let second = worktree::lease(&root, "hex/r2", &base_ref, &sha).unwrap();
+    let second = worktree::lease(&root, "hex/r2", &sha).unwrap();
     assert_eq!(second.dir, root.join(".hex/worktrees/0"), "reused slot 0");
     assert!(!second.warmup_needed, "clean reuse skips warmup");
     assert!(second.reclaimed.is_none());
@@ -105,10 +105,10 @@ fn lease_creates_then_reuses_the_same_slot_when_clean() {
 fn parallel_lease_grows_the_pool() {
     let _gate = pool_shape_gate();
     let root = temp_repo("parallel");
-    let (base_ref, sha) = worktree::resolve_base(&root, None).unwrap();
+    let (_, sha) = worktree::resolve_base(&root, None).unwrap();
     // Hold the first lease while leasing again → a second slot must be created.
-    let a = worktree::lease(&root, "hex/a", &base_ref, &sha).unwrap();
-    let b = worktree::lease(&root, "hex/b", &base_ref, &sha).unwrap();
+    let a = worktree::lease(&root, "hex/a", &sha).unwrap();
+    let b = worktree::lease(&root, "hex/b", &sha).unwrap();
     assert_eq!(a.dir, root.join(".hex/worktrees/0"));
     assert_eq!(b.dir, root.join(".hex/worktrees/1"));
 }
@@ -117,9 +117,9 @@ fn parallel_lease_grows_the_pool() {
 fn dirty_slot_is_reclaimed_and_deps_survive() {
     let _gate = pool_shape_gate();
     let root = temp_repo("reclaim");
-    let (base_ref, sha) = worktree::resolve_base(&root, None).unwrap();
+    let (_, sha) = worktree::resolve_base(&root, None).unwrap();
 
-    let first = worktree::lease(&root, "hex/r1", &base_ref, &sha).unwrap();
+    let first = worktree::lease(&root, "hex/r1", &sha).unwrap();
     let slot = first.dir.clone();
     // Leave the slot dirty: a modified tracked file, a stray untracked file, and
     // a gitignored "dependency" that must survive the reclaim.
@@ -129,7 +129,7 @@ fn dirty_slot_is_reclaimed_and_deps_survive() {
     std::fs::write(slot.join("deps/lib"), "warm\n").unwrap();
     drop(first);
 
-    let second = worktree::lease(&root, "hex/r2", &base_ref, &sha).unwrap();
+    let second = worktree::lease(&root, "hex/r2", &sha).unwrap();
     assert_eq!(second.dir, slot, "same slot reclaimed");
     assert!(second.warmup_needed, "reclaim re-warms");
     assert!(
@@ -150,8 +150,8 @@ fn dirty_slot_is_reclaimed_and_deps_survive() {
 fn reattach_recreates_a_missing_checkout_from_the_branch() {
     let _gate = pool_shape_gate();
     let root = temp_repo("reattach");
-    let (base_ref, sha) = worktree::resolve_base(&root, None).unwrap();
-    let leased = worktree::lease(&root, "hex/r1", &base_ref, &sha).unwrap();
+    let (_, sha) = worktree::resolve_base(&root, None).unwrap();
+    let leased = worktree::lease(&root, "hex/r1", &sha).unwrap();
     let dir = leased.dir.clone();
     drop(leased);
 
@@ -172,8 +172,8 @@ fn reattach_recreates_a_missing_checkout_from_the_branch() {
 fn run_warmup_runs_argv_and_propagates_failure() {
     let _gate = pool_shape_gate();
     let root = temp_repo("warmup");
-    let (base_ref, sha) = worktree::resolve_base(&root, None).unwrap();
-    let slot = worktree::lease(&root, "hex/r1", &base_ref, &sha).unwrap();
+    let (_, sha) = worktree::resolve_base(&root, None).unwrap();
+    let slot = worktree::lease(&root, "hex/r1", &sha).unwrap();
     let logdir = root.join(".hex");
     std::fs::create_dir_all(&logdir).unwrap();
     worktree::run_warmup(&slot.dir, &["git".into(), "--version".into()], &logdir).expect("ok");
@@ -190,7 +190,6 @@ fn end_to_end_run_executes_in_the_leased_worktree() {
 version: 1
 name: wt
 entry: work
-defaults: { budget: { attempts: 4 } }
 nodes:
   work:
     agent: { worker: w, prompt: "go", may_propose: [ready] }
@@ -204,14 +203,16 @@ accept: { require: [] }
     std::fs::create_dir_all(&gdir).unwrap();
     std::fs::write(gdir.join("wt.yaml"), GRAPH).unwrap();
 
-    // The worker records its cwd (the slot) as the result, then emits `ready`.
+    // The worker records its cwd (the slot) as the result, then reports its
+    // verdict — both in the captured message, since `result: file` reads only
+    // that file.
     let mut workers = Workers::new();
     workers.insert(
         "w",
         Box::new(
             CommandWorker::new(
                 "w",
-                sh("pwd > \"$HEX_RESULT_FILE\"; printf ready > \"$HEX_EMIT_FILE\""),
+                sh("pwd > \"$HEX_RESULT_FILE\"; echo 'VERDICT: ready' >> \"$HEX_RESULT_FILE\""),
             )
             .with_result_capture(Some(hex_worker::ResultCapture::File)),
         ),
@@ -257,4 +258,32 @@ accept: { require: [] }
     );
     let ignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
     assert!(ignore.contains(".hex/worktrees/"), "{ignore}");
+}
+
+/// `release_slot` deletes only a slot still on the releasing run's own branch:
+/// slots are pooled, so a newer (possibly paused, hence unlocked) run may have
+/// reclaimed it since the pruned run recorded it — its uncommitted work must
+/// survive another run's prune.
+#[test]
+fn release_slot_keeps_a_slot_reused_by_another_branch() {
+    let _gate = pool_shape_gate();
+    let root = temp_repo("release-branch");
+    let (_, base_sha) = worktree::resolve_base(&root, None).expect("base");
+    let slot = worktree::lease(&root, "hex/old-run", &base_sha).expect("lease");
+    let dir = slot.dir.clone();
+    drop(slot); // the lease lock is gone, as after a pause or a finished run
+
+    // Another branch now owns the checkout (a reclaim by a newer run).
+    git(&dir, &["checkout", "-qb", "hex/new-run"]);
+
+    assert!(
+        !worktree::release_slot(&root, &dir, "hex/old-run"),
+        "a reused slot must not be deleted"
+    );
+    assert!(dir.exists(), "the newer run's checkout survives");
+    assert!(
+        worktree::release_slot(&root, &dir, "hex/new-run"),
+        "the owning branch may release it"
+    );
+    assert!(!dir.exists());
 }

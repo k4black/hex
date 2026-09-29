@@ -23,7 +23,6 @@ defaults:
   role: implementer
   context: fresh
   budget:
-    attempts: 12
     elapsed: 30m
 
 entry: implement
@@ -48,8 +47,9 @@ nodes:
         pass):
         {{review.result}}
 
-        Implement the smallest change that satisfies the task. When you are
-        done, run:  hex emit ready_for_review
+        Implement the smallest change that satisfies the task. When it is done,
+        state your verdict at the end of your final message — hex asks for the
+        exact line to use.
       may_propose: [ready_for_review]
     on:
       ready_for_review: review
@@ -65,13 +65,11 @@ nodes:
         Review the current working-tree changes against this task: {{prompt}}
 
         Run `git diff` (and `git status`) to see them. If the change is
-        acceptable, run:
-          hex emit approved
-        Otherwise put concrete, actionable feedback in your final message (it is
-        handed back to the implementer) and run:
-          hex emit changes_requested
+        acceptable say so in your verdict; otherwise put concrete, actionable
+        feedback in your final message — it is handed back to the implementer.
+
       may_propose: [approved, changes_requested]
-    # At most 4 review rounds, however many attempts the run budget allows.
+    # At most 4 review rounds, however much time the run has left.
     budget:
       visits: 4
     on:

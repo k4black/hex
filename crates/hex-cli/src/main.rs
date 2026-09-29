@@ -1,14 +1,14 @@
 //! `hex` — a thin, deterministic control plane for agentic loops and graphs.
 //!
 //! This binary is one operator surface: argument parsing and rendering over
-//! [`hex_runtime::Runtime`]. A human at a TTY and an agent (via injected
-//! `hex emit`) share the same control protocol; every action becomes an event.
+//! [`hex_runtime::Runtime`]. A human at a TTY and an agent driving hex from a
+//! shell share the same control protocol; every action becomes an event.
 //!
 //! Verbs: `init` · `validate` · `graph` · `run` · `resume` · `runs` · `status` ·
-//! `watch` · `wait` · `logs` · `pause` · `steer` · `respond` · `cancel`, plus the
-//! worker-side `emit`. Redoing work is a new `run`; there is no
-//! `retry`/`replay`. The mid-run verbs are all thin writes to the run's control
-//! inbox — the same transport a human and an agent use.
+//! `wait` · `logs` · `pause` · `steer` · `respond` · `cancel`. Redoing
+//! work is a new `run`; there is no `retry`/`replay`. The mid-run verbs are all
+//! thin writes to the run's control inbox — the same transport a human and an
+//! agent use.
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -21,9 +21,7 @@ use hex_runtime::{
 #[macro_use]
 mod out;
 mod agent_stream;
-mod dash;
 mod feedback;
-mod graph_export;
 mod graph_view;
 mod preview;
 #[cfg(test)]
@@ -39,7 +37,7 @@ Examples:
   hex validate critique-loop           check a graph before running it
   hex run critique-loop -p \"fix bug\"   start a run with an inline prompt
   hex run critique-loop -f task.md     read the prompt from a file
-  hex run tdd -p \"fix bug\" --detach    start a run in the background
+  hex run critique-loop -p \"fix bug\" & run it in the background (your shell)
   hex runs                             list runs (ids, status, age)
   hex status <run-id>                  show a run's status
   hex logs <run-id> --node reviewer    show one node's agent output
@@ -48,7 +46,7 @@ Examples:
   hex respond <run-id> \"approved\"      answer a waiting human node
   hex resume <run-id>                  continue a run after a pause or crash
 
-Add --json to any command except `dash` for machine-readable output on stdout.
+Add --json to any command for machine-readable output on stdout.
 Docs: https://github.com/k4black/hex";
 
 // The subcommand is optional so bare `hex` prints help to stderr (exit 2)
@@ -66,11 +64,9 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Emit machine-readable JSON on stdout, for every verb but `dash`, instead
-    /// of human-readable text.
-    ///
-    /// `dash` is a full-screen TUI with no machine mode; a machine consumer uses
-    /// `hex runs --json` for that view.
+    /// Emit machine-readable JSON on stdout, for the commands that have a
+    /// machine form (`hex graph` does not — a graph's machine form is its YAML,
+    /// via `--format source`).
     #[arg(long, global = true)]
     json: bool,
 
@@ -89,18 +85,18 @@ enum Command {
     List,
     /// Check that configured workers and checks are actually usable
     Doctor,
-    /// Validate a graph: schema, references, bounded cycles
+    /// Validate a graph: schema, references, a reachable success
     Validate {
         /// Graph reference: a preset name or a path to a `.yaml` file
         #[arg(value_name = "GRAPH")]
         graph: String,
     },
-    /// Render a graph: as text, JSON, mermaid, or graphviz DOT
+    /// Render a graph: as text, or its YAML source
     Graph {
         /// Graph reference: a preset name or a path to a `.yaml` file
         #[arg(value_name = "GRAPH")]
         graph: String,
-        /// Output format (`mermaid` pastes into a GitHub comment; `dot` feeds graphviz)
+        /// Output format (`source` prints the YAML, the copy-and-customise path)
         #[arg(long, value_enum, default_value_t = GraphFormat::Text)]
         format: GraphFormat,
     },
@@ -133,12 +129,6 @@ enum Command {
         /// Warmup argv run once in a fresh/reclaimed worktree (no shell)
         #[arg(long, value_name = "CMD", requires = "worktree")]
         worktree_init: Option<String>,
-        /// Run in the background: print the run id and return immediately
-        #[arg(long)]
-        detach: bool,
-        /// Internal: drive the run id a `--detach` launcher reserved
-        #[arg(long, value_name = "RUN_ID", hide = true, conflicts_with = "detach")]
-        reserved_run_id: Option<String>,
         /// Disable the live in-flight preview pane (plain line streaming instead)
         #[arg(long)]
         no_preview: bool,
@@ -153,17 +143,6 @@ enum Command {
     },
     /// List runs (newest activity first)
     Runs,
-    /// Live full-screen view of all runs
-    Dash {
-        /// Redraw interval in milliseconds (must be ≥ 1)
-        #[arg(
-            long,
-            value_name = "MS",
-            default_value_t = 1000,
-            value_parser = clap::value_parser!(u64).range(1..)
-        )]
-        interval: u64,
-    },
     /// Show a run's projected status
     Status {
         /// Run id, as printed by `hex run`
@@ -171,14 +150,6 @@ enum Command {
         /// Also break the spend down per node and per model
         #[arg(long)]
         usage: bool,
-    },
-    /// Print a run's recorded event stream
-    Watch {
-        /// Run id, as printed by `hex run`
-        run_id: String,
-        /// Keep printing new events until the run finishes
-        #[arg(long)]
-        follow: bool,
     },
     /// Show each attempt's final message (`--full` for full stdout/stderr)
     Logs {
@@ -229,11 +200,6 @@ enum Command {
         /// Run id, as printed by `hex run`
         run_id: String,
     },
-    /// Propose a routing event (worker-side; called by an agent inside a run)
-    Emit {
-        /// Routing event to append (must be in the node's `may_propose`)
-        event: String,
-    },
     /// Record feedback about hex to `~/.hex/feedback.jsonl` (issues, missing
     /// capabilities); auto-captures the run/graph/agent/project context
     Feedback {
@@ -244,21 +210,26 @@ enum Command {
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
     },
+    /// Show what this machine has asked hex to do, folded from `~/.hex/stats.jsonl`
+    Stats,
+    /// Remove old finished/interrupted run directories and release their worktree slots
+    Prune {
+        /// Only remove runs whose journal is older than this (humantime, e.g. `7d`)
+        #[arg(long, value_name = "DUR")]
+        older_than: Option<String>,
+        /// Remove every non-live run, regardless of age
+        #[arg(long)]
+        all: bool,
+    },
 }
 
-/// How `hex graph` renders. Every one of these goes to stdout and exits 0.
+/// How `hex graph` renders. Both go to stdout and exit 0.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GraphFormat {
     /// The flow, for a terminal.
     Text,
-    /// The compiled IR plus edge classification, for a machine.
-    Json,
-    /// A mermaid `flowchart`, for a Markdown comment.
-    Mermaid,
-    /// A graphviz `digraph`, for `dot -Tsvg`.
-    Dot,
-    /// The graph's YAML verbatim — the copy-and-customise path two shipped
-    /// presets already tell you to use.
+    /// The graph's YAML verbatim — the copy-and-customise path, and the only
+    /// machine form a graph has: the exact text a run compiles.
     Source,
 }
 
@@ -287,6 +258,20 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         return Ok(ExitCode::from(2));
     };
 
+    // One usage line per invocation, with two exclusions. `init` creates the
+    // project's `.hex/`, and a usage log must never create that directory first.
+    // The observation verbs (`status`, `logs`, `wait`, `runs`, `stats`) are the
+    // ones agents poll in a loop — logging them grows the file with poll
+    // frequency instead of with work done, which breaks the fold-on-read ceiling.
+    let verb = command_verb(&command);
+    if !matches!(verb, "init" | "status" | "logs" | "wait" | "runs" | "stats") {
+        hex_runtime::stats::record_cli(
+            verb,
+            caller_source(),
+            &std::env::current_dir().unwrap_or_default(),
+        );
+    }
+
     match command {
         Command::Init => cmd_init(json),
         Command::List => cmd_list(json, ui::Ui::stdout(cli.color, json)),
@@ -303,16 +288,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             worktree,
             no_worktree,
             worktree_init,
-            detach,
-            reserved_run_id,
             no_preview,
         } => cmd_run(
             graph.as_deref(),
             resolve_prompt(&prompt, &file)?,
             name.as_deref(),
             isolation_from(worktree.as_deref(), no_worktree, worktree_init.as_deref()),
-            detach,
-            reserved_run_id,
             json,
             no_preview,
             ui::Ui::stdout(cli.color, json),
@@ -321,20 +302,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             cmd_resume(&run_id, json, no_preview, ui::Ui::stdout(cli.color, json))
         }
         Command::Runs => cmd_runs(json, ui::Ui::stdout(cli.color, json)),
-        Command::Dash { interval } => {
-            // `dash` is a TUI with no machine mode. Refuse `--json` before
-            // opening the runtime or the terminal, and point a machine consumer
-            // at the verb that does have one.
-            if json {
-                eprintln!("hex: dash has no machine mode; use `hex runs --json`");
-                return Ok(ExitCode::from(2));
-            }
-            dash::run(&open_runtime()?, interval, cli.color)
-        }
         Command::Status { run_id, usage } => {
             cmd_status(&run_id, usage, json, ui::Ui::stdout(cli.color, json))
         }
-        Command::Watch { run_id, follow } => cmd_watch(&run_id, follow, json),
         Command::Logs {
             run_id,
             node,
@@ -359,8 +329,48 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             cmd_control(&run_id, &ControlCommand::Respond { text }, json)
         }
         Command::Cancel { run_id } => cmd_cancel(&run_id, json),
-        Command::Emit { event } => cmd_emit(&event),
         Command::Feedback { message, kind } => feedback::record(&message, kind.as_deref()),
+        Command::Stats => cmd_stats(json, ui::Ui::stdout(cli.color, json)),
+        Command::Prune { older_than, all } => cmd_prune(older_than.as_deref(), all, json),
+    }
+}
+
+/// The canonical verb name for the stats log — stable, lowercase, the same word
+/// the CLI accepts.
+fn command_verb(command: &Command) -> &'static str {
+    match command {
+        Command::Init => "init",
+        Command::List => "list",
+        Command::Doctor => "doctor",
+        Command::Validate { .. } => "validate",
+        Command::Graph { .. } => "graph",
+        Command::Run { .. } => "run",
+        Command::Resume { .. } => "resume",
+        Command::Runs => "runs",
+        Command::Status { .. } => "status",
+        Command::Logs { .. } => "logs",
+        Command::Wait { .. } => "wait",
+        Command::Pause { .. } => "pause",
+        Command::Steer { .. } => "steer",
+        Command::Respond { .. } => "respond",
+        Command::Cancel { .. } => "cancel",
+        Command::Feedback { .. } => "feedback",
+        Command::Stats => "stats",
+        Command::Prune { .. } => "prune",
+    }
+}
+
+/// Which class of caller invoked this verb — the coarse fact a run journal
+/// cannot hold. `subgraph` means it ran inside an attempt (the runtime injected
+/// `HEX_RUN_ID`); otherwise a terminal is `interactive` and a pipe or an agent's
+/// shell is `non-interactive`.
+fn caller_source() -> &'static str {
+    if std::env::var_os("HEX_RUN_ID").is_some() {
+        "subgraph"
+    } else if std::io::stdout().is_terminal() {
+        "interactive"
+    } else {
+        "non-interactive"
     }
 }
 
@@ -408,13 +418,24 @@ fn open_runtime_streaming(json: bool, no_preview: bool) -> Result<Runtime, Strin
     Ok(open_runtime()?.with_progress(Box::new(preview::SharedPreview(sink))))
 }
 
-/// A one-line rendering of an event for progress/watch output.
+/// A one-line rendering of an event for progress output.
 pub(crate) fn event_line(e: &hex_runtime::Event) -> String {
     let node = e
         .node_id
         .as_deref()
         .map_or(String::new(), |n| format!(" {n}"));
-    format!("#{}{} {}", e.seq, node, event_summary(&e.body))
+    // Wall clock (UTC) so a run redirected to a log file carries its own
+    // timeline — an agent tailing it can tell 2 minutes of silence from 20.
+    let s = e.at_ms / 1000;
+    format!(
+        "{:02}:{:02}:{:02} #{}{} {}",
+        (s / 3600) % 24,
+        (s / 60) % 60,
+        s % 60,
+        e.seq,
+        node,
+        event_summary(&e.body)
+    )
 }
 
 /// The starter `.hex/config.yaml`. Every key is commented out: the built-in layer
@@ -766,10 +787,18 @@ fn cmd_graph(
     json: bool,
     ui: ui::Ui,
 ) -> Result<ExitCode, String> {
+    // `--json` is refused, not ignored: a graph's machine form is its YAML.
+    if json {
+        return Err(
+            "`hex graph` has no machine form — the graph's machine form is its YAML \
+             (`hex graph <name> --format source`)"
+                .to_owned(),
+        );
+    }
     let runtime = open_runtime()?;
     // Source is the one format that must work on a graph that does not compile:
     // you reach for it precisely to fix one.
-    if matches!(format, GraphFormat::Source) && !json {
+    if matches!(format, GraphFormat::Source) {
         out!(
             "{}",
             runtime.graph_source(reference).map_err(|e| e.to_string())?
@@ -777,41 +806,27 @@ fn cmd_graph(
         return Ok(ExitCode::SUCCESS);
     }
     let graph = runtime.validate(reference).map_err(|e| e.to_string())?;
-    let topo = hex_runtime::Topology::of(&graph);
-    // The global `--json` is an alias for `--format json` rather than a conflict:
-    // it is documented as working on any command, so rejecting it here would
-    // break the one habit every other verb teaches.
-    let format = if json { GraphFormat::Json } else { format };
-    match format {
-        GraphFormat::Json => outln!("{}", graph_view::to_json(&graph, &topo, reference)),
-        GraphFormat::Mermaid => out!("{}", graph_export::to_mermaid(&graph, &topo)),
-        GraphFormat::Dot => out!("{}", graph_export::to_dot(&graph, &topo)),
-        // Handled above, before compilation.
-        GraphFormat::Source => unreachable!("source returns before the graph is compiled"),
-        GraphFormat::Text => {
-            // Which layer this resolved from, and its one-line description —
-            // "which of the three graphs named this am I looking at" is a
-            // question the reference alone cannot answer.
-            let entry = runtime
-                .list_graphs()
-                .into_iter()
-                .find(|e| e.name == reference);
-            let origin = entry
-                .as_ref()
-                .map_or_else(|| reference.to_owned(), |e| e.origin.clone());
-            let description = entry.as_ref().and_then(|e| e.description.clone());
-            out!(
-                "{}",
-                graph_view::render(
-                    &graph,
-                    &origin,
-                    description.as_deref(),
-                    &runtime.worker_bindings(),
-                    ui
-                )
-            );
-        }
-    }
+    // Which layer this resolved from, and its one-line description — "which of
+    // the three graphs named this am I looking at" is a question the reference
+    // alone cannot answer.
+    let entry = runtime
+        .list_graphs()
+        .into_iter()
+        .find(|e| e.name == reference);
+    let origin = entry
+        .as_ref()
+        .map_or_else(|| reference.to_owned(), |e| e.origin.clone());
+    let description = entry.as_ref().and_then(|e| e.description.clone());
+    out!(
+        "{}",
+        graph_view::render(
+            &graph,
+            &origin,
+            description.as_deref(),
+            &runtime.worker_bindings(),
+            ui
+        )
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -839,8 +854,6 @@ fn cmd_run(
     prompt: Option<String>,
     name: Option<&str>,
     isolation: Isolation,
-    detach: bool,
-    reserved: Option<String>,
     json: bool,
     no_preview: bool,
     ui: ui::Ui,
@@ -851,106 +864,10 @@ fn cmd_run(
         print_graph_list(&runtime, json, ui);
         return Ok(ExitCode::SUCCESS);
     };
-    if detach {
-        return cmd_detach(
-            &runtime,
-            reference,
-            prompt.as_deref(),
-            name,
-            &isolation,
-            json,
-        );
-    }
-    let report = match &reserved {
-        Some(run_id) => runtime.start_reserved(run_id, reference, prompt.as_deref(), &isolation),
-        None => runtime.start(reference, prompt.as_deref(), name, &isolation),
-    }
-    .map_err(|e| e.to_string())?;
-    print_outcome(&runtime, &report, json, "run", ui)
-}
-
-/// Launch a run in the background and return its id immediately.
-///
-/// The run id is reserved (and the graph validated) here, in the foreground, so a
-/// bad graph or a missing agent CLI is reported to the operator instead of dying
-/// unseen in the child. Then we re-exec ourselves to drive that reservation.
-fn cmd_detach(
-    runtime: &Runtime,
-    reference: &str,
-    prompt: Option<&str>,
-    name: Option<&str>,
-    isolation: &Isolation,
-    json: bool,
-) -> Result<ExitCode, String> {
-    let (run_id, run_dir) = runtime
-        .reserve(reference, prompt, name)
+    let report = runtime
+        .start(reference, prompt.as_deref(), name, &isolation)
         .map_err(|e| e.to_string())?;
-
-    let mut argv: Vec<String> = vec![
-        "run".to_owned(),
-        reference.to_owned(),
-        "--reserved-run-id".to_owned(),
-        run_id.clone(),
-    ];
-    if let Some(text) = prompt {
-        // Pass the resolved text, not `-f`: the child must run the prompt the
-        // launcher validated, even if the file changes underneath it.
-        argv.push("--prompt".to_owned());
-        argv.push(text.to_owned());
-    }
-    if let Isolation::Worktree { base, init } = isolation {
-        argv.push("--worktree".to_owned());
-        argv.push(base.clone().unwrap_or_default());
-        if !init.is_empty() {
-            argv.push("--worktree-init".to_owned());
-            argv.push(init.join(" "));
-        }
-    }
-    spawn_detached(&argv, &run_dir)?;
-
-    if json {
-        outln!(
-            "{}",
-            serde_json::json!({ "run_id": run_id, "detached": true })
-        );
-    } else {
-        outln!("{run_id}");
-        eprintln!("detached; follow with `hex wait {run_id}` or `hex watch {run_id}`");
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Spawn `hex <argv>` as a run that outlives this process.
-///
-/// `spawn`, never `fork()` — forking a multithreaded Rust process is unsafe, and
-/// this binary is multithreaded. `process_group(0)` puts the child in its own
-/// process group so a Ctrl-C (or the shell reaping our group) does not kill the
-/// run, and we deliberately never `wait()`: the parent exits at once, the child
-/// is reparented, and no zombie is left behind.
-#[cfg(unix)]
-fn spawn_detached(argv: &[String], run_dir: &std::path::Path) -> Result<(), String> {
-    use std::os::unix::process::CommandExt as _;
-    use std::process::{Command as Proc, Stdio};
-
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate the hex binary: {e}"))?;
-    let out = std::fs::File::create(run_dir.join("detached.out"))
-        .map_err(|e| format!("cannot create detached.out: {e}"))?;
-    let err = std::fs::File::create(run_dir.join("detached.err"))
-        .map_err(|e| format!("cannot create detached.err: {e}"))?;
-    Proc::new(exe)
-        .args(argv)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("cannot spawn the detached run: {e}"))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn spawn_detached(_argv: &[String], _run_dir: &std::path::Path) -> Result<(), String> {
-    Err("--detach needs a unix process group; run in the foreground".to_owned())
+    print_outcome(&runtime, &report, json, "run", ui)
 }
 
 fn cmd_resume(run_id: &str, json: bool, no_preview: bool, ui: ui::Ui) -> Result<ExitCode, String> {
@@ -1120,14 +1037,17 @@ fn cmd_runs(json: bool, ui: ui::Ui) -> Result<ExitCode, String> {
             .map(|r| {
                 serde_json::json!({
                     "run_id": r.run_id,
-                    "status": r.status.as_ref().map(ToString::to_string),
+                    "state": r.state.as_str(),
+                    "hung": r.hung,
+                    "disposition": disposition_json(r.state.disposition()),
                     "current": r.current,
                     "attempts": r.attempts,
-                    "disposition": disposition_json(r.disposition),
-                    "liveness": r.liveness.to_string(),
                     "created_at_ms": r.created_at_ms,
                     "updated_at_ms": r.updated_at_ms,
-                    "error": r.error,
+                    "error": match &r.state {
+                        hex_runtime::Liveness::Error(why) => Some(why),
+                        _ => None,
+                    },
                 })
             })
             .collect();
@@ -1141,13 +1061,13 @@ fn cmd_runs(json: bool, ui: ui::Ui) -> Result<ExitCode, String> {
     // One table, one width policy, one place that knows how a state looks.
     // `finished:failed` in STATE beside `finished` in PROCESS said "finished"
     // twice and nothing else. The mark carries the colour, the word carries the
-    // verdict, and liveness appears only while it still means something.
-    // Liveness, not status: an *unreadable* run has no status but is not a
-    // process anyone is waiting on, and letting it force the column back means
-    // the column never disappears.
+    // verdict, and the process column appears only while it still means
+    // something: an *unreadable* run has no disposition but is not a process
+    // anyone is waiting on, and letting it force the column back means the column
+    // never disappears.
     let live = runs
         .iter()
-        .any(|r| !matches!(r.liveness, hex_runtime::Liveness::Finished));
+        .any(|r| !matches!(r.state, hex_runtime::Liveness::Finished(_)));
     let mut headers: Vec<&str> = vec!["", "RUN", "RESULT", "AGE", "LAST"];
     if live {
         headers.push("PROCESS");
@@ -1163,10 +1083,15 @@ fn cmd_runs(json: bool, ui: ui::Ui) -> Result<ExitCode, String> {
             r.current.clone().unwrap_or_else(|| "-".to_owned()),
         ];
         if live {
-            row.push(
-                ui.paint(ui::style::DIM, &r.liveness.to_string())
-                    .to_string(),
-            );
+            // `live` alone cannot say whether the process is *working*, so the
+            // stale-heartbeat case is spelled out here rather than becoming a
+            // state of its own: the operator's next move is identical.
+            let process = if r.hung {
+                format!("{} (not beating)", r.state.as_str())
+            } else {
+                r.state.as_str().to_owned()
+            };
+            row.push(ui.paint(ui::style::DIM, &process).to_string());
         }
         table.row(row);
     }
@@ -1175,12 +1100,14 @@ fn cmd_runs(json: bool, ui: ui::Ui) -> Result<ExitCode, String> {
     }
     // Buffered to one line: four 130-character yaml errors interleaved with the
     // table on a terminal and vanished entirely when it was redirected.
-    let broken: Vec<&hex_runtime::RunSummary> = runs.iter().filter(|r| r.error.is_some()).collect();
-    if !broken.is_empty() {
+    let broken = runs
+        .iter()
+        .filter(|r| matches!(r.state, hex_runtime::Liveness::Error(_)))
+        .count();
+    if broken > 0 {
         eprintln!(
-            "hex: {} run(s) could not be replayed (a graph from an older schema); \
-             `hex status <run>` prints why",
-            broken.len()
+            "hex: {broken} run(s) could not be replayed (a graph from an older schema); \
+             `hex status <run>` prints why"
         );
     }
     Ok(ExitCode::SUCCESS)
@@ -1237,15 +1164,19 @@ fn spend_line(t: &hex_runtime::Totals, ui: ui::Ui) -> String {
 
 /// The glyph for a run's state — the column you scan before reading anything.
 pub(crate) fn mark_for(r: &hex_runtime::RunSummary) -> ui::Mark {
-    use hex_runtime::{Disposition as D, Status};
-    match (&r.status, r.disposition) {
-        (None, _) => ui::Mark::Warn,
-        (_, Some(D::Succeeded)) => ui::Mark::Ok,
-        (_, Some(D::Failed)) => ui::Mark::Fail,
-        (_, Some(D::TimedOut | D::BudgetExhausted)) => ui::Mark::Warn,
-        (_, Some(D::Cancelled)) => ui::Mark::Idle,
-        (Some(Status::Running), None) => ui::Mark::Running,
-        _ => ui::Mark::Idle,
+    use hex_runtime::Liveness;
+    match &r.state {
+        Liveness::Error(_) => ui::Mark::Warn,
+        Liveness::Finished(d) => match d {
+            hex_runtime::Disposition::Succeeded => ui::Mark::Ok,
+            hex_runtime::Disposition::Failed => ui::Mark::Fail,
+            hex_runtime::Disposition::TimedOut | hex_runtime::Disposition::BudgetExhausted => {
+                ui::Mark::Warn
+            }
+            hex_runtime::Disposition::Cancelled => ui::Mark::Idle,
+        },
+        Liveness::Live => ui::Mark::Running,
+        Liveness::Interrupted => ui::Mark::Idle,
     }
 }
 
@@ -1254,17 +1185,14 @@ pub(crate) fn mark_for(r: &hex_runtime::RunSummary) -> ui::Mark {
 /// Left uncoloured on purpose: the mark in the first column already carries the
 /// colour, and colour must never be the only thing saying what happened.
 pub(crate) fn result_word(r: &hex_runtime::RunSummary) -> String {
-    use hex_runtime::{Disposition as D, Status};
-    match (&r.status, r.disposition) {
-        (None, _) => "unreadable".to_owned(),
-        (_, Some(D::Succeeded)) => "succeeded".to_owned(),
-        (_, Some(D::Failed)) => "failed".to_owned(),
-        (_, Some(D::TimedOut)) => "timed out".to_owned(),
-        (_, Some(D::BudgetExhausted)) => "budget exhausted".to_owned(),
-        (_, Some(D::Cancelled)) => "cancelled".to_owned(),
-        (Some(Status::Paused), _) => "paused".to_owned(),
-        (Some(Status::Running), _) => "running".to_owned(),
-        _ => "created".to_owned(),
+    use hex_runtime::Liveness;
+    match &r.state {
+        Liveness::Error(_) => "unreadable".to_owned(),
+        Liveness::Finished(d) => d.to_string().replace('_', " "),
+        Liveness::Live => "running".to_owned(),
+        // Paused, Ctrl-C'd and crashed are one state on purpose: the next move
+        // is `hex resume` in all three cases.
+        Liveness::Interrupted => "interrupted".to_owned(),
     }
 }
 
@@ -1282,35 +1210,175 @@ pub(crate) fn age(at_ms: u64) -> String {
     }
 }
 
-/// How long `wait` tolerates "nobody is driving this unfinished run" before
-/// giving up. A grace period, because a just-detached run has not yet taken its
-/// lock and would otherwise look abandoned the instant it was launched.
-const WAIT_ABANDONED_GRACE_MS: u64 = 5_000;
+/// How long `wait` tolerates an `interrupted` run before concluding nobody is
+/// coming back for it. A grace period, because a run started in another shell a
+/// moment ago may not have taken its lock yet.
+const WAIT_INTERRUPTED_GRACE_MS: u64 = 5_000;
+
+/// `hex stats` — what this machine has asked hex to do, folded from
+/// `~/.hex/stats.jsonl`. Read-only: no counters, no database, the log is the
+/// only source and the fold is the only number.
+fn cmd_stats(json: bool, ui: ui::Ui) -> Result<ExitCode, String> {
+    let path = hex_runtime::local_log::path(hex_runtime::stats::FILE)?;
+    let agg = hex_runtime::stats::fold(&path)?;
+    if json {
+        outln!(
+            "{}",
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "lines": agg.lines,
+                "verbs": agg.verbs,
+                "graphs": agg.graphs,
+                "repos": agg.repos,
+                "dispositions": agg.dispositions,
+                "nodes": agg.nodes,
+                "worktree_runs": agg.worktree_runs,
+                "shared_runs": agg.shared_runs,
+            })
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    if agg.lines == 0 {
+        outln!("no stats recorded yet ({} is empty)", path.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+    outln!("{} ({} lines)", path.display(), agg.lines);
+    // Four of the five sections are a name and one count.
+    for (title, headers, map) in [
+        ("COMMANDS", ["VERB", "COUNT"], &agg.verbs),
+        ("NODES", ["NODE", "ATTEMPTS"], &agg.nodes),
+        ("REPOS", ["REPO", "LINES"], &agg.repos),
+        ("OUTCOMES", ["DISPOSITION", "RUNS"], &agg.dispositions),
+    ] {
+        stats_table(
+            ui,
+            title,
+            &headers,
+            &[false, true],
+            map.iter().map(|(k, n)| vec![k.clone(), n.to_string()]),
+        );
+    }
+    stats_table(
+        ui,
+        "GRAPHS",
+        &["GRAPH", "RUNS", "CUSTOM"],
+        &[false, true, true],
+        agg.graphs
+            .iter()
+            .map(|(g, u)| vec![g.clone(), u.runs.to_string(), u.custom.to_string()]),
+    );
+    outln!(
+        "\nisolation: {} worktree · {} shared",
+        agg.worktree_runs,
+        agg.shared_runs
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One titled table of the stats report. An empty section prints nothing:
+/// a header over no rows reads like a bug.
+fn stats_table<I>(ui: ui::Ui, title: &str, headers: &[&str], right: &[bool], rows: I)
+where
+    I: IntoIterator<Item = Vec<String>>,
+{
+    let mut table = ui::Table::new(headers, right);
+    let mut any = false;
+    for row in rows {
+        any = true;
+        table.row(row);
+    }
+    if !any {
+        return;
+    }
+    outln!("\n{title}");
+    for line in table.render(ui) {
+        outln!("{line}");
+    }
+}
+
+/// `hex prune` — remove old finished/interrupted runs and release their slots.
+fn cmd_prune(older_than: Option<&str>, all: bool, json: bool) -> Result<ExitCode, String> {
+    let runtime = open_runtime()?;
+    let dur = match older_than {
+        Some(raw) => Some(
+            humantime::parse_duration(raw)
+                .map_err(|e| format!("cannot parse `{raw}` as a duration: {e}"))?,
+        ),
+        None if all => None,
+        // Default: keep a week of history. Always printed, so the policy is
+        // never a surprise.
+        None => Some(std::time::Duration::from_secs(7 * 24 * 3600)),
+    };
+    let report = runtime.prune(dur, all).map_err(|e| e.to_string())?;
+    if json {
+        outln!(
+            "{}",
+            serde_json::json!({
+                "removed": report.removed,
+                "kept": report.kept,
+                "bytes": report.bytes,
+            })
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(d) = dur {
+        outln!(
+            "pruning runs untouched for over {} (pass --all to ignore age)",
+            humantime::format_duration(d)
+        );
+    }
+    for id in &report.removed {
+        outln!("removed {id}");
+    }
+    outln!(
+        "{} removed, {} kept, {} reclaimed",
+        report.removed.len(),
+        report.kept.len(),
+        human_bytes(report.bytes)
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Bytes in the unit a human would read ("how much did that free").
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    // Whole bytes take no decimal ("512 B", "1.5 KiB").
+    format!("{value:.*} {}", usize::from(unit > 0), UNITS[unit])
+}
 
 /// Block until a run reaches an outcome, then exit with its disposition code.
 ///
-/// Also returns when the run *cannot* finish on its own — paused, or abandoned by
-/// its driver — rather than waiting forever for a process that is not coming
-/// back.
+/// Also returns when the run *cannot* finish on its own — interrupted by a pause,
+/// a Ctrl-C or a crash — rather than waiting forever for a process that is not
+/// coming back. `hex resume` continues it.
 fn cmd_wait(run_id: &str, json: bool) -> Result<ExitCode, String> {
+    use hex_runtime::Liveness;
     let runtime = open_runtime()?;
-    let mut abandoned_since: Option<std::time::Instant> = None;
+    let mut interrupted_since: Option<std::time::Instant> = None;
     loop {
         let summary = runtime.summary(run_id).map_err(|e| e.to_string())?;
-        let verdict = match summary.liveness {
-            hex_runtime::Liveness::Finished => Some((
-                disposition_label(summary.disposition, "failed"),
-                summary.disposition.map_or(ExitCode::from(1), exit_for),
-            )),
-            hex_runtime::Liveness::Paused => Some(("paused".to_owned(), ExitCode::from(PAUSED))),
-            hex_runtime::Liveness::Abandoned => {
-                let since = abandoned_since.get_or_insert_with(std::time::Instant::now);
+        let verdict = match &summary.state {
+            Liveness::Finished(d) => Some((disposition_label(Some(*d), "failed"), exit_for(*d))),
+            // Exit 6 (paused) covers a crash too: both continue with
+            // `hex resume`, so a second code would distinguish nothing.
+            Liveness::Interrupted => {
+                let since = interrupted_since.get_or_insert_with(std::time::Instant::now);
                 let waited = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
-                (waited >= WAIT_ABANDONED_GRACE_MS)
-                    .then(|| ("abandoned".to_owned(), ExitCode::from(1)))
+                (waited >= WAIT_INTERRUPTED_GRACE_MS)
+                    .then(|| ("interrupted".to_owned(), ExitCode::from(PAUSED)))
             }
-            hex_runtime::Liveness::Live | hex_runtime::Liveness::Hung => {
-                abandoned_since = None;
+            Liveness::Error(why) => Some((
+                format!("unreadable: {}", first_line(why)),
+                ExitCode::from(1),
+            )),
+            Liveness::Live => {
+                interrupted_since = None;
                 None
             }
         };
@@ -1321,13 +1389,13 @@ fn cmd_wait(run_id: &str, json: bool) -> Result<ExitCode, String> {
                     serde_json::json!({
                         "run_id": summary.run_id,
                         "state": state,
-                        "disposition": disposition_json(summary.disposition),
+                        "disposition": disposition_json(summary.state.disposition()),
                     })
                 );
             } else {
                 outln!("{state}");
-                if state == "abandoned" {
-                    eprintln!("nothing is driving `{run_id}` — continue it with `hex resume`");
+                if state == "interrupted" {
+                    eprintln!("`{run_id}` is not being driven — continue it with `hex resume`");
                 }
             }
             return Ok(code);
@@ -1592,79 +1660,33 @@ fn totals_json(t: &hex_runtime::Totals) -> serde_json::Value {
 /// the control inbox uses, for the same reason: there is no daemon to push.
 const FOLLOW_POLL: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// How long a follower waits for a just-reserved run's journal to appear.
+/// How long a follower tolerates a run whose journal has not appeared yet.
 ///
-/// `--detach` reserves the run directory a moment before the driver writes its
-/// first event, so `hex logs --follow "$(hex run … --detach)"` — the obvious thing
-/// to type — would otherwise fail instantly with "no journal yet". A follower's
-/// whole job is to wait.
-const JOURNAL_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// A run directory and its first event are written by the same process a few
+/// microseconds apart, so this only covers a run started in another shell an
+/// instant ago. A follower's whole job is to wait, but not for long: a run that
+/// has existed for seconds with no journal is a broken run, not a slow one.
+const JOURNAL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Block until `run_id` has a readable journal. Distinguishes "not started yet"
-/// from "does not exist" via `summary`, which succeeds for a reserved run and
-/// fails for a missing one — so a typo still fails fast.
+/// Block until `run_id` has a readable journal.
+///
+/// "Not started yet" and "does not exist" are told apart by the run *directory*:
+/// `summary` succeeds for a directory with no events and fails for a missing one,
+/// so a typo still fails fast.
 fn wait_for_journal(runtime: &Runtime, run_id: &str) -> Result<(), String> {
     let deadline = std::time::Instant::now() + JOURNAL_WAIT;
     loop {
-        let summary = runtime.summary(run_id).map_err(|e| e.to_string())?;
-        if summary.status.is_some() {
+        if runtime.events(run_id).is_ok() {
             return Ok(());
         }
+        // A missing run must not be retried: fail with the runtime's own message.
+        runtime.summary(run_id).map_err(|e| e.to_string())?;
         if std::time::Instant::now() >= deadline {
-            return Err(summary.error.unwrap_or_else(|| {
-                format!("run `{run_id}` still has no journal after {JOURNAL_WAIT:?}")
-            }));
+            return Err(format!(
+                "run `{run_id}` still has no journal after {JOURNAL_WAIT:?}"
+            ));
         }
         std::thread::sleep(FOLLOW_POLL);
-    }
-}
-
-fn cmd_watch(run_id: &str, follow: bool, json: bool) -> Result<ExitCode, String> {
-    let runtime = open_runtime()?;
-    if follow {
-        wait_for_journal(&runtime, run_id)?;
-    }
-    let print_from = |events: &[hex_runtime::Event], from: usize| -> Result<(), String> {
-        for event in &events[from..] {
-            if json {
-                outln!(
-                    "{}",
-                    serde_json::to_string(event).map_err(|e| e.to_string())?
-                );
-            } else {
-                outln!("{}", event_line(event));
-            }
-        }
-        Ok(())
-    };
-    let events = runtime.events(run_id).map_err(|e| e.to_string())?;
-    print_from(&events, 0)?;
-    if !follow {
-        return Ok(ExitCode::SUCCESS);
-    }
-    // Poll by event count. The journal is append-only, so "how many have I already
-    // printed" is the whole cursor — no offsets to keep and nothing to miss.
-    let mut printed = events.len();
-    loop {
-        if let Ok(summary) = runtime.summary(run_id)
-            && summary
-                .status
-                .as_ref()
-                .is_some_and(hex_runtime::Status::is_finished)
-        {
-            // Drain whatever the terminal write added before stopping.
-            if let Ok(events) = runtime.events(run_id) {
-                print_from(&events, printed.min(events.len()))?;
-            }
-            return Ok(ExitCode::SUCCESS);
-        }
-        std::thread::sleep(FOLLOW_POLL);
-        if let Ok(events) = runtime.events(run_id)
-            && events.len() > printed
-        {
-            print_from(&events, printed)?;
-            printed = events.len();
-        }
     }
 }
 
@@ -1969,32 +1991,6 @@ fn cmd_cancel(run_id: &str, json: bool) -> Result<ExitCode, String> {
     } else {
         outln!("cancelled {run_id}");
     }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Worker-side control (transport 1): append a routing event to `$HEX_EMIT_FILE`
-/// after checking it is allowed by `$HEX_MAY_PROPOSE`. Agents call this.
-fn cmd_emit(event: &str) -> Result<ExitCode, String> {
-    let file = std::env::var("HEX_EMIT_FILE")
-        .map_err(|_| "hex emit must be run inside a hex attempt (HEX_EMIT_FILE unset)")?;
-    let allowed = std::env::var("HEX_MAY_PROPOSE").unwrap_or_default();
-    let permitted: Vec<&str> = allowed
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !permitted.contains(&event) {
-        return Err(format!(
-            "event `{event}` is not in this node's may_propose ({allowed})"
-        ));
-    }
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&file)
-        .map_err(|e| format!("cannot open emit file: {e}"))?;
-    writeln!(f, "{event}").map_err(|e| e.to_string())?;
     Ok(ExitCode::SUCCESS)
 }
 

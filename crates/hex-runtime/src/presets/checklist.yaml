@@ -26,9 +26,8 @@ defaults:
   role: implementer
   context: fresh
   budget:
-    # Each item costs at least two attempts (implement + review); this allows
-    # roughly 8-10 items with a few fix rounds. Raise it for longer lists.
-    attempts: 30
+    # A wall-clock backstop for the whole run; the loops themselves are bounded
+    # by the per-node visit bounds below (and by the 5-visit default).
     elapsed: 90m
 
 entry: implement
@@ -57,15 +56,21 @@ nodes:
 
         Follow this protocol exactly, first match wins:
         1. If the per-item reviewer's message above requests changes, fix the
-           item you just implemented, then run:  hex emit item_done
+           item you just implemented; your verdict is `item_done`.
         2. If the holistic reviewer's verdict above requests changes that no
            checklist item covers yet, append each such point to the checklist
            file as a new `- [ ]` item, then continue with step 3.
         3. If the checklist has an unchecked item: take the FIRST one, implement
            only that item — the smallest change that satisfies it — mark it
-           `[x]` in the checklist file, then run:  hex emit item_done
-        4. Every item is checked: run:  hex emit all_done
+           `[x]` in the checklist file; your verdict is `item_done`.
+        4. Every item is checked: your verdict is `all_done`.
+
+
       may_propose: [item_done, all_done]
+    # One visit per round, and deliberately looser than `review`'s bound so the
+    # reviewer stays the knob that stops a long checklist.
+    budget:
+      visits: 12
     on:
       item_done: review
       all_done: final_review
@@ -86,17 +91,17 @@ nodes:
 
         Run `git diff` (and `git status`) to see the change, and read the
         checklist file to see which item was just checked. Judge only that
-        item's change — review only, do not edit files. If it is acceptable,
-        run:
-          hex emit approved
-        Otherwise put concrete, actionable feedback in your final message (it
-        is handed back to the implementer) and run:
-          hex emit changes_requested
+        item's change — review only, do not edit files. If it is acceptable say
+        so in your verdict; otherwise put concrete, actionable feedback in your
+        final message (it is handed back to the implementer).
       may_propose: [approved, changes_requested]
     # Bounds the per-item cycle: one visit per item plus fix rounds. This is
-    # the knob to raise for a long checklist, together with budget.attempts.
+    # the knob to raise for a long checklist; raise `implement`'s bound with it
+    # once past 12.
     budget:
-      visits: 20
+      # Tight enough that a review that keeps re-flagging the same points ends
+      # the run instead of looping on it.
+      visits: 6
     on:
       approved: implement
       changes_requested: implement
@@ -117,11 +122,10 @@ nodes:
         Read the checklist file, then run `git diff` (and `git status`) over
         the full change. Judge coherence across items, completeness against the
         checklist, and overall quality — review only, do not edit files. If the
-        complete change is acceptable, run:
-          hex emit approved
-        Otherwise put concrete, actionable feedback in your final message (the
-        implementer turns it into new checklist items) and run:
-          hex emit changes_requested
+        complete change is acceptable say so in your verdict; otherwise put
+        concrete, actionable feedback in your final message (the implementer
+        turns it into new checklist items). End with the verdict line hex asks
+        for.
       may_propose: [approved, changes_requested]
     budget:
       visits: 3

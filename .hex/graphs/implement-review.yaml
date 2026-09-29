@@ -1,20 +1,20 @@
 version: 1
 name: implement-review
 description: "Implement a task, prove it green, then have a different model review it — loop until approved"
-example: "add --format mermaid|dot to hex graph"
+example: "add --older-than to hex prune"
 
 # hex implementing its own features. The shape the README calls the flagship,
 # with hex's real gate wired in: nothing reaches the reviewer until fmt, clippy
 # and the whole test suite pass, so a review is never spent on a broken tree.
 #
-# Bounded on generation tokens as well as attempts: a review of this repo reads
+# Bounded on generation tokens as well as time: a review of this repo reads
 # ~5M tokens of context to produce ~20k, so an attempt bound in *total* tokens
-# would be tuned to context size rather than to work done.
+# would be tuned to context size rather than to work done. The implement/review
+# loops are bounded by their per-node visit counts.
 
 defaults:
   role: implementer
   budget:
-    attempts: 10
     elapsed: 90m
     attempt: 25m
     output_tokens: 200000
@@ -35,8 +35,7 @@ nodes:
         {{review.result}}
 
         When the change compiles, is formatted, passes clippy with zero
-        warnings and passes the whole test suite, finish. Do not run
-        `hex emit`; finishing cleanly is the signal.
+        warnings and passes the whole test suite, finish.
     on:
       done: verify
 
@@ -61,11 +60,9 @@ nodes:
         is wrong, output that does not match the specification in the task, and
         violations of the invariants in AGENTS.md. Review only; do not edit.
 
-        If the change is correct and complete, run:
-          hex emit approved
-        Otherwise put concrete findings in your final message, most serious
-        first, each naming file:line and a failure scenario. Then run:
-          hex emit changes_requested
+        If the change is correct and complete say so in your verdict;
+        otherwise put concrete findings in your final message, most serious
+        first, each naming file:line and a failure scenario.
       may_propose: [approved, changes_requested]
     budget:
       visits: 3

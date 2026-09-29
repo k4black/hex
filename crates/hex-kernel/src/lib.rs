@@ -135,8 +135,8 @@ pub struct SessionHandle {
 /// What a run spent, split the two ways an operator asks about it: *which node
 /// cost me this* and *which model cost me this*.
 ///
-/// Folded from `AttemptReported` by [`reduce`], so every client — the CLI, and
-/// the dashboard later — reads one set of numbers computed one way.
+/// Folded from `AttemptReported` by [`reduce`], so every client reads one set
+/// of numbers computed one way.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Usage {
     /// Per-node totals, keyed by node id.
@@ -308,7 +308,7 @@ pub enum Effect {
     },
     /// Suspend and request a human decision or input. The runtime journals the
     /// question and then blocks on a `respond` command from the control inbox —
-    /// the same transport whether the run is foreground or detached.
+    /// the same transport however the run was started.
     RequestHuman {
         /// Node requesting the human.
         node_id: String,
@@ -585,8 +585,8 @@ pub fn schedule(graph: &Graph, state: &RunState, now_ms: u64) -> Vec<Effect> {
             && let Acceptance::Missing(missing) = accept(graph, state)
         {
             // Prefer going and producing the missing evidence over dead-ending.
-            // The transition comes from `Graph::implicit_reroute_from` so the
-            // edge taken here is the same one cycle validation sees (core rule 5).
+            // The transition comes from `Graph::implicit_reroute_from`, the one
+            // definition of the implicit success-terminal edge (core rule 5).
             if let Some(to) = graph.implicit_reroute_from(&cur) {
                 return vec![Effect::RerouteUnmet {
                     to: to.to_owned(),
@@ -607,30 +607,13 @@ pub fn schedule(graph: &Graph, state: &RunState, now_ms: u64) -> Vec<Effect> {
     }
 
     // Budgets are checked before spending an attempt, and fail closed.
-    if let Some(max) = graph.budget.attempts
-        && state.attempts_total >= max
-    {
-        return vec![terminal_because(
-            Disposition::BudgetExhausted,
-            format!("attempt budget spent ({max} attempts)"),
-        )];
-    }
     let visits = state.visits.get(&cur).copied().unwrap_or(0);
-    // A per-node bound and the run-wide blanket bound; whichever is tighter.
     if let Some(maxv) = node.max_visits
         && visits > maxv
     {
         return vec![terminal_because(
             Disposition::BudgetExhausted,
-            format!("node `{cur}` exceeded its own visit bound ({maxv} visits)"),
-        )];
-    }
-    if let Some(maxv) = graph.budget.cycle_visits
-        && visits > maxv
-    {
-        return vec![terminal_because(
-            Disposition::BudgetExhausted,
-            format!("node `{cur}` exceeded the run visit bound ({maxv} visits)"),
+            format!("node `{cur}` exceeded its visit bound ({maxv} visits)"),
         )];
     }
     if let Some(maxt) = graph.budget.output_tokens
@@ -732,13 +715,8 @@ mod tests {
             .edge("implement", "ready", "test")
             .edge("test", "passed", "done")
             .edge("test", "failed", "implement")
-            .budget(Budget {
-                attempts: Some(8),
-                elapsed_ms: None,
-                attempt_elapsed_ms: None,
-                cycle_visits: None,
-                output_tokens: None,
-            })
+            .max_visits("implement", 8)
+            .max_visits("test", 8)
             .require("test", "passed")
             .build()
     }
@@ -1166,15 +1144,15 @@ mod tests {
     }
 
     #[test]
-    fn attempts_budget_exhaustion_fails_closed() {
+    fn node_visit_bound_exhaustion_fails_closed() {
         let g = loop_graph();
         let mut s = drive_to(&g, &[EventBody::RunStarted]);
-        s.attempts_total = 8; // at the limit
+        s.visits.insert("implement".to_owned(), 9); // past the bound of 8
         assert_eq!(
             schedule(&g, &s, 0),
             vec![Effect::RecordTerminal {
                 disposition: Disposition::BudgetExhausted,
-                why: Some("attempt budget spent (8 attempts)".to_owned()),
+                why: Some("node `implement` exceeded its visit bound (8 visits)".to_owned()),
             }]
         );
     }
@@ -1249,12 +1227,14 @@ mod tests {
 
     #[test]
     fn exact_budget_success_is_not_flipped() {
-        // At the attempts limit, a success terminal must still succeed — a
-        // reached outcome does not spend an attempt.
-        let g = loop_graph();
+        // At the visit limit, a success terminal must still succeed — a
+        // reached outcome does not spend an attempt, and `schedule` settles a
+        // terminal before any budget check.
+        let mut g = loop_graph();
+        g.nodes.get_mut("done").expect("done").max_visits = Some(8);
         let mut s = drive_to(&g, &[EventBody::RunStarted]);
         s.current = Some("done".to_owned());
-        s.attempts_total = 8; // exactly at budget
+        s.visits.insert("done".to_owned(), 8); // at the bound
         s.signals.insert("test".to_owned(), "passed".to_owned());
         assert_eq!(
             schedule(&g, &s, 0),
@@ -1623,10 +1603,6 @@ mod tests {
             .edge("implement", "ready", "test")
             .edge("test", "passed", "done")
             .edge("test", "failed", "implement")
-            .budget(Budget {
-                attempts: Some(8),
-                ..Budget::default()
-            })
             .require("test", "passed")
             .on_unmet("implement")
             .build();

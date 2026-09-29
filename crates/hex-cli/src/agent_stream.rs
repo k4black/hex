@@ -170,10 +170,10 @@ mod tests {
     fn a_tool_call_shows_its_target_not_its_payload() {
         let line = r#"{"type":"assistant","message":{"content":[
             {"type":"tool_use","name":"Write","input":{
-                "file_path":"crates/hex-cli/src/graph_export.rs",
+                "file_path":"crates/hex-cli/src/graph_view.rs",
                 "content":"a thousand lines of file content"}}]}}"#;
         let out = humanize(line).expect("a tool line");
-        assert_eq!(out, "· Write crates/hex-cli/src/graph_export.rs");
+        assert_eq!(out, "· Write crates/hex-cli/src/graph_view.rs");
         assert!(!out.contains("thousand"), "the payload stays out: {out}");
     }
 

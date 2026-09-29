@@ -33,25 +33,24 @@ pub struct WorkRequest {
     pub node_id: String,
     /// This attempt's id.
     pub attempt_id: String,
-    /// The node prompt (with the operator prompt already interpolated).
+    /// The node prompt (with the operator prompt already interpolated, and the
+    /// generated verdict instruction appended when the node has one).
     pub prompt: String,
-    /// Routing events the agent is allowed to emit (its `may_propose` list).
-    pub may_propose: Vec<String>,
     /// Directory the agent operates in (the run's workspace).
     pub workdir: PathBuf,
-    /// Per-attempt scratch directory for stdout/stderr and the emit file.
+    /// Per-attempt scratch directory for stdout/stderr and the result file.
     pub attempt_dir: PathBuf,
     /// Wall-clock deadline for this attempt in milliseconds; the child is
     /// killed if it runs longer. `None` means no per-attempt time bound.
     pub deadline_ms: Option<u64>,
     /// Whether this node should not modify the workspace (e.g. a reviewer).
     /// Advisory only: a hard read-only sandbox would also block the agent from
-    /// writing `HEX_EMIT_FILE`/`HEX_RESULT_FILE`, so workers do not enforce it —
-    /// read-only intent is conveyed through the node's prompt. See `agent.rs`.
+    /// writing `HEX_RESULT_FILE`, so workers do not enforce it — read-only
+    /// intent is conveyed through the node's prompt. See `agent.rs`.
     pub read_only: bool,
     /// An extra directory *outside* the workspace the worker must keep writable —
-    /// where the control files (`HEX_EMIT_FILE`/`HEX_RESULT_FILE`) live when they
-    /// sit outside the run's cwd. `None` when they're already under the workspace.
+    /// where the result file (`HEX_RESULT_FILE`) lives when it sits outside the
+    /// run's cwd. `None` when it is already under the workspace.
     /// Only path-sandboxed workers (codex) act on it. This is a stopgap for the
     /// absent non-workspace control transport (a socket/MCP hook would retire it).
     pub extra_writable_dir: Option<PathBuf>,
@@ -118,18 +117,17 @@ impl AttemptReport {
     }
 }
 
-/// What a worker reports after one attempt. On success `signal` is the routing
-/// event (or `None` for implicit completion — a clean finish with no emit); on
-/// failure `error` is set. `result` is the captured final message (independent
-/// of routing), fed to a downstream node as `{{node.result}}`.
+/// What a worker reports after one attempt. Deliberately **no** routing signal
+/// here: `result` carries the final message *uncapped*, and the runtime — which
+/// alone knows the node's allowed outcomes — reads the `VERDICT: <signal>` line
+/// out of it and caps it for `{{node.result}}`. Uncapped, or a long review
+/// would lose its trailing verdict line. On failure `error` is set.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkOutcome {
-    /// The routing event the agent emitted (∈ `may_propose`), or `None` when the
-    /// agent finished cleanly without emitting (the runtime synthesizes `done`).
-    pub signal: Option<String>,
-    /// The captured final message text, if the worker declares result capture.
+    /// The captured final message text, **uncapped** — the runtime caps it when
+    /// it journals `NodeResult`, after reading the verdict out of it.
     pub result: Option<String>,
-    /// Execution failure reason (the agent crashed or emitted something invalid).
+    /// Execution failure reason (the agent crashed, exited nonzero, or timed out).
     pub error: Option<String>,
     /// Whether the failure was specifically a per-attempt timeout, so the
     /// runtime can record the `TimedOut` disposition rather than plain `Failed`.
@@ -145,11 +143,12 @@ pub struct WorkOutcome {
 }
 
 impl WorkOutcome {
-    /// A successful outcome carrying a routing signal.
+    /// A successful outcome whose final message ends `VERDICT: <signal>`, so the
+    /// mock and tests exercise the runtime's real parse path.
     #[must_use]
-    pub fn signal(name: impl Into<String>) -> Self {
+    pub fn verdict(signal: &str) -> Self {
         Self {
-            signal: Some(name.into()),
+            result: Some(format!("(mock worker)\n{VERDICT_PREFIX} {signal}")),
             ..Self::default()
         }
     }
@@ -211,10 +210,32 @@ pub trait Worker {
         None
     }
 
+    /// An argv that checks this worker's *credentials* without buying a
+    /// completion (`codex login status`, `claude auth status`, …). `hex doctor`
+    /// runs it: success is exit 0 with no `not_ready` in the output. `None` for
+    /// a worker with nothing to authenticate.
+    fn auth_probe(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Whether this worker can produce a final-message `result` at all. A node
+    /// with more than one outcome routes on a verdict read out of that message,
+    /// so the runtime refuses such a node bound to a worker that captures
+    /// nothing — see `check_workers`. The kernel cannot make this check, because
+    /// only the runtime may see a worker.
+    fn captures_result(&self) -> bool {
+        false
+    }
+
     /// Run one attempt to completion and report the outcome. Effectful (this
     /// is the adapter layer); the runtime journals around it.
     fn run(&self, request: &WorkRequest) -> WorkOutcome;
 }
+
+/// Prefix of the line that carries a node's routing verdict, e.g.
+/// `VERDICT: approved`. The runtime generates the instruction that asks for it
+/// and parses it back; a node's graph never spells it.
+pub const VERDICT_PREFIX: &str = "VERDICT:";
 
 /// The set of [`Capability`] entries one worker advertises. The graph
 /// validator rejects a graph whose nodes demand capabilities the assigned

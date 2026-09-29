@@ -12,10 +12,10 @@ use std::time::Instant;
 use std::collections::BTreeMap;
 
 use hex_kernel::graph::{CommandMode, CommandStep, Context, NodeKind, NodeSpec};
-use hex_kernel::validate::DONE_SIGNAL;
+use hex_kernel::validate::{DONE_SIGNAL, UNKNOWN_SIGNAL};
 use hex_kernel::{Effect, Graph, RunState, SessionHandle, Status, reduce, schedule};
 use hex_proto::{Actor, Command, Disposition, EventBody};
-use hex_worker::{WorkOutcome, WorkRequest};
+use hex_worker::{VERDICT_PREFIX, WorkOutcome, WorkRequest};
 
 use crate::control::{Heartbeat, Inbox};
 use crate::error::{HexError, Result};
@@ -40,8 +40,6 @@ pub struct AttemptView {
     pub worker: Option<String>,
     /// This attempt's ordinal within the run (1-based, all nodes counted).
     pub attempt_number: u32,
-    /// The run's attempts budget, if one is declared.
-    pub attempts_budget: Option<u32>,
     /// Remaining time budget at the start of this attempt, if any.
     pub deadline_ms: Option<u64>,
     /// Wall-clock start (Unix epoch ms), for a live elapsed timer.
@@ -115,8 +113,8 @@ impl Drop for FinishGuard<'_> {
 pub struct WorktreeCtx {
     /// The run's branch, `hex/<run-id>`.
     pub branch: String,
-    /// The base ref the worktree was cut from (`HEAD` or a branch name).
-    pub base_ref: String,
+    /// The resolved base commit the branch was cut from (a sha — see `Slot`).
+    pub base_sha: String,
 }
 
 /// One run's mutable execution context: the graph, its workers, the journal,
@@ -134,6 +132,13 @@ pub struct Session<'a> {
     prompt: Option<String>,
     /// Present when the run is isolated in a git worktree.
     worktree: Option<WorktreeCtx>,
+    /// The last failing output signature each gate produced. Two identical
+    /// signatures mean the loop cannot change its own evidence, so routing it
+    /// back only spends tokens — see `run_command`.
+    ///
+    /// ponytail: in-memory, so a `hex resume` resets it. Back it with the journal
+    /// only if a resumed run is ever seen wedging on the same gate again.
+    gate_sigs: BTreeMap<String, String>,
     sink: Option<&'a dyn ProgressSink>,
 }
 
@@ -164,6 +169,7 @@ impl<'a> Session<'a> {
             state,
             prompt,
             worktree,
+            gate_sigs: BTreeMap::new(),
             sink,
         }
     }
@@ -430,8 +436,9 @@ impl<'a> Session<'a> {
     /// inbox until an operator answers (`hex respond`), the attempt's time budget
     /// runs out, or a cancel/pause arrives.
     ///
-    /// The inbox is the *only* human transport, so this behaves identically for a
-    /// foreground and a detached run, and for a human and an agent operator.
+    /// The inbox is the *only* human transport, so this behaves identically
+    /// whether the driving process is in the foreground or was started by a
+    /// background shell, and for a human and an agent operator.
     fn request_human(&mut self, node_id: &str) -> Result<()> {
         let Some(node) = self.graph.node(node_id) else {
             return self.halt(node_id, "unknown node", Disposition::Failed);
@@ -566,15 +573,20 @@ impl<'a> Session<'a> {
         // AttemptStarted event below clears the queue, so guidance lands on
         // exactly one attempt.
         resolved_prompt.push_str(&steer_banner(&self.state.pending_steer));
-        // Under worktree isolation, tell the agent it's on a throwaway branch and
-        // ask it to commit its own work (hex never commits) — committing both
-        // preserves the work and frees the slot for warm reuse. A read_only
-        // reviewer shouldn't commit, so it gets no banner.
-        if let Some(wt) = &self.worktree
-            && !read_only
-        {
-            resolved_prompt.push_str(&worktree_banner(&wt.branch, &wt.base_ref));
+        // One role banner per node. A read-only node whose prompt already runs
+        // `git diff` gets the review scope (the diff base is a runtime fact,
+        // never authored) — the prompt test keeps it off read-only nodes that
+        // are not reviewing anything (planner, researcher). A writing node under
+        // worktree isolation is asked to commit its own work (hex never commits).
+        if read_only {
+            if resolved_prompt.contains("git diff") {
+                resolved_prompt.push_str(&review_scope_banner(self.worktree.as_ref()));
+            }
+        } else if let Some(wt) = &self.worktree {
+            resolved_prompt.push_str(&worktree_banner(&wt.branch, &wt.base_sha));
         }
+        // Generated, never authored — see `verdict_instruction`.
+        resolved_prompt.push_str(&verdict_instruction(may_propose));
 
         // intent-before-effect: the attempt is on the record before it runs.
         self.record(
@@ -621,7 +633,6 @@ impl<'a> Session<'a> {
             node_id: node_id.to_owned(),
             attempt_id: attempt_id.to_owned(),
             prompt: resolved_prompt,
-            may_propose: may_propose.clone(),
             workdir: self.workdir.clone(),
             attempt_dir,
             deadline_ms,
@@ -643,13 +654,22 @@ impl<'a> Session<'a> {
             worktree_branch: self.worktree.as_ref().map(|w| w.branch.clone()),
         };
         let WorkOutcome {
-            signal,
             result,
             error,
             timed_out,
             interrupted,
             report,
         } = adapter.run(&request);
+
+        // Facts this attempt's *silence* must be judged against, captured before
+        // `report` and `result` are consumed below.
+        let reported_usage = report
+            .as_ref()
+            .is_some_and(|r| !r.models.is_empty() || r.cost_micro_usd.is_some());
+        let claims_cost = adapter
+            .capabilities()
+            .supports(hex_proto::Capability::CostReporting);
+        let had_text = result.as_deref().is_some_and(|t| !t.trim().is_empty());
 
         // What the agent spent goes down first, because everything after this can
         // end the attempt: a report written after the routing signal would no
@@ -671,14 +691,23 @@ impl<'a> Session<'a> {
             )?;
         }
 
+        // Read the routing verdict out of the **uncapped** final message, before
+        // the cap below runs: the `VERDICT:` line is the message's last line and
+        // the cap keeps the head, so a long review would otherwise lose exactly
+        // the line the routing depends on.
+        let verdict = verdict_of(result.as_deref());
+
         // Record the captured result next (correlated to the in-flight attempt),
-        // so it's in the projection before the routing signal fires.
+        // so it's in the projection before the routing signal fires. Capped here
+        // rather than in the worker because only the runtime reads the raw text.
         if let Some(text) = result {
             self.record(
                 Some(node_id),
                 Some(attempt_id),
                 Actor::agent(worker_name.clone()),
-                EventBody::NodeResult { text },
+                EventBody::NodeResult {
+                    text: cap_result(text),
+                },
             )?;
         }
 
@@ -690,48 +719,100 @@ impl<'a> Session<'a> {
             return self.interrupt_attempt(node_id, attempt_id);
         }
 
-        match signal {
-            Some(signal) if may_propose.contains(&signal) => self.record(
+        // A worker that claims to report usage, exited cleanly with a final
+        // message, and reported nothing means its output shape changed under us:
+        // the parser is silently returning zero tokens, so `budget.output_tokens`
+        // would fail open with no trace. Say so once per such attempt instead.
+        if claims_cost && !reported_usage && had_text && error.is_none() {
+            self.record(
                 Some(node_id),
                 Some(attempt_id),
-                Actor::agent(worker_name),
-                EventBody::Signal { name: signal },
-            ),
-            Some(signal) => self.fail_attempt(
-                node_id,
-                attempt_id,
-                &format!("emitted disallowed `{signal}`"),
-                Disposition::Failed,
-            ),
-            // Implicit completion: a clean finish with no emit routes the
-            // synthesized `done` — but only if the node actually handles it.
-            None if error.is_none() => {
-                if self.graph.route(node_id, DONE_SIGNAL).is_some() {
-                    self.record(
-                        Some(node_id),
-                        Some(attempt_id),
-                        Actor::agent(worker_name),
-                        EventBody::Signal {
-                            name: DONE_SIGNAL.to_owned(),
-                        },
-                    )
-                } else {
-                    self.fail_attempt(
+                Actor::runtime(),
+                EventBody::Note {
+                    text: format!(
+                        "worker `{worker_name}` reported no token usage for an attempt that \
+                         produced output — its parser may be out of date, and \
+                         `budget.output_tokens` will not count this attempt"
+                    ),
+                },
+            )?;
+        }
+
+        // A failed attempt never routes: a timed-out or crashed agent's salvaged
+        // partial output must not be read as a verdict about work it never
+        // finished. Only a clean exit is asked what it concluded.
+        let Some(error) = error else {
+            return self.route_verdict(node_id, attempt_id, worker_name, verdict, may_propose);
+        };
+        let disposition = if timed_out {
+            Disposition::TimedOut
+        } else {
+            Disposition::Failed
+        };
+        self.fail_attempt(node_id, attempt_id, &error, disposition)
+    }
+
+    /// Journal a routing signal for an attempt.
+    fn signal(&mut self, node_id: &str, attempt_id: &str, actor: Actor, name: &str) -> Result<()> {
+        self.record(
+            Some(node_id),
+            Some(attempt_id),
+            actor,
+            EventBody::Signal {
+                name: name.to_owned(),
+            },
+        )
+    }
+
+    /// Route a clean finish by its verdict.
+    fn route_verdict(
+        &mut self,
+        node_id: &str,
+        attempt_id: &str,
+        worker_name: String,
+        verdict: Option<String>,
+        may_propose: &[String],
+    ) -> Result<()> {
+        // A node with no declared outcomes completes implicitly; whatever the
+        // message says is a result, never a verdict.
+        if may_propose.is_empty() {
+            return if self.graph.route(node_id, DONE_SIGNAL).is_some() {
+                self.signal(node_id, attempt_id, Actor::agent(worker_name), DONE_SIGNAL)
+            } else {
+                self.fail_attempt(
+                    node_id,
+                    attempt_id,
+                    "agent finished and the node has no `done` edge",
+                    Disposition::Failed,
+                )
+            };
+        }
+        match verdict {
+            // A declared verdict routes on it.
+            Some(signal) if may_propose.contains(&signal) => {
+                self.signal(node_id, attempt_id, Actor::agent(worker_name), &signal)
+            }
+            // No marker, or a marker the node never declared — both are the
+            // reserved `unknown`: route its declared edge, else fail closed
+            // naming the outcomes the node was asked for.
+            other => {
+                if self.graph.route(node_id, UNKNOWN_SIGNAL).is_some() {
+                    return self.signal(
                         node_id,
                         attempt_id,
-                        "agent emitted no signal and the node has no `done` edge",
-                        Disposition::Failed,
-                    )
+                        Actor::agent(worker_name),
+                        UNKNOWN_SIGNAL,
+                    );
                 }
-            }
-            None => {
-                let reason = error.unwrap_or_else(|| "no signal".to_owned());
-                let disposition = if timed_out {
-                    Disposition::TimedOut
-                } else {
-                    Disposition::Failed
+                let expected = may_propose.join(" | ");
+                let why = match other {
+                    Some(signal) => format!(
+                        "agent reported `{signal}`, which is not among this node's outcomes \
+                         (expected: {expected})"
+                    ),
+                    None => format!("no verdict in the final message (expected: {expected})"),
                 };
-                self.fail_attempt(node_id, attempt_id, &reason, disposition)
+                self.fail_attempt(node_id, attempt_id, &why, Disposition::Failed)
             }
         }
     }
@@ -783,37 +864,45 @@ impl<'a> Session<'a> {
         };
         match outcome {
             Ok(report) => {
+                if report.failed.is_empty() {
+                    // A pass clears the stall record for this gate.
+                    self.gate_sigs.remove(node_id);
+                    return self.signal(node_id, attempt_id, Actor::runtime(), "passed");
+                }
                 // Name the failing steps, so `failed` is actionable without
                 // digging through per-step logs.
-                if !report.failed.is_empty() {
-                    self.record(
-                        Some(node_id),
-                        Some(attempt_id),
-                        Actor::runtime(),
-                        EventBody::Note {
-                            text: format!(
-                                "{} of {} {} step(s) failed: {}",
-                                report.failed.len(),
-                                steps.len(),
-                                mode.as_str(),
-                                report.failed.join(", ")
-                            ),
-                        },
-                    )?;
-                }
-                let signal = if report.failed.is_empty() {
-                    "passed"
-                } else {
-                    "failed"
-                };
                 self.record(
                     Some(node_id),
                     Some(attempt_id),
                     Actor::runtime(),
-                    EventBody::Signal {
-                        name: signal.to_owned(),
+                    EventBody::Note {
+                        text: format!(
+                            "{} of {} {} step(s) failed: {}",
+                            report.failed.len(),
+                            steps.len(),
+                            mode.as_str(),
+                            report.failed.join(", ")
+                        ),
                     },
-                )
+                )?;
+                // Stall detection: identical failing output means the last round
+                // produced no new evidence, so routing `failed` back only spends
+                // tokens — the bound a pre-existing red check at the branch base
+                // (and a reviewer re-flagging a fixed point) both lacked.
+                let sig = failure_signature(&attempt_dir);
+                if !sig.is_empty() && self.gate_sigs.get(node_id).is_some_and(|prev| *prev == sig) {
+                    return self.fail_attempt(
+                        node_id,
+                        attempt_id,
+                        &format!(
+                            "gate `{node_id}` failed with identical output twice — it cannot \
+                             be fixed by re-running"
+                        ),
+                        Disposition::Failed,
+                    );
+                }
+                self.gate_sigs.insert(node_id.to_owned(), sig);
+                self.signal(node_id, attempt_id, Actor::runtime(), "failed")
             }
             Err(fail) if fail.interrupted => self.interrupt_attempt(node_id, attempt_id),
             Err(fail) => {
@@ -902,7 +991,6 @@ impl<'a> Session<'a> {
             attempt_id: attempt_id.to_owned(),
             worker,
             attempt_number: self.state.attempts_total,
-            attempts_budget: self.graph.budget.attempts,
             deadline_ms,
             started_at_ms: now_ms(),
             stdout_log: attempt_dir.join("stdout.log"),
@@ -978,6 +1066,35 @@ fn run_ordered(
         }
     }
     Ok(StepReport { failed: Vec::new() })
+}
+
+/// A content signature of a command attempt's captured step output.
+///
+/// Two identical signatures mean the loop reproduced exactly the same evidence.
+/// Output, not just the exit code: a test loop making real progress changes what
+/// the test prints, so `implement-until-green` keeps looping while it is getting
+/// somewhere and stops when it is not.
+fn failure_signature(attempt_dir: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let dirs = crate::step_dirs(attempt_dir);
+    if dirs.is_empty() {
+        return String::new(); // no step output, no evidence to compare
+    }
+    let mut hasher = Sha256::new();
+    for dir in dirs {
+        let name = dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        hasher.update(name.as_bytes());
+        for file in ["stdout.log", "stderr.log", "exit"] {
+            // Stream, not read: a gate's output (a full test run) is unbounded.
+            if let Ok(mut f) = std::fs::File::open(dir.join(file)) {
+                let _ = std::io::copy(&mut f, &mut hasher);
+            }
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// Run every step concurrently, then report all failures.
@@ -1128,13 +1245,30 @@ fn steer_banner(pending: &[String]) -> String {
 
 /// The instruction appended to an agent's prompt when the run is isolated in a
 /// git worktree — hex makes no commits itself, so the agent is asked to.
-fn worktree_banner(branch: &str, base_ref: &str) -> String {
+fn worktree_banner(branch: &str, base_sha: &str) -> String {
     format!(
         "\n\n[hex] You are working in an isolated git worktree on branch `{branch}` \
-         (cut from `{base_ref}`). Your changes will NOT be merged automatically. When \
+         (cut from `{base_sha}`). Your changes will NOT be merged automatically. When \
          your task is complete, commit your work in this worktree with a clear message, \
          and summarize what you changed in your final message."
     )
+}
+
+/// The review-scope line a read-only node gets. Under worktree isolation the
+/// implementer commits its work, so a bare `git diff` shows nothing — the base
+/// ref names what to diff against.
+fn review_scope_banner(worktree: Option<&WorktreeCtx>) -> String {
+    match worktree {
+        Some(wt) => format!(
+            "\n\n[hex] Review the change, not the repository: the work is committed on \
+             this branch. See it with `git diff {base}...HEAD` (plus `git status` for \
+             anything uncommitted).",
+            base = wt.base_sha
+        ),
+        None => "\n\n[hex] Review the change, not the repository: see it with `git diff` \
+                 (and `git status`)."
+            .to_owned(),
+    }
 }
 
 /// Render an author template over the shared kernel grammar
@@ -1199,6 +1333,69 @@ fn interpolate(
     out
 }
 
+/// Cap on the journaled result value: it feeds a downstream prompt, so a
+/// runaway output must not bloat it. Truncated with `…`.
+const MAX_RESULT_BYTES: usize = 16 * 1024;
+
+/// Truncate a captured result so the *final* value (including the `…` marker) is
+/// at most [`MAX_RESULT_BYTES`] bytes, cut at a char boundary. Applied only
+/// after [`verdict_of`] has read the uncapped message — the `VERDICT:` line is
+/// the last line and this cap keeps the head.
+fn cap_result(s: String) -> String {
+    if s.len() <= MAX_RESULT_BYTES {
+        return s;
+    }
+    let mut end = MAX_RESULT_BYTES - '…'.len_utf8();
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// The routing verdict an agent declared, read out of its final message.
+///
+/// `None` means the message carries no `VERDICT:` line. The **last** marker
+/// wins, because the generated instruction asks for a line at the end while a
+/// message may quote the word earlier. The prefix match is case-insensitive so
+/// `Verdict:` from a chatty agent still routes. An agent that literally reports
+/// `unknown` means the same as reporting nothing, so both take the unknown path.
+fn verdict_of(result: Option<&str>) -> Option<String> {
+    let text = result?;
+    let value = text.lines().rev().find_map(|line| {
+        // An agent that fences its verdict in backticks, bold or quotes still
+        // means it, so shed the decoration before looking for the marker.
+        let line = line.trim().trim_start_matches(['`', '*', '"', '\'']);
+        let rest = line
+            .get(..VERDICT_PREFIX.len())
+            .filter(|head| head.eq_ignore_ascii_case(VERDICT_PREFIX))
+            .map(|_| line[VERDICT_PREFIX.len()..].trim())?;
+        Some(rest.trim_matches(['`', '*', '"', '\'']).to_owned())
+    })?;
+    (!value.is_empty() && value != UNKNOWN_SIGNAL).then_some(value)
+}
+
+/// The verdict instruction appended to an agent node's prompt, generated from
+/// the node's own declared outcomes.
+///
+/// Generated rather than authored on purpose: a graph never spells out how to
+/// report, so no preset can forget it and it cannot drift from the edges the
+/// run will actually route on. A node with no declared outcomes completes
+/// implicitly and gets nothing appended.
+fn verdict_instruction(may_propose: &[String]) -> String {
+    if may_propose.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nWhen you have finished, end your final message with a line exactly like this:\n\
+         {prefix} {first}\n\
+         Use one of: {all}. That line is how hex routes the run — a final message \
+         without it, or with a value outside that list, cannot be routed.",
+        prefix = VERDICT_PREFIX,
+        first = may_propose[0],
+        all = may_propose.join(" | ")
+    )
+}
+
 /// SHA-256 of the graph source, hex-encoded — the exact-snapshot identity a run
 /// records so later edits to the source never change what already ran.
 #[must_use]
@@ -1238,7 +1435,10 @@ fn resumable_id(handle: Option<&SessionHandle>, program: Option<&str>) -> Option
 pub fn check_workers(graph: &Graph, workers: &Workers) -> Result<()> {
     for node in graph.nodes.values() {
         if let NodeSpec::Agent {
-            worker, context, ..
+            worker,
+            context,
+            may_propose,
+            ..
         } = &node.spec
         {
             let Some(adapter) = workers.get(worker) else {
@@ -1259,9 +1459,87 @@ pub fn check_workers(graph: &Graph, workers: &Workers) -> Result<()> {
                     node.id
                 )));
             }
+            // A node with declared outcomes routes on a verdict read out of the
+            // worker's captured final message. A worker that captures nothing
+            // could never produce one, so the node would fail every attempt —
+            // refuse it at compile time instead. The kernel cannot make this
+            // check: only the runtime may see a worker.
+            if !may_propose.is_empty() && !adapter.captures_result() {
+                return Err(HexError::new(format!(
+                    "node `{}` declares outcomes ({}), but worker `{worker}` captures no final \
+                     message, so its verdict could never be read — give the worker a `result:` \
+                     capture mode, or make the node single-outcome",
+                    node.id,
+                    may_propose.join(" | ")
+                )));
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::{MAX_RESULT_BYTES, cap_result, verdict_instruction, verdict_of};
+
+    /// The outcomes of a node that declares two.
+    fn outcomes() -> Vec<String> {
+        vec!["approved".to_owned(), "changes_requested".to_owned()]
+    }
+
+    /// One assertion shape: message text in, parsed verdict out. The last
+    /// marker wins; decoration and case are shed; the literal `unknown` means
+    /// what writing nothing means — take the unknown path.
+    #[test]
+    fn verdict_parsing_cases() {
+        for (text, want) in [
+            (
+                "I first thought VERDICT: changes_requested\nbut on reflection\nVERDICT: approved",
+                Some("approved"),
+            ),
+            ("`VERDICT: approved`", Some("approved")),
+            ("Verdict: approved", Some("approved")),
+            ("**VERDICT: approved**", Some("approved")),
+            ("I reviewed it and it looks fine", None),
+            ("VERDICT: unknown", None),
+        ] {
+            assert_eq!(verdict_of(Some(text)).as_deref(), want, "{text}");
+        }
+        assert_eq!(verdict_of(None), None);
+    }
+
+    /// A2. The marker is the *last* line and a real review easily exceeds the
+    /// 16 KiB result cap, which keeps the head — so the verdict is read from the
+    /// uncapped message. Without this a compliant long review would be recorded
+    /// as `unknown` and fail the attempt.
+    #[test]
+    fn a_verdict_after_a_very_long_message_is_still_found() {
+        let mut text = "x".repeat(64 * 1024);
+        text.push_str("\nVERDICT: approved");
+        assert_eq!(verdict_of(Some(&text)).as_deref(), Some("approved"));
+    }
+
+    #[test]
+    fn the_instruction_lists_the_actual_outcomes() {
+        let text = verdict_instruction(&outcomes());
+        assert!(text.contains("VERDICT: approved"), "{text}");
+        assert!(text.contains("approved | changes_requested"), "{text}");
+    }
+
+    #[test]
+    fn a_single_outcome_node_gets_no_instruction() {
+        assert!(verdict_instruction(&[]).is_empty());
+    }
+
+    #[test]
+    fn cap_result_bounds_the_final_value_including_the_marker() {
+        let capped = cap_result("x".repeat(MAX_RESULT_BYTES * 2));
+        assert!(capped.len() <= MAX_RESULT_BYTES, "len {}", capped.len());
+        assert!(capped.ends_with('…'));
+        // A multibyte char straddling the cut must not panic or corrupt.
+        let capped = cap_result("é".repeat(MAX_RESULT_BYTES));
+        assert!(capped.len() <= MAX_RESULT_BYTES);
+    }
 }
 
 #[cfg(test)]
@@ -1371,13 +1649,30 @@ mod check_workers_tests {
         );
     }
 
-    /// The default policy asks nothing of the worker.
+    /// The default policy asks nothing of the worker's capabilities — but the
+    /// node still needs a verdict from it, so a non-capturing worker is refused.
     #[test]
-    fn fresh_is_accepted_on_any_worker() {
+    fn a_multi_outcome_node_refuses_a_non_capturing_worker() {
+        let err = check_workers(
+            &graph(Context::Fresh),
+            &registry(Box::new(CommandWorker::new("w", vec!["true".to_owned()]))),
+        )
+        .expect_err("a node with declared outcomes needs a captured verdict");
+        assert!(
+            err.to_string().contains("captures no final message"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_multi_outcome_node_accepts_a_capturing_worker() {
         assert!(
             check_workers(
                 &graph(Context::Fresh),
-                &registry(Box::new(CommandWorker::new("w", vec!["true".to_owned()])))
+                &registry(Box::new(
+                    CommandWorker::new("w", vec!["true".to_owned()])
+                        .with_result_capture(Some(hex_worker::ResultCapture::Text))
+                ))
             )
             .is_ok()
         );

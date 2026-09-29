@@ -22,7 +22,7 @@ const ASK_GRAPH: &str = r#"
 version: 1
 name: ask
 entry: plan
-defaults: { budget: { attempts: 4, attempt: 60s } }
+defaults: { budget: { attempt: 60s } }
 nodes:
   plan:
     agent: { worker: fast, prompt: "plan" }

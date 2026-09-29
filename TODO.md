@@ -11,7 +11,9 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
       projections + reduce/schedule/accept) / `hex-worker` (adapter) /
       `hex-runtime` (owns the drive loop) / thin clients (cli, mcp,
       dashboard) over the runtime (via a `RuntimeClient` trait until
-      2026-08-01, now over `Runtime` itself).
+      2026-08-01, now over `Runtime` itself). (Amended 2026-09-13: the
+      `hex-mcp`/`hex-dashboard` stubs were deleted; the cli is the one client
+      until a second one is actually built.)
 - [x] Definition syntax: **standard YAML**, single file, inline prompts,
       kind-as-key + co-located `on:` edges, `defaults:`/`templates:`/`extends:`,
       run-level `gates:` + `accept.require`. No custom mini-grammar.
@@ -25,11 +27,18 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
       there is something to derive it from.)
 - [x] Worker→runtime channel: one `Command` protocol, two transports —
       injected `hex emit` CLI (floor) + MCP tool hooks (`finish_session()`).
+      **Superseded 2026-09-13 (simplification):** the `hex emit` transport is
+      deleted; an agent node's routing verdict is the `VERDICT: <signal>` line
+      of its final message, instructed and parsed by the runtime
+      (`docs/design/2026-09-13-simplification.md`). Operator control keeps the
+      file-inbox `Command` protocol.
 - [x] Domain: 5 entities (Graph, Run, Event, Budget, Artifact); 5 node kinds;
       interactivity = policy flag on `agent`; approval = later `human` node.
 - [x] Verbs: `run`/`resume` only execution verbs; **no** `retry`/`replay`/
       `skip` — redo is a new run. Plus pause/cancel/status/watch/logs/emit/
-      respond/validate/graph, `--json` everywhere.
+      respond/validate/graph, `--json` everywhere. **Amended 2026-09-13
+      (simplification):** `watch`, `emit` and `dash` deleted; `stats` and
+      `prune` added.
 - [x] Isolation: runtime-owned; default `shared`, opt-in per-run `worktree`
       (feature work isolated from the main working copy); **no auto-merge**.
 - [x] MVP shape: slim skeleton **with** journal/replay/resume (hex's core
@@ -58,7 +67,9 @@ locked in the 2026-07-19 design session (see README.md + AGENTS.md; research:
       crates over hand-rolling where they cut real code — `clap` (CLI parsing,
       derive), `thiserror` (runtime error type), `yaml_serde` (maintained
       serde_yaml fork), `fs4` (advisory locks, fs2 successor), `uuid` (run-id
-      suffixes), `humantime` (budget durations); dev: `assert_cmd` + `tempfile`
+      suffixes), `humantime` (budget durations), `which` (is this agent CLI
+      installed?), `jiff` (the run-id date prefix), `anstream` (`strip_str`, to
+      measure a painted cell); dev: `assert_cmd` + `tempfile`
       (binary end-to-end tests). Nothing lands in `hex-kernel` — it stays pure
       (proto-only). Deferred crates are annotated on their phase items below
       (`schemars`/`jsonschema` P2, `clap_complete` P3, `rmcp` P4/P7, `tokio` P6,
@@ -111,6 +122,8 @@ fail-closed, typed timeout disposition, evidence/correlation guards).
 - [x] Worker channel, transport 1: injected env (`HEX_RUN_ID`/`HEX_NODE_ID`/
       `HEX_ATTEMPT_ID`/`HEX_EMIT_FILE`/`HEX_MAY_PROPOSE`) + `hex emit`;
       per-node `may_propose` allow-list enforced at emit and at ingest.
+      (**Superseded 2026-09-13**: the emit channel and its env vars are gone —
+      the verdict line replaced them; `may_propose` is still the allow-list.)
 - [x] Node kinds working: `agent`, `gate`/`command` (inline argv), `terminal`
       (`human` stubs to Phase 2, fails closed).
 - [x] Budgets: attempts + elapsed time + per-node cycle visits; fail-closed.
@@ -212,7 +225,9 @@ outcome, not a guess.
       reads like sequential evidence and the journal stays deterministic.
 - [x] **Per-node `budget: { visits: N }`** — bounds one loop (cap a review cycle
       at 3 without capping a cheap lint cycle). The run-wide `cycle_visits` stays
-      as a blanket backstop.
+      as a blanket backstop. *(Superseded 2026-09-14: the run-wide bounds were
+      deleted and every non-terminal node is now visit-bounded by default — see
+      "Per-node bounding" above.)*
 - [x] **`accept.on_unmet: <node>`** reroutes a run that reached a success terminal
       without its required evidence, instead of dead-ending on `failed`. Carried by
       its own `EventBody::AcceptanceUnmet`, *not* a synthesized `Signal`, because
@@ -232,11 +247,14 @@ outcome, not a guess.
 **(b) Detached runs + control inbox** — the prerequisite for driving hex from a
 Claude session, and the largest remaining piece.
 
-- [ ] `hex run --detach` (foreground stays the default): spawn with
+- [~] `hex run --detach` (foreground stays the default): spawn with
       `process_group(0)`, never `fork()` (unsafe in a multithreaded Rust process),
       stdio to files, parent exits without `wait()`. Keep the advisory lock as the
       liveness signal — kernel-released on death, unlike a pidfile, and PID reuse
       is real — plus a journal heartbeat to tell "hung" from "crashed".
+      (Shipped 2026-07-31; **deleted 2026-09-13 (simplification)** — `hex run`
+      blocks, backgrounding is the shell or tmux. Lock + heartbeat liveness
+      survives as the `Liveness` enum.)
 - [ ] Control inbox `.hex/runs/<id>/control/`: write temp then `rename()`
       (Maildir), polled at attempt boundaries. **cancel · pause/resume · steer**,
       each journaled with an actor so replay stays honest. Every daemonless job
@@ -247,11 +265,13 @@ Claude session, and the largest remaining piece.
       plan → approve → implement is the most universally shipped loop shape in the
       field survey (Cursor, Claude Code, aider, Cline, Roo).
 - [ ] `hex runs` (list), `hex wait <id>`, `hex cancel` on a live run.
-- [ ] A shipped SKILL.md teaching an agent to drive the CLI, and `hex-mcp` as a
+- [~] A shipped SKILL.md teaching an agent to drive the CLI, and `hex-mcp` as a
       second thin client over the same runtime. (The `RuntimeClient` trait was
       kept for this reason and deleted 2026-08-01 having never gained a second
       implementation; `hex-mcp` binds to `Runtime` and re-derives a trait if it
-      ever needs one.)
+      ever needs one.) (SKILL.md shipped in `skills/hex/`; the `hex-mcp` stub
+      crate was **deleted 2026-09-13** — an MCP client would be recreated as a
+      new thin client when it is actually built.)
 
 ## Control & detach pass — landed 2026-07-31
 
@@ -274,6 +294,8 @@ Phase (b) of the agreed sequence, implemented as specified.
       `--reserved-run-id`, stdio to `detached.{out,err}`, `process_group(0)`,
       launcher exits without `wait()`. Never `fork()` (unsafe in a multithreaded
       Rust process). Liveness = run lock + 5s heartbeat → live / hung / abandoned.
+      (**Deleted 2026-09-13 (simplification)** — one blocking execution mode;
+      lock + heartbeat liveness kept.)
 - [x] **New verbs** `runs`, `wait`, `pause`, `steer`, `respond`; `cancel` now works
       on a *live* run (inbox) as well as an idle one (direct append). Exit code
       **6 = paused** joins 0–5.
@@ -298,7 +320,11 @@ Phase (b) of the agreed sequence, implemented as specified.
       *paused* worktree run's slot can be reclaimed (its uncommitted work
       discarded-and-logged) by another run before `hex resume`. In-scope of the
       documented reclaim behaviour, but new now that pause can return mid-run.
-- [ ] **The fs4/flock flake is NOT root-caused, and it is not worktree-specific.**
+- [~] **The fs4/flock flake is NOT root-caused, and it is not worktree-specific.**
+      (**User-visible symptom closed 2026-09-13**: `cancel` reads the journal
+      before probing the lock, so a finished run records directly and the flaky
+      probe is never taken. The flake itself is still undiagnosed; the
+      worktree-slot side still has it.)
       Now observed on the **run** lock too (`tests/control.rs::cancel_of_an_idle_run_is_recorded_directly`
       fails ~1 in 14 workspace runs: `RunLock::acquire` gets `WouldBlock` on a lock
       the just-returned `start` released, so `cancel` returns `Requested` instead
@@ -317,9 +343,10 @@ Phase (b) of the agreed sequence, implemented as specified.
       is intact either way, so the cost is a needless extra slot, never
       corruption.
 - [ ] `RunReport.disposition` is now `Option<Disposition>`, and the client surface
-      gained `list_runs`/`control` with a new `cancel` signature — `hex-mcp` will
-      inherit these when it is built. (They lived on `RuntimeClient` until it was
-      deleted 2026-08-01; they are `Runtime` methods now.)
+      gained `list_runs`/`control` with a new `cancel` signature — a future MCP
+      client would inherit these. (They lived on `RuntimeClient` until it was
+      deleted 2026-08-01; they are `Runtime` methods now. The `hex-mcp` stub
+      crate was deleted 2026-09-13.)
 
 ### Quality pass — landed 2026-07-31 (`/simplify`, 4 parallel review angles)
 
@@ -404,8 +431,16 @@ cycle only when its bound is actually enforced there.
       payoff/partials/cost pass below; a node whose worker cannot resume is refused
       at compile time rather than degrading, since a silent degrade costs exactly
       what `continue` buys.
-- [ ] Stall breaker: stop and report when a check fails with an identical
+- [x] Stall breaker: stop and report when a check fails with an identical
       signature N times, or a node is revisited with an identical result.
+      **Shipped 2026-09-13 (simplification)**: a gate failing with the identical
+      output signature twice ends the run `failed` with
+      `why: gate <x> failed identically twice` (`driver.rs`, `gate_sigs`);
+      a pass clears the record. Agent-result stall detection stays unbuilt.
+      Open edge (flagged by two reviewers, 2026-09-15): `gate_sigs` is
+      in-memory, so a pause/`hex resume` between two identical failures resets
+      the count — journal the signature (an `EventBody` field, schema bump) if
+      a resumed run is ever seen wedging on the same gate.
 - [x] Cost/token accounting (`CostReporting`, kept for this) — **landed
       2026-07-31**: `AttemptReported` + a `RunState.usage` projection, parsed from
       codex's and claude's own structured output, in micro-USD.
@@ -416,7 +451,8 @@ cycle only when its bound is actually enforced there.
       `hex status` renders the per-node/per-model breakdown — both off the same
       projection, so a third surface would only be somewhere for them to disagree.
       **`watch --follow` landed 2026-07-31** in the live-observability pass below,
-      together with `logs --follow`. Still open: `config show`. (`graph --format source` shipped and is how a preset is forked.)
+      together with `logs --follow` (`hex watch` was then **deleted 2026-09-13** —
+      `logs --follow` is the follower). Still open: `config show`. (`graph --format source` shipped and is how a preset is forked.)
 
 **(d) Presets & remaining cleanups**
 
@@ -428,10 +464,12 @@ cycle only when its bound is actually enforced there.
       `Journal::path()`, `hex_runtime::open()`, plus `Inbox::drain()` and
       `Builder::commands()` found dead by the simplify pass. **Resolved 2026-09-05** (ponytail pass): the never-constructed
       `Capability` variants (`StreamingOutput`/`GracefulCancel`/`ReadOnlyMode`)
-      and `Command::Status` deleted (`LiveSteering` kept — interactive sessions
-      are designed and the README names it); `hex-worker`'s unused `hex-kernel`
-      dep dropped. **Still open**: hardcoded
-      `HEX_EMIT_FILE`/`HEX_MAY_PROPOSE` literals in the CLI;
+      and `Command::Status` deleted (`LiveSteering` was kept for the designed
+      interactive sessions, then deleted 2026-09-13 with `StructuredEvents` and
+      `FreshSessions` — a capability nothing checks is dead weight; re-add it
+      when interactive ships); `hex-worker`'s unused `hex-kernel`
+      dep dropped. The hardcoded `HEX_EMIT_FILE`/`HEX_MAY_PROPOSE` literals
+      went with the emit protocol (**deleted 2026-09-13**). **Still open**:
       drop `graph.sha256` (duplicates `RunCreated.graph_hash`, but it is what
       `verify_and_fold` checks today — needs a decision); promote the
       worktree lease out of `RunCreated.inputs` into a typed event (it stores an
@@ -461,9 +499,10 @@ cycle only when its bound is actually enforced there.
       GitLab, Buildkite) converges on exactly this because there is no persistent
       listener to push to. Separate verbs over the id (`hex wait`, `hex logs -f`),
       per docker/kubectl convention — not more flags on `run`.
-- [ ] **Run digest + `hex watch --follow`** — an end-of-run summary (what
-      changed, what the reviewer said, why it stopped, what it cost) and a
-      live tail from a second terminal. `hex status` is still four lines.
+- [~] **Run digest + `hex watch --follow`** — superseded: the end-of-run output
+      and `hex status` carry the digest from one projection (a third surface
+      would only disagree), and `hex watch` was deleted 2026-09-13 with the
+      simplification pass (`hex logs --follow` is the live tail).
 - [ ] **`hex cancel` on a live run** — currently refused, because it needs the
       lock the driver holds. Falls out of the control inbox.
 - [ ] **Stall / oscillation circuit breaker** — an unattended loop with no
@@ -590,6 +629,8 @@ nothing else — the evidence was on disk and no CLI surface reached it. 257 tes
       completes implicitly without ever calling `hex`, so refusing every run
       would block work that would have succeeded. No `PATH` is injected anywhere
       — placing the binary on it is the operator's job.
+      (**Retired 2026-09-13** with the emit protocol: an agent never calls
+      `hex`, so the `self` row is gone.)
 
 ### Known warts from this pass
 
@@ -687,7 +728,7 @@ snapshot. 263 tests (was 257), clippy + fmt clean.
       polls, so the follower is journal-driven now.)
 - [x] **`hex watch --follow`** prints new events until the run finishes, cursored by
       event count — the journal is append-only, so "how many have I printed" is the
-      whole cursor.
+      whole cursor. (`hex watch` **deleted 2026-09-13**; `logs --follow` remains.)
 - [x] **Both followers wait for a just-reserved run's journal** (`wait_for_journal`,
       15s): `--detach` reserves the run dir a moment before the driver's first write,
       so `hex logs --follow "$(hex run … --detach)"` — the obvious thing to type —
@@ -842,6 +883,9 @@ reviewer via openrouter — the first real cross-model run on the pi worker).
 
 - [x] **New presets `code` / `research` / `pr`** — one-shot implementer, one-pass
       sourced research, and critique-loop-then-open-a-PR (`gh`). All gate-free.
+      (**Deleted 2026-09-13 (simplification)** together with
+      `plan-build-review` — never run; six presets remain, git history keeps
+      the four.)
 - [x] **`hex-bench` deleted** — the one bench file moved to
       `hex-runtime/benches/`; the crate was 8 lines of doc pulling three
       non-dev deps.
@@ -862,9 +906,8 @@ reviewer via openrouter — the first real cross-model run on the pi worker).
       off the not-built list; banned "pipeline" wording removed from
       `plan-build-review`; gotcha 5b's result modes match the enum again.
 - [x] Declined, with reasons: `preset::list` single-map rewrite (couples into
-      `collect_yaml`, ~10 lines for real churn), `civil_from_days` → `time`
-      (dependency-free is deliberate), tempfile drop-guards (leaked temp dirs
-      are documented debug evidence), `Workers::new()` removal (~35 call
+      `collect_yaml`, ~10 lines for real churn), tempfile drop-guards (leaked
+      temp dirs are documented debug evidence), `Workers::new()` removal (~35 call
       sites), `hex wait`/`hex runs` re-fold caching (real but invisible at
       current journal sizes — still listed under deferred efficiency).
 
@@ -875,7 +918,50 @@ reviewer via openrouter — the first real cross-model run on the pi worker).
       run's scope fails the gate on files the prompt forbids touching, and the
       loop burns attempts to `budget_exhausted`. Candidates: scope gate checks
       to the branch diff; or a preflight that runs the gate once at the base and
-      refuses to start (or warns) when it is already red.
+      refuses to start (or warns) when it is already red. (Bounded, not fixed,
+      2026-09-13: gate-signature stall detection ends the identical-failure
+      loop `failed` instead of burning to `budget_exhausted`.)
+
+## Simplification pass — landed 2026-09-13
+
+Design and rationale: `docs/design/2026-09-13-simplification.md` (the
+implementation spec; decisions locked in a grilling session).
+
+- [x] **Verdict replaces `hex emit`** — the routing instruction is
+      runtime-generated from `may_propose`, appended to the prompt at attempt
+      start, and parsed from the RAW capture before the 16 KiB `cap_result`;
+      reserved `unknown` fails closed or routes via `on: { unknown: … }`;
+      `E-mixed-done-and-proposals`; `result: text` capture mode +
+      `Worker::captures_result()` compile check (gotchas 5, 49).
+- [x] **One blocking execution** — `--detach` and the reserved-run machinery
+      deleted; backgrounding is `&` or tmux (SIGHUP caveat documented).
+- [x] **One runtime liveness state** — `Liveness` (live / interrupted /
+      finished / error) replaces `RunSummary.error` + `Option<Status>`; kernel
+      `Status` untouched; hung is a diagnostic on live.
+- [x] **`cancel` reads the journal before probing the lock** — closes the
+      user-visible fs4-flake symptom.
+- [x] **Surface cuts** — `hex dash`, `hex watch`, mermaid/DOT/`--format json`
+      exports, `hex-mcp`/`hex-dashboard` stubs, and the `code` /
+      `plan-build-review` / `pr` / `research` presets (six remain).
+- [x] **Additions** — `hex stats` (cross-repo `~/.hex/stats.jsonl`, folded on
+      read), `hex prune [--older-than <dur>] [--all]`, gate-signature stall
+      detection, and a journaled `Note` when a worker exits cleanly with output
+      but no parsed usage (so `budget.output_tokens` no longer fails open
+      silently).
+
+## Per-node bounding — landed 2026-09-14
+
+- [x] **Deleted the run-wide retry budgets** (`Budget.attempts`,
+      `Budget.cycle_visits`, and their `RawBudget` fields). Every non-terminal
+      node's `max_visits` defaults to `DEFAULT_NODE_VISITS` (5); a node that
+      exceeds its bound ends the run `budget_exhausted` naming the node. A
+      graph still writing `budget: { attempts: N }` is refused by
+      `deny_unknown_fields`. `check_cycles`/`E-unbounded-cycle` deleted (the
+      default bound makes an unbounded cycle unconstructible); `E-budget-zero`
+      now also rejects a node's `visits: 0`. Recorded snapshots are replayed with
+      a legacy `attempts`/`cycle_visits` budget stripped, so a pre-change run
+      still resumes; checklist's `implement` got an explicit bound so `review`
+      stays the long-list knob (gotchas 5, 17, 18, 50).
 
 ## Phase 2 — hardening & correctness
 
@@ -896,7 +982,9 @@ adding surface. (Split out from the old mega "Phase 2"; UX/authoring is Phase 3.
 - [ ] Canonical self-contained compiled snapshot (hash covers interpolated
       inputs + resolved defaults), superseding the source-hash + defaults-in-
       `RunCreated` integrity check shipped in Phase 1.
-- [ ] Repeated-failure circuit breaker + progress-signature stall detection.
+- [~] Repeated-failure circuit breaker + progress-signature stall detection.
+      (Gate-signature stall detection **shipped 2026-09-13**; an agent-result
+      progress signature stays open.)
 - [ ] Graph-surface versioning before the format is externally relied on: bump
       `version` on surface changes and keep a replay compiler per version, so a
       snapshot written by an older hex still resumes. Moot pre-release (no
@@ -932,8 +1020,9 @@ Phase-2 kernel; none change kernel semantics.
 
 - [~] Verbs: `pause`, `capabilities`; `graph --format mermaid|dot` (ascii
       shipped in Phase 1). **`pause` shipped with the control inbox**, and
-      **`graph --format text|json|mermaid|dot` shipped 2026-08-01**
-      (`hex-cli/src/graph_export.rs`; `--json` is an alias for `--format json`).
+      **`graph --format text|json|mermaid|dot` shipped 2026-08-01** — then the
+      mermaid/DOT/JSON arms were **deleted 2026-09-13 (simplification)**, never
+      having been used; `--format text|source` remain.
       **Remaining:** `capabilities`.
 - [~] Polished CLI UX. **Shipped 2026-07-20 with the `clap` migration:** one
       unified help (bare `hex` renders the same clap help as `--help`, to stderr
@@ -951,6 +1040,7 @@ Phase-2 kernel; none change kernel semantics.
       on `q`/`Esc`/`Ctrl-C`. A thin `Runtime` client reusing `hex runs`' row
       helpers and the shared `ui::Mark` colour/charset policy; refuses a non-TTY
       and `--json` (no machine mode — `hex runs --json` instead).
+      (**Deleted 2026-09-13 (simplification)** — `hex runs` is the listing.)
 - [ ] **Cut cross-model review cost — feed the reviewer the diff, not the whole
       repo.** Found dogfooding `hex dash` (checklist preset, cross-model review):
       a ~14-item run cost ≈ $40, almost all of it the codex reviewer re-reading
@@ -964,10 +1054,12 @@ Phase-2 kernel; none change kernel semantics.
       line numbers; (c) let a review node scope its read to changed files. The
       per-item commits are safe regardless, so the failure mode is cost, not
       lost work. See memory `checklist-dogfood-cost-and-reviewer-loop`.
+      (**Partly bounded 2026-09-13**: `checklist`'s `review.visits` dropped
+      20 → 6, and gate-signature stall detection ends an identical-failure loop;
+      the diff-not-repo reviewer feed itself is still open.)
 - [ ] Proper ASCII graph rendering for `hex graph`: a real laid-out diagram
-      (boxes + arrows, cycles visible), not today's flat node/edge list; keep
-      `--format text|json|mermaid|dot` so the same IR renders to each (the
-      mermaid and DOT arms already do, off the same `Topology`).
+      (boxes + arrows, cycles visible), not today's flat node/edge list.
+      (The mermaid/DOT/JSON arms were deleted 2026-09-13; `text|source` remain.)
 - [x] Live agent-output preview during a run (shipped 2026-07-21): a sticky
       footer (ratatui inline viewport) tails the in-flight attempt's stdout and
       stderr (interleaved best-effort — per-stream order exact, cross-stream is
@@ -1023,10 +1115,11 @@ Phase-2 kernel; none change kernel semantics.
       `--output-format json`, opencode `run --format json`; opencode
       `event_server` capability (`serve` + SSE) for richer fidelity.
 - [ ] **Enforced read-only** for reviewer nodes: today `read_only` is advisory
-      (prompt-only) because a real read-only sandbox also blocks the `hex emit`
-      file channel. Needs a control transport outside the sandboxed workspace
-      (e.g. MCP tool hook, or an emit dir the sandbox whitelists) so a reviewer
-      can be sandbox-enforced read-only *and* still route its verdict.
+      (prompt-only) because a real read-only sandbox also blocks the
+      `HEX_RESULT_FILE` write, losing the final message and with it the verdict
+      (amended 2026-09-13 — the emit channel is gone, but the result file has
+      the same problem). Needs a result path outside the sandboxed workspace so
+      a reviewer can be sandbox-enforced read-only *and* still route.
 - [ ] tdd's red/green gates run the whole `cargo test` suite, so they can't
       isolate the *new* test (an unrelated pre-existing failure reads as "red").
       Per-test targeting once node I/O can pass the test name to the gate.
@@ -1059,7 +1152,9 @@ Phase-2 kernel; none change kernel semantics.
       `.result`), stored as `NodeResult`; a downstream prompt references it as
       `{{node.result}}`, interpolated at attempt-start and wrapped as untrusted.
       An agent that finishes cleanly without emitting gets a synthesized reserved
-      `done` signal (implicit completion); >1-outcome nodes still `hex emit`.
+      `done` signal (implicit completion); >1-outcome nodes still `hex emit`
+      (superseded 2026-09-13: they end their final message with
+      `VERDICT: <signal>` instead).
       Full typed inputs/outputs (`schemars`, `{{node.output}}` typed fields,
       per-node dataflow contracts) remain Phase 6.
 
@@ -1067,8 +1162,8 @@ Phase-2 kernel; none change kernel semantics.
 
 - [ ] `interactive: true` agent policy: live human↔agent conversation
       (grill-me/Q&A), every turn journaled (`worker.message`/`human.message`),
-      suspend/resume mid-attempt; validator requires `live_steering` +
-      `session_resume`.
+      suspend/resume mid-attempt; validator requires `session_resume` plus a
+      re-added `live_steering` capability (deleted 2026-09-13 while unused).
 - [ ] `hex respond` / steering flow from any client; sessions resumable via
       `hex resume` after interruption.
 - [ ] **Interactive run UX**: combine the live preview (sticky footer, last-N
@@ -1127,7 +1222,8 @@ Phase-2 kernel; none change kernel semantics.
       implementation that earns back a client trait — derive it then, from two
       real implementations, rather than keeping an empty one open for it.
 - [ ] `hex-mcp` server: same verbs as MCP tools; clients can start new runs;
-      authoring prompts/templates exposed over MCP.
+      authoring prompts/templates exposed over MCP. (The stub crate was deleted
+      2026-09-13; recreate it as a thin `Runtime` client when built.)
 - [ ] `hex graph new` architect command (worker drafts a graph from a
       description, validates, writes the file).
 - [ ] Live operator views (need the controller to know what's live): `hex ps`

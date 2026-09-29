@@ -1,6 +1,6 @@
 //! Preflight: is this machine actually able to run what the graph asks for?
 //!
-//! Three failure modes motivated this module, all of which used to cost a real
+//! Two failure modes motivated this module, both of which used to cost a real
 //! run before showing themselves:
 //!
 //! - an agent CLI that is not installed — discovered only after the run dir,
@@ -8,15 +8,13 @@
 //! - a `checks:` command that cannot start (`cargo` in a Python repo) — which
 //!   exits non-zero and is therefore indistinguishable from a genuine test
 //!   failure, so the loop routes `failed` back to the implementer and burns the
-//!   whole attempt budget on false evidence;
-//! - `hex` itself not being on `PATH`, which breaks the agent's `hex emit`
-//!   control channel — see the private `probe_self`.
+//!   node's whole visit bound on false evidence.
 //!
-//! `hex doctor` reports all three, and [`preflight`] refuses to start a run whose
-//! workers are missing.
+//! `hex doctor` reports both, and [`preflight`] refuses to start a run whose
+//! workers are missing. (A `self` probe of `hex` on the agent's `PATH` died with
+//! the `hex emit` channel — the agent no longer runs `hex`, so do not re-add it.)
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 use hex_kernel::graph::{Graph, NodeSpec};
 
@@ -26,7 +24,7 @@ use crate::workers::Workers;
 /// One preflight finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
-    /// What was probed: `self`, `worker` or `check`.
+    /// What was probed: `worker` or `check`.
     pub kind: &'static str,
     /// Registry/check name as configured.
     pub name: String,
@@ -38,8 +36,7 @@ pub struct Finding {
     pub detail: String,
 }
 
-/// The full preflight report, in a stable order (`hex` itself, then workers,
-/// then checks).
+/// The full preflight report, in a stable order (workers, then checks).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Report {
     /// Every probed entry.
@@ -64,10 +61,10 @@ impl Report {
     }
 }
 
-/// Probe `hex` itself, then every configured worker and check.
+/// Probe every configured worker and check, then every worker's credentials.
 #[must_use]
 pub fn report(workers: &Workers, checks: &BTreeMap<String, Vec<String>>) -> Report {
-    let mut findings = vec![probe_self()];
+    let mut findings: Vec<Finding> = Vec::new();
     findings.extend(
         workers
             .entries()
@@ -76,32 +73,61 @@ pub fn report(workers: &Workers, checks: &BTreeMap<String, Vec<String>>) -> Repo
     findings.extend(checks.iter().map(|(name, argv)| {
         probe("check", name, argv.first().map(String::as_str)).with_argv(argv)
     }));
+    // Auth after presence: a missing binary already has a row, and running its
+    // probe would only add noise. Identical argvs are probed once (roles alias
+    // workers), keyed under the first name that produced them.
+    let mut seen: BTreeMap<Vec<String>, ()> = BTreeMap::new();
+    for (name, worker) in workers.entries() {
+        let Some(argv) = worker.auth_probe() else {
+            continue;
+        };
+        if seen.insert(argv.clone(), ()).is_some()
+            || argv
+                .first()
+                .is_some_and(|program| which::which(program).is_err())
+        {
+            continue;
+        }
+        findings.push(auth_probe(name, &argv));
+    }
     Report { findings }
 }
 
-/// Whether the agent's `hex emit` channel can resolve `hex` at all.
+/// Run one worker's credential probe: exit 0 with no `not_ready` in the output
+/// means the credentials are usable, all without buying a completion.
 ///
-/// The worker↔runtime channel is a *plain `PATH` lookup in the agent's own
-/// shell*: hex injects `HEX_EMIT_FILE` but deliberately does not inject a `PATH`
-/// (the operator installs the binary themselves). A run whose agent got
-/// `command not found: hex` therefore emitted no signal — which is why this is
-/// reported `ok: false` and makes `hex doctor` exit non-zero, exactly like a
-/// missing agent CLI. It is not merely cosmetic: without it, every node with more
-/// than one outcome is unroutable, and the run discovers that as a timeout
-/// (15 minutes, in the run that motivated this).
-///
-/// It is still *not* part of [`preflight`]: a single-outcome node completes
-/// implicitly without ever calling `hex`, so refusing to start every run would
-/// block work that would have succeeded.
-fn probe_self() -> Finding {
-    let mut finding = probe("self", "hex", Some("hex"));
-    if !finding.ok {
-        finding.detail = "`hex` not found on PATH — put the hex binary on PATH: an agent's \
-                          `hex emit` control channel is a plain PATH lookup in its own shell, so \
-                          a node with more than one outcome cannot route without it"
-            .to_owned();
+/// ponytail: no timeout — every current probe is a local credential check; add
+/// a bound if one is ever seen hanging.
+fn auth_probe(name: &str, argv: &[String]) -> Finding {
+    let out = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output();
+    let (ok, detail) = match out {
+        Ok(out) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let ok = out.status.success() && !text.contains("not_ready");
+            // First non-empty line is the human summary either way.
+            let line = text
+                .lines()
+                .find(|l| l.chars().any(char::is_alphanumeric))
+                .unwrap_or("no output")
+                .trim()
+                .to_owned();
+            (ok, format!("{} ({line})", argv.join(" ")))
+        }
+        Err(e) => (false, format!("{} failed to start: {e}", argv.join(" "))),
+    };
+    Finding {
+        kind: "auth",
+        name: name.to_owned(),
+        program: argv.first().cloned(),
+        ok,
+        detail,
     }
-    finding
 }
 
 /// Probe one named entry's executable.
@@ -117,7 +143,7 @@ fn probe(kind: &'static str, name: &str, program: Option<&str>) -> Finding {
             detail: "no executable to probe".to_owned(),
         };
     };
-    match which(program) {
+    match which::which(program).ok() {
         Some(path) => Finding {
             kind,
             name: name.to_owned(),
@@ -160,7 +186,7 @@ pub fn preflight(graph: &Graph, workers: &Workers) -> Result<()> {
         if let NodeSpec::Agent { worker, .. } = &node.spec
             && let Some(adapter) = workers.get(worker)
             && let Some(program) = adapter.program()
-            && which(program).is_none()
+            && which::which(program).is_err()
         {
             missing.push(format!(
                 "`{program}` (worker `{worker}`, node `{}`)",
@@ -179,65 +205,9 @@ pub fn preflight(graph: &Graph, workers: &Workers) -> Result<()> {
     )))
 }
 
-/// Resolve `program` the way a shell would: a path with a separator is used
-/// as-is, otherwise each `PATH` entry is tried.
-///
-/// `std::process::Command` does this internally but offers no way to ask
-/// *whether* it would succeed without spawning, which is the whole point here.
-#[must_use]
-pub fn which(program: &str) -> Option<PathBuf> {
-    if program.contains(std::path::MAIN_SEPARATOR) || program.contains('/') {
-        let path = Path::new(program);
-        return executable(path).then(|| path.to_path_buf());
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths).find_map(|dir| {
-        let candidate = dir.join(program);
-        executable(&candidate).then_some(candidate)
-    })
-}
-
-/// Whether `path` is a file we could execute.
-fn executable(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn which_finds_a_real_binary_and_misses_a_fake_one() {
-        assert!(which("sh").is_some(), "sh should be on PATH");
-        assert!(which("definitely-not-a-real-binary-xyz").is_none());
-    }
-
-    #[test]
-    fn which_handles_an_explicit_path() {
-        let sh = which("sh").expect("sh on PATH");
-        assert_eq!(which(&sh.display().to_string()), Some(sh));
-        assert!(which("./definitely-not-here-xyz").is_none());
-    }
-
-    #[test]
-    fn a_directory_is_not_executable() {
-        // Guards the `is_file` check: PATH dirs contain subdirectories.
-        assert!(!executable(Path::new("/")));
-    }
 
     #[test]
     fn report_flags_a_missing_check_and_passes_a_real_one() {
@@ -259,19 +229,14 @@ mod tests {
         assert!(good.detail.starts_with("sh -c ("), "argv shown: {good:?}");
     }
 
-    /// The `hex emit` channel is the first thing an agent needs and the last thing
-    /// anyone thought to probe; the row must exist whatever else is configured.
+    /// Nothing configured, nothing probed — and so nothing broken.
     #[test]
-    fn report_always_probes_hex_itself_first() {
+    fn report_probes_every_configured_worker() {
         let report = report(&Workers::default(), &BTreeMap::new());
-        let first = report.findings.first().expect("a self row");
-        assert_eq!((first.kind, first.name.as_str()), ("self", "hex"));
-        assert_eq!(first.ok, which("hex").is_some());
-        if !first.ok {
-            assert!(
-                first.detail.contains("put the hex binary on PATH"),
-                "{first:?}"
-            );
-        }
+        assert!(
+            report.findings.is_empty(),
+            "nothing configured, nothing probed"
+        );
+        assert!(report.ok(), "and therefore nothing is broken");
     }
 }

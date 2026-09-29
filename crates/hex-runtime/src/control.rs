@@ -15,7 +15,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use hex_proto::{Actor, Command};
+use hex_proto::{Actor, Command, Disposition};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -327,20 +327,27 @@ pub fn last_beat_ms(run_dir: &Path) -> Option<u64> {
     raw.split_whitespace().next()?.parse().ok()
 }
 
-/// What a reader can conclude about a run's process, from its lock and beacon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a reader can conclude about a run right now: the runtime-facing state.
+///
+/// One enum, deliberately. The kernel's `Status` says where a run is in its
+/// *lifecycle* — it is pure, so it can see neither a process nor the filesystem —
+/// while this says what an operator or a parent agent can actually conclude, and
+/// it is computed from the journal, the run lock and the heartbeat. Two enums
+/// answering one question is how the two drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Liveness {
-    /// A process holds the run lock and is beating.
+    /// A process holds the run lock. [`RunSummary::hung`](crate::RunSummary) is
+    /// the diagnostic that refines this into "and it is still ticking".
     Live,
-    /// A process holds the run lock but has not beaten recently.
-    Hung,
-    /// Nobody is driving an unfinished run: it crashed or was never started.
-    /// `hex resume` continues it (marking the orphaned attempt interrupted).
-    Abandoned,
-    /// Deliberately suspended by an operator; resumable.
-    Paused,
+    /// Unfinished, and nothing holds the lock — a Ctrl-C pause, an operator
+    /// `hex pause`, and a crash all collapse here, because the operator action is
+    /// the same for all three: `hex resume` continues it.
+    Interrupted,
     /// The run reached a terminal disposition.
-    Finished,
+    Finished(Disposition),
+    /// The journal could not be read or replayed. A listing still shows it —
+    /// hiding a broken run is how a run gets lost — and `hex status` prints why.
+    Error(String),
 }
 
 impl Liveness {
@@ -349,10 +356,18 @@ impl Liveness {
     pub fn as_str(&self) -> &'static str {
         match self {
             Liveness::Live => "live",
-            Liveness::Hung => "hung",
-            Liveness::Abandoned => "abandoned",
-            Liveness::Paused => "paused",
-            Liveness::Finished => "finished",
+            Liveness::Interrupted => "interrupted",
+            Liveness::Finished(_) => "finished",
+            Liveness::Error(_) => "error",
+        }
+    }
+
+    /// The terminal disposition, when the run has one.
+    #[must_use]
+    pub const fn disposition(&self) -> Option<Disposition> {
+        match self {
+            Liveness::Finished(d) => Some(*d),
+            _ => None,
         }
     }
 }

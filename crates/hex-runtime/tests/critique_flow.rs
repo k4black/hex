@@ -18,9 +18,6 @@ const GRAPH: &str = r#"
 version: 1
 name: test-critique
 entry: implement
-defaults:
-  budget:
-    attempts: 8
 nodes:
   implement:
     agent: { worker: mock, prompt: "implement {{prompt}}", may_propose: [ready] }
@@ -57,7 +54,6 @@ const HANDOFF_GRAPH: &str = r#"
 version: 1
 name: handoff
 entry: plan
-defaults: { budget: { attempts: 4 } }
 nodes:
   plan:
     agent: { worker: planner, prompt: "make a plan" }
@@ -93,10 +89,10 @@ fn node_result_is_captured_and_handed_to_the_downstream_prompt() {
     );
     workers.insert(
         "builder",
-        Box::new(CommandWorker::new(
-            "builder",
-            sh("cat > got-prompt.txt; printf ready > \"$HEX_EMIT_FILE\""),
-        )),
+        Box::new(
+            CommandWorker::new("builder", sh("cat > got-prompt.txt; echo 'VERDICT: ready'"))
+                .with_result_capture(Some(ResultCapture::Text)),
+        ),
     );
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers);
     let report = runtime
@@ -140,7 +136,7 @@ const REROUTE_GRAPH: &str = r#"
 version: 1
 name: reroute
 entry: implement
-defaults: { budget: { attempts: 4, attempt: 20s } }
+defaults: { budget: { attempt: 20s } }
 nodes:
   implement:
     agent: { worker: builder, prompt: "implement it", may_propose: [ready, blocked] }
@@ -168,13 +164,14 @@ fn a_rerouted_run_stays_readable_by_status_logs_and_resume() {
     let mut workers = Workers::new();
     workers.insert(
         "builder",
-        Box::new(CommandWorker::new(
-            "builder",
-            sh(
-                "if [ -f been-here ]; then printf ready > \"$HEX_EMIT_FILE\"; \
-                else : > been-here; printf blocked > \"$HEX_EMIT_FILE\"; fi",
-            ),
-        )),
+        Box::new(
+            CommandWorker::new(
+                "builder",
+                sh("if [ -f been-here ]; then echo 'VERDICT: ready'; \
+                    else : > been-here; echo 'VERDICT: blocked'; fi"),
+            )
+            .with_result_capture(Some(ResultCapture::Text)),
+        ),
     );
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers);
 
@@ -224,7 +221,6 @@ enum Entry {
     Start {
         node: String,
         number: u32,
-        budget: Option<u32>,
         worker: Option<String>,
         stdout_log: PathBuf,
         attempt_id: String,
@@ -244,7 +240,6 @@ impl hex_runtime::ProgressSink for Recorder {
         self.log.lock().unwrap().push(Entry::Start {
             node: v.node_id.clone(),
             number: v.attempt_number,
-            budget: v.attempts_budget,
             worker: v.worker.clone(),
             stdout_log: v.stdout_log.clone(),
             attempt_id: v.attempt_id.clone(),
@@ -307,8 +302,8 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
         }
     }
 
-    // The three views carry the right node, 1-based ordinal, shared budget,
-    // worker (None for the gate), and a log path under this attempt's dir.
+    // The three views carry the right node, 1-based ordinal, worker (None for
+    // the gate), and a log path under this attempt's dir.
     let starts: Vec<&Entry> = log
         .iter()
         .filter(|e| matches!(e, Entry::Start { .. }))
@@ -322,7 +317,6 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
         let Entry::Start {
             node,
             number,
-            budget,
             worker,
             stdout_log,
             attempt_id,
@@ -332,7 +326,6 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
         };
         assert_eq!(node, exp_node);
         assert_eq!(*number, exp_num);
-        assert_eq!(*budget, Some(8), "the graph's attempts budget");
         assert_eq!(worker.as_deref(), exp_worker);
         assert!(
             stdout_log.ends_with("stdout.log"),
@@ -374,7 +367,12 @@ struct PanicWorker;
 
 impl hex_worker::Worker for PanicWorker {
     fn capabilities(&self) -> hex_worker::CapabilityManifest {
-        hex_worker::CapabilityManifest::from(&[hex_proto::Capability::FreshSessions][..])
+        hex_worker::CapabilityManifest::default()
+    }
+    /// Stands in for a real adapter, so it must satisfy the same contract a real
+    /// one does — the node it drives declares outcomes.
+    fn captures_result(&self) -> bool {
+        true
     }
     fn run(&self, _request: &hex_worker::WorkRequest) -> hex_worker::WorkOutcome {
         panic!("worker exploded");
@@ -459,7 +457,7 @@ fn budget_exhaustion_fails_closed() {
     let root = temp_root("budget");
     write_graph(&root);
 
-    // review never approves → the loop churns until the attempts budget stops it.
+    // review never approves → the loop churns until a node's visit bound stops it.
     let mock = MockWorker::new()
         .on("implement", &["ready"; 20])
         .on("review", &["changes_requested"; 20]);
@@ -744,7 +742,6 @@ name: timeout
 entry: implement
 defaults:
   budget:
-    attempts: 4
     elapsed: 10s
     attempt: 200ms
 nodes:
@@ -794,9 +791,6 @@ const CHECK_GRAPH: &str = r#"
 version: 1
 name: check-graph
 entry: implement
-defaults:
-  budget:
-    attempts: 6
 nodes:
   implement:
     agent: { worker: mock, prompt: "implement", may_propose: [ready] }
@@ -820,7 +814,7 @@ fn check_runtime(tag: &str, check: Option<Vec<String>>) -> (Runtime, PathBuf) {
         config.checks.insert("test".to_owned(), argv);
     }
     let mut workers = Workers::new();
-    // Enough scripted turns for the loop to spend its whole attempt budget: the
+    // Enough scripted turns for the loop to exhaust its node visit bounds: the
     // mock pops one signal per attempt and errors when its queue runs dry.
     workers.insert(
         "mock",
@@ -848,9 +842,12 @@ fn an_unconfigured_check_is_refused_before_the_run_starts() {
     );
 }
 
-/// The same graph in a project that *does* configure the check runs it for real.
+/// The same graph in a project that *does* configure the check runs it for
+/// real — and a gate reproducing exactly the same failing output twice is a
+/// stall, so the run ends `failed` instead of looping until the budget is gone
+/// (budget exhaustion itself is `budget_exhaustion_fails_closed`).
 #[test]
-fn a_configured_check_is_executed_and_can_fail_the_loop() {
+fn a_gate_failing_with_identical_output_twice_ends_the_run() {
     let (runtime, _root) = check_runtime(
         "failcheck",
         Some(vec!["sh".to_owned(), "-c".to_owned(), "exit 1".to_owned()]),
@@ -858,8 +855,7 @@ fn a_configured_check_is_executed_and_can_fail_the_loop() {
     let report = runtime
         .start("cg", None, None, &Isolation::Shared)
         .expect("run");
-    // The check genuinely fails, so the loop re-implements until the budget ends.
-    assert_eq!(report.disposition, Some(Disposition::BudgetExhausted));
+    assert_eq!(report.disposition, Some(Disposition::Failed));
 
     let events = runtime.events(&report.run_id).expect("events");
     assert!(
@@ -867,7 +863,7 @@ fn a_configured_check_is_executed_and_can_fail_the_loop() {
             &e.body,
             EventBody::Signal { name } if name == "failed"
         )),
-        "a real check failure routes `failed`"
+        "the first real check failure routes `failed`"
     );
     assert!(
         !events.iter().any(|e| matches!(
@@ -876,13 +872,15 @@ fn a_configured_check_is_executed_and_can_fail_the_loop() {
         )),
         "a configured check must not report itself as skipped"
     );
-    // And the operator is told which budget ran out.
+    // And the operator is told why the loop was cut short — the reason rides
+    // the terminal AttemptFailed, which `Payoff` surfaces as `why:`.
     assert!(
         events.iter().any(|e| matches!(
             &e.body,
-            EventBody::Note { text } if text.contains("attempt budget spent")
+            EventBody::AttemptFailed { reason, .. }
+                if reason.contains("failed with identical output twice")
         )),
-        "budget exhaustion must explain itself: {events:#?}"
+        "the stall must explain itself: {events:#?}"
     );
 }
 
@@ -926,10 +924,12 @@ fn preflight_refuses_a_missing_agent_cli_before_creating_a_run() {
     let mut workers = Workers::new();
     workers.insert(
         "mock",
-        Box::new(CommandWorker::new(
-            "mock",
-            vec!["definitely-not-a-real-agent-xyz".to_owned()],
-        )),
+        Box::new(
+            CommandWorker::new("mock", vec!["definitely-not-a-real-agent-xyz".to_owned()])
+                // Capture, so the graph/worker check passes and this test reaches
+                // the *machine* preflight it is about.
+                .with_result_capture(Some(ResultCapture::Text)),
+        ),
     );
     // Declare the check, so compilation succeeds and the run reaches the *worker*
     // preflight this test is about.
@@ -950,5 +950,46 @@ fn preflight_refuses_a_missing_agent_cli_before_creating_a_run() {
     assert!(
         !runs.exists() || std::fs::read_dir(&runs).into_iter().flatten().count() == 0,
         "preflight must not leave a run directory behind"
+    );
+}
+
+/// An agent reporting a verdict its node never declared routes the reserved
+/// `unknown` edge when the graph declares one — the same path as no marker at
+/// all — instead of failing the attempt outright.
+#[test]
+fn an_undeclared_verdict_routes_the_declared_unknown_edge() {
+    const UNKNOWN_GRAPH: &str = r#"
+version: 1
+name: unknown-edge
+entry: work
+nodes:
+  work:
+    agent: { worker: mock, prompt: "work", may_propose: [ready] }
+    on: { ready: done, unknown: bad }
+  done:
+    terminal: succeeded
+  bad:
+    terminal: failed
+accept: { require: [] }
+"#;
+    let root = temp_root("unknownedge");
+    let dir = root.join(".hex").join("graphs");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("ue.yaml"), UNKNOWN_GRAPH).expect("write");
+    let mut workers = Workers::new();
+    workers.insert("mock", Box::new(MockWorker::new().on("work", &["sneaky"])));
+    let runtime = Runtime::with_workers(root, Config::builtin(), workers);
+
+    let report = runtime
+        .start("ue", None, None, &Isolation::Shared)
+        .expect("run");
+    assert_eq!(report.disposition, Some(Disposition::Failed));
+    let events = runtime.events(&report.run_id).expect("events");
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.body,
+            EventBody::Signal { name } if name == "unknown"
+        )),
+        "an undeclared verdict routes `unknown`, it does not fail the attempt: {events:#?}"
     );
 }

@@ -1,9 +1,9 @@
 //! `hex-proto` — the versioned control protocol for hex.
 //!
 //! This is the one stable, public surface shared by every actor: the kernel,
-//! the runtime, worker adapters, and every thin client (CLI, MCP, dashboard).
-//! It defines the append-only [`Event`] envelope, operator [`Command`]s, and
-//! worker [`Capability`] manifest entries.
+//! the runtime, worker adapters, and the CLI. It defines the append-only
+//! [`Event`] envelope, operator [`Command`]s, and worker [`Capability`]
+//! manifest entries.
 //!
 //! It has **no** dependencies on other hex crates — the whole workspace points
 //! inward to here.
@@ -405,19 +405,13 @@ impl Command {
 }
 
 /// A capability a worker adapter advertises in its manifest so the graph
-/// validator can reject definitions the adapter cannot satisfy (e.g. an
-/// `interactive: true` node on a worker without live steering).
+/// validator can reject definitions the adapter cannot satisfy (e.g. a
+/// `context: continue` node on a worker without session resume).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    /// Emits structured events rather than only prose on stdout.
-    StructuredEvents,
-    /// Can start a fresh agent session per attempt.
-    FreshSessions,
     /// Can resume a prior agent session.
     SessionResume,
-    /// Accepts mid-attempt steering input (required for interactive sessions).
-    LiveSteering,
     /// Reports token/cost usage per attempt.
     CostReporting,
 }

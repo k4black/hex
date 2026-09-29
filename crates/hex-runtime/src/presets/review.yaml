@@ -12,8 +12,6 @@ example: "check the diff for security and error-handling gaps"
 defaults:
   role: reviewer
   context: fresh
-  budget:
-    attempts: 2
 
 entry: review
 
@@ -26,11 +24,9 @@ nodes:
         What to check for: {{prompt}}
 
         Run `git diff` (and `git status`) to see the changes — review only, do
-        not edit files. If they are acceptable, run:
-          hex emit approved
-        Otherwise explain what needs to change in your final message (shown by
-        `hex logs`) and run:
-          hex emit changes_requested
+        not edit files. If they are acceptable say so in your verdict; otherwise
+        explain what needs to change in your final message (shown by `hex logs`).
+
       may_propose: [approved, changes_requested]
     on:
       approved: done

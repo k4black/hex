@@ -24,7 +24,6 @@ defaults:
   role: researcher
   context: fresh
   budget:
-    attempts: 14
     elapsed: 45m
 
 entry: research
@@ -69,11 +68,10 @@ nodes:
         asserted? Is a load-bearing question still open? Is a conclusion drawn
         from one source that needed three? Would a careful reader be misled?
 
-        If the notes genuinely answer the question, run:
-          hex emit enough
+        If the notes genuinely answer the question, say so in your verdict.
         Otherwise name — concretely, in your final message, so the researcher can
-        act on it — what is missing and where to look. Then run:
-          hex emit more_needed
+        act on it — what is missing and where to look. End with the verdict line
+        hex asks for.
       may_propose: [enough, more_needed]
     # The backstop. Without it, "is this enough?" is a question a model can keep
     # answering `more_needed` to until the run's whole budget is gone.

@@ -1,18 +1,19 @@
 //! Subprocess agent adapters: one uniform [`Worker`] surface, one adapter per
 //! external coding-agent CLI.
 //!
-//! Every adapter shares the same spawn/log/emit/result plumbing (`run_agent`),
-//! but each concrete worker ([`CodexWorker`], [`ClaudeWorker`], [`OpencodeWorker`],
-//! [`PiWorker`]) encapsulates *its* agent's specifics — argv, final-message capture,
-//! and the read-only flag it maps to. [`CommandWorker`] is the generic escape hatch
-//! for a custom argv (and for tests). The runtime only ever sees `dyn Worker`.
+//! Every adapter shares the same spawn/log/result plumbing (`run_agent`), but
+//! each concrete worker ([`CodexWorker`], [`ClaudeWorker`], [`OpencodeWorker`],
+//! [`PiWorker`]) encapsulates *its* agent's specifics — argv, final-message
+//! capture, and the read-only flag it maps to. [`CommandWorker`] is the generic
+//! escape hatch for a custom argv (and for tests). The runtime only ever sees
+//! `dyn Worker`.
 //!
-//! Control channels the runtime injects: `HEX_EMIT_FILE` (the agent's routing
-//! signal via `hex emit`), `HEX_RESULT_FILE`/`{result}` (where a worker writes
-//! its final message), plus `HEX_RUN_ID`/`HEX_NODE_ID`/`HEX_ATTEMPT_ID`/
-//! `HEX_MAY_PROPOSE`.
+//! An agent's only output channel is its terminating message. The runtime
+//! injects `HEX_RESULT_FILE`/`{result}` (where a worker may write that message)
+//! plus `HEX_RUN_ID`/`HEX_NODE_ID`/`HEX_ATTEMPT_ID`, and reads the node's routing
+//! verdict out of the captured text — there is no `hex emit` subprocess and no
+//! emit file, so nothing here needs `hex` on the agent's `PATH`.
 
-use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::path::Path;
 use std::process::{Child, Command as ProcCommand, ExitStatus, Stdio};
@@ -22,16 +23,9 @@ use hex_proto::{Capability, ModelUsage};
 
 use crate::{AttemptReport, CapabilityManifest, WorkOutcome, WorkRequest, Worker};
 
-/// The env var naming the file an agent appends its routing signal to.
-pub const EMIT_FILE_ENV: &str = "HEX_EMIT_FILE";
-
 /// The env var (and `{result}` argv token) naming the file a worker writes its
 /// final message to, for capture into `{{node.result}}`.
 pub const RESULT_FILE_ENV: &str = "HEX_RESULT_FILE";
-
-/// Cap on the *extracted* result value: it feeds a downstream prompt, so a
-/// runaway output must not bloat it. Truncated with `…`.
-const MAX_RESULT_BYTES: usize = 16 * 1024;
 
 /// Cap on the *raw* stream we read to find the result. Generous so a normal
 /// tool-heavy JSONL stream's final answer (which comes last) isn't lost, while
@@ -57,6 +51,10 @@ pub enum ResultCapture {
     /// stdout is JSONL from `pi --mode json`; extract the final assistant
     /// message text and usage from `pi`'s structured event stream.
     PiJsonl,
+    /// The bounded *tail* of stdout is the final message. The lowest-common-
+    /// denominator mode, for a `kind: command` worker (or a test script) that
+    /// simply prints its answer and its `VERDICT:` line last.
+    Text,
 }
 
 /// Cap on the bounded log tail kept as a *partial* result for an attempt that
@@ -64,20 +62,11 @@ pub enum ResultCapture {
 /// terminal, and the newest output is the informative part.
 const MAX_PARTIAL_BYTES: u64 = 8 * 1024;
 
-/// Advertise a fresh session per attempt — what all blocking headless adapters
-/// actually provide today. (Streaming is declared once implemented.)
-fn fresh() -> CapabilityManifest {
-    CapabilityManifest::from(&[Capability::FreshSessions])
-}
-
-/// A fresh session per attempt, plus resumption of a prior one — what an adapter
-/// that can honour `context: continue` and report its spend declares.
+/// What an adapter that can honour `context: continue` and report its spend
+/// declares. Everything else (a fresh session per attempt) is the baseline and
+/// needs no capability.
 fn resumable() -> CapabilityManifest {
-    CapabilityManifest::from(&[
-        Capability::FreshSessions,
-        Capability::SessionResume,
-        Capability::CostReporting,
-    ])
+    CapabilityManifest::from(&[Capability::SessionResume, Capability::CostReporting])
 }
 
 /// Where an adapter's session id and usage come from. Deliberately separate from
@@ -118,9 +107,9 @@ impl CodexWorker {
 
     /// Build the argv template. `read_only` is advisory only: a true read-only
     /// sandbox (`--sandbox read-only`) would also block the agent from writing
-    /// `HEX_EMIT_FILE`/`HEX_RESULT_FILE` under the workspace, breaking the
-    /// control channel — so we always use `workspace-write` and rely on the
-    /// node's prompt to keep a reviewer from editing. Enforced read-only awaits a
+    /// `HEX_RESULT_FILE` under the workspace, losing the final message the run
+    /// routes on — so we always use `workspace-write` and rely on the node's
+    /// prompt to keep a reviewer from editing. Enforced read-only awaits a
     /// non-workspace control transport (see TODO).
     #[must_use]
     pub fn command(&self, extra_writable: Option<&Path>, resume: Option<&str>) -> Vec<String> {
@@ -143,9 +132,9 @@ impl CodexWorker {
             "--output-last-message",
             "{result}",
         ]));
-        // Under worktree isolation the control files live outside the workspace,
-        // so the sandbox must be told that directory is writable, or `hex emit`/
-        // result capture would be blocked.
+        // Under worktree isolation the result file lives outside the workspace,
+        // so the sandbox must be told that directory is writable, or result
+        // capture would be blocked.
         let extra_dir = extra_writable.map(|d| d.to_string_lossy().into_owned());
         if resume.is_some() {
             // The config-override spellings of the two flags `resume` lacks. Both
@@ -179,6 +168,12 @@ impl CodexWorker {
 impl Worker for CodexWorker {
     fn program(&self) -> Option<&str> {
         Some("codex")
+    }
+    fn auth_probe(&self) -> Option<Vec<String>> {
+        Some(strs(&["codex", "login", "status"]))
+    }
+    fn captures_result(&self) -> bool {
+        true
     }
     fn capabilities(&self) -> CapabilityManifest {
         resumable()
@@ -216,9 +211,9 @@ impl ClaudeWorker {
     }
 
     // Read-only is advisory here: the allow/deny classifier below still leaves
-    // write-capable `Bash` (needed for `hex emit`), so it can't be enforced
-    // without breaking the control channel. The role's prompt keeps it
-    // read-only. (Enforced read-only awaits a non-workspace control transport.)
+    // write-capable `Bash`, which a coding agent needs to build and test, so it
+    // cannot be enforced without crippling the agent. The role's prompt keeps it
+    // read-only. (Enforced read-only awaits a stronger sandbox.)
     #[must_use]
     pub fn command(&self, resume: Option<&str>) -> Vec<String> {
         // Codex confines effects with an OS sandbox (`workspace-write`); Claude
@@ -227,8 +222,8 @@ impl ClaudeWorker {
         //   * `acceptEdits` auto-approves in-workspace edits (no stall on Edit/
         //     Write), while dangerous ops still route through the deny-list.
         //   * `--allowedTools` auto-approves the coding essentials (incl. `Bash`,
-        //     which the `hex emit` control channel needs). Tools outside this set
-        //     (e.g. `WebFetch`) get no approver in headless mode → fail closed.
+        //     which build/test commands need). Tools outside this set (e.g.
+        //     `WebFetch`) get no approver in headless mode → fail closed.
         //   * `--disallowedTools` denies the genuinely destructive/exfil commands
         //     (deny rules outrank the mode). This is defense-in-depth, NOT a hard
         //     boundary — prefix matching is bypassable via shell chaining, so real
@@ -265,8 +260,8 @@ impl ClaudeWorker {
 }
 
 /// Auto-approved tools for headless Claude: the coding essentials plus `Bash`
-/// (the `hex emit` control channel is a Bash call). Anything outside this set
-/// has no approver in `-p` mode, so it fails closed rather than stalling.
+/// (how an agent builds and tests). Anything outside this set has no approver in
+/// `-p` mode, so it fails closed rather than stalling.
 const CLAUDE_ALLOWED_TOOLS: &str = "Read,Grep,Glob,Edit,Write,Bash";
 
 /// Denied Bash invocations (deny outranks the permission mode). A focused,
@@ -283,6 +278,12 @@ const CLAUDE_DENIED_TOOLS: &str = concat!(
 impl Worker for ClaudeWorker {
     fn program(&self) -> Option<&str> {
         Some("claude")
+    }
+    fn auth_probe(&self) -> Option<Vec<String>> {
+        Some(strs(&["claude", "auth", "status"]))
+    }
+    fn captures_result(&self) -> bool {
+        true
     }
     fn capabilities(&self) -> CapabilityManifest {
         resumable()
@@ -330,8 +331,15 @@ impl Worker for OpencodeWorker {
     fn program(&self) -> Option<&str> {
         Some("opencode")
     }
+    fn auth_probe(&self) -> Option<Vec<String>> {
+        // Local credential listing only — opencode has no per-provider check.
+        Some(strs(&["opencode", "auth", "list"]))
+    }
+    fn captures_result(&self) -> bool {
+        true
+    }
     fn capabilities(&self) -> CapabilityManifest {
-        fresh()
+        CapabilityManifest::default()
     }
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         run_agent(
@@ -385,6 +393,17 @@ impl Worker for PiWorker {
     fn program(&self) -> Option<&str> {
         Some("pi")
     }
+    fn auth_probe(&self) -> Option<Vec<String>> {
+        // Per model on purpose: `pi auth check --model openrouter/x/y` verifies
+        // the provider the configured model resolves to, so it also catches the
+        // bare-model ambiguity trap (gotcha 48) — it prints `not_ready`. With no
+        // model configured there is no provider to name, so nothing to probe.
+        let model = self.model.as_deref()?;
+        Some(strs(&["pi", "auth", "check", "--model", model]))
+    }
+    fn captures_result(&self) -> bool {
+        true
+    }
     fn capabilities(&self) -> CapabilityManifest {
         resumable()
     }
@@ -427,7 +446,7 @@ impl CommandWorker {
         Self {
             name: name.into(),
             command,
-            capabilities: fresh(),
+            capabilities: CapabilityManifest::default(),
             result_capture: None,
         }
     }
@@ -443,6 +462,12 @@ impl CommandWorker {
 impl Worker for CommandWorker {
     fn program(&self) -> Option<&str> {
         self.command.first().map(String::as_str)
+    }
+    /// Only when a `result:` mode is configured: with none, the worker's output
+    /// is logged but no final message is captured, so a multi-outcome node bound
+    /// to it could never produce a verdict.
+    fn captures_result(&self) -> bool {
+        self.result_capture.is_some()
     }
     fn capabilities(&self) -> CapabilityManifest {
         self.capabilities.clone()
@@ -479,8 +504,8 @@ fn push_flag(argv: &mut Vec<String>, flag: &str, value: Option<&str>) {
 
 /// Run one attempt from an argv template: substitute `{prompt}`/`{result}`,
 /// inject the control env, spawn (piping the prompt to stdin when the argv has
-/// no `{prompt}`), enforce the deadline, then capture the final message and the
-/// routing signal. `Ok(None)` from the emit channel is *implicit completion*.
+/// no `{prompt}`), enforce the deadline, then capture the final message — the
+/// runtime reads the routing verdict out of it.
 fn run_agent(
     name: &str,
     command: &[String],
@@ -493,10 +518,8 @@ fn run_agent(
         return WorkOutcome::error(format!("worker `{name}` has an empty command"));
     }
 
-    let emit_file = request.attempt_dir.join("emitted");
     let result_file = request.attempt_dir.join("result.txt");
-    // Start clean so a resumed attempt never reads a stale signal/result.
-    let _ = fs::remove_file(&emit_file);
+    // Start clean so a resumed attempt never reads a stale result.
     let _ = fs::remove_file(&result_file);
 
     let uses_placeholder = command.iter().any(|a| a.contains("{prompt}"));
@@ -526,9 +549,7 @@ fn run_agent(
         // The program actually spawned, so `hex feedback` records the real agent
         // (matches `AttemptReported.agent`, gotcha 39).
         .env("HEX_AGENT", &command[0])
-        .env(EMIT_FILE_ENV, &emit_file)
         .env(RESULT_FILE_ENV, &result_file)
-        .env("HEX_MAY_PROPOSE", request.may_propose.join(","))
         .stdin(if uses_placeholder {
             Stdio::null()
         } else {
@@ -607,20 +628,16 @@ fn run_agent(
         Err(reason) => return WorkOutcome::error(reason).with_report(report),
     };
 
-    // No emit on a clean exit is *implicit completion* (signal `None`); the
-    // runtime synthesizes `done`. A disallowed/ambiguous emit is an error.
-    match read_signal(&emit_file, &request.may_propose) {
-        Ok(signal) => WorkOutcome {
-            signal,
-            result,
-            error: None,
-            timed_out: false,
-            interrupted: false,
-            report: report.filter(|r| !r.is_empty()),
-        },
-        Err(reason) => WorkOutcome::error(reason)
-            .with_result(result)
-            .with_report(report),
+    // Routing is deliberately NOT decided here. The runtime knows the node's
+    // allowed outcomes — and therefore whether a missing verdict is an error
+    // (multi-outcome) or implicit completion (single-outcome) — so it receives
+    // the **uncapped** final message and decides. See `WorkOutcome`.
+    WorkOutcome {
+        result,
+        error: None,
+        timed_out: false,
+        interrupted: false,
+        report: report.filter(|r| !r.is_empty()),
     }
 }
 
@@ -1033,11 +1050,11 @@ fn capture_result(
         Some(ResultCapture::PiJsonl) => {
             pi_result(&attempt_dir.join("stdout.log"), MAX_STREAM_BYTES)?
         }
+        // The tail, because the answer and its trailing `VERDICT:` line are the
+        // newest output.
+        Some(ResultCapture::Text) => read_tail(&attempt_dir.join("stdout.log"), MAX_STREAM_BYTES),
     };
-    Ok(raw
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .map(cap_result))
+    Ok(raw.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()))
 }
 
 /// Read at most `max` bytes of `path`, decoded lossily so a cut through a
@@ -1106,21 +1123,6 @@ fn read_line_bounded<R: std::io::BufRead>(
 ) -> std::io::Result<usize> {
     use std::io::{BufRead as _, Read as _};
     reader.take(cap as u64).read_until(b'\n', buf)
-}
-
-/// Truncate a captured result so the *final* value (including the `…` marker) is
-/// at most [`MAX_RESULT_BYTES`] bytes, cut at a char boundary. Takes the string
-/// by value and returns it untouched in the common (under-cap) case — no
-/// re-allocation unless truncation is actually needed.
-fn cap_result(s: String) -> String {
-    if s.len() <= MAX_RESULT_BYTES {
-        return s;
-    }
-    let mut end = MAX_RESULT_BYTES - '…'.len_utf8();
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
 }
 
 /// Build a [`ProcCommand`] for `argv` in `cwd`, capturing stdout/stderr to
@@ -1235,57 +1237,6 @@ pub fn wait_bounded(
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
-/// Read the emitted routing signal. `Ok(None)` = the agent emitted nothing (a
-/// clean finish → implicit completion, the runtime synthesizes `done`).
-/// `Ok(Some(name))` = exactly one distinct signal, and it is in `may_propose`.
-/// `Err` = a disallowed signal or multiple ambiguous emissions.
-fn read_signal(
-    emit_file: &std::path::Path,
-    may_propose: &[String],
-) -> Result<Option<String>, String> {
-    // Bound the read: a faulty agent must not exhaust memory. Signals are tiny.
-    const MAX_EMIT_BYTES: u64 = 64 * 1024;
-    let file = match fs::File::open(emit_file) {
-        Ok(file) => file,
-        // No file = nothing proposed (implicit completion). Any *other* open
-        // error (perms, …) fails closed rather than silently routing `done`.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("could not open emit file: {e}")),
-    };
-    let mut contents = String::new();
-    std::io::Read::read_to_string(
-        &mut std::io::Read::take(file, MAX_EMIT_BYTES),
-        &mut contents,
-    )
-    .map_err(|e| format!("could not read emit file: {e}"))?;
-    let distinct: BTreeSet<&str> = contents
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    match distinct.len() {
-        0 => Ok(None),
-        1 => {
-            let signal = *distinct.iter().next().expect("one element");
-            if may_propose.iter().any(|allowed| allowed == signal) {
-                Ok(Some(signal.to_owned()))
-            } else {
-                Err(format!(
-                    "agent emitted `{signal}` which is not in may_propose"
-                ))
-            }
-        }
-        _ => {
-            let mut names: Vec<&str> = distinct.into_iter().collect();
-            names.sort_unstable();
-            Err(format!(
-                "agent emitted multiple signals: {}",
-                names.join(", ")
-            ))
-        }
     }
 }
 
@@ -1527,13 +1478,12 @@ mod tests {
         }
     }
 
-    fn request(dir: &std::path::Path, may: &[&str]) -> WorkRequest {
+    fn request(dir: &std::path::Path) -> WorkRequest {
         WorkRequest {
             run_id: "run_0".to_owned(),
             node_id: "implement".to_owned(),
             attempt_id: "att_1".to_owned(),
             prompt: "hello".to_owned(),
-            may_propose: may.iter().map(|s| (*s).to_owned()).collect(),
             workdir: dir.to_path_buf(),
             attempt_dir: dir.to_path_buf(),
             deadline_ms: None,
@@ -1546,35 +1496,31 @@ mod tests {
         }
     }
 
+    /// The worker's job is to hand the runtime the agent's final message; it is
+    /// the runtime that reads a verdict out of it. A `result: text` worker that
+    /// prints its verdict last therefore has that line in the captured result.
     #[test]
-    fn reads_emitted_signal_from_the_child() {
-        let dir = temp_dir("emit");
+    fn a_verdict_printed_last_reaches_the_captured_result() {
+        let dir = temp_dir("verdict-text");
         let worker = CommandWorker::new(
             "fake",
-            strs(&["sh", "-c", "printf ready > \"$HEX_EMIT_FILE\""]),
-        );
-        let outcome = worker.run(&request(&dir, &["ready"]));
-        assert_eq!(outcome, WorkOutcome::signal("ready"));
+            strs(&["sh", "-c", "echo 'the answer'; echo 'VERDICT: ready'"]),
+        )
+        .with_result_capture(Some(ResultCapture::Text));
+        let outcome = worker.run(&request(&dir));
+        assert_eq!(outcome.error, None);
+        let result = outcome.result.expect("captured stdout tail");
+        assert!(result.contains("VERDICT: ready"), "{result}");
     }
 
     #[test]
-    fn disallowed_signal_is_an_error() {
-        let dir = temp_dir("disallowed");
-        let worker = CommandWorker::new(
-            "fake",
-            strs(&["sh", "-c", "printf sneaky > \"$HEX_EMIT_FILE\""]),
-        );
-        let outcome = worker.run(&request(&dir, &["ready"]));
-        assert!(outcome.error.is_some());
-    }
-
-    #[test]
-    fn no_emit_is_implicit_completion() {
+    fn a_clean_exit_with_no_message_reports_no_result() {
         let dir = temp_dir("silent");
-        // A clean exit with no emit is not an error — it's implicit completion.
+        // A clean exit with no capture is not an error — the runtime decides
+        // whether a missing verdict is implicit completion or a failed attempt.
         let worker = CommandWorker::new("fake", strs(&["true"]));
-        let outcome = worker.run(&request(&dir, &["ready"]));
-        assert_eq!(outcome.signal, None);
+        let outcome = worker.run(&request(&dir));
+        assert_eq!(outcome.result, None);
         assert_eq!(outcome.error, None);
     }
 
@@ -1586,8 +1532,7 @@ mod tests {
             strs(&["sh", "-c", "printf 'the plan' > \"$HEX_RESULT_FILE\""]),
         )
         .with_result_capture(Some(ResultCapture::File));
-        let outcome = worker.run(&request(&dir, &[]));
-        assert_eq!(outcome.signal, None, "no emit → implicit completion");
+        let outcome = worker.run(&request(&dir));
         assert_eq!(outcome.result.as_deref(), Some("the plan"));
         assert_eq!(outcome.error, None);
     }
@@ -1606,7 +1551,7 @@ mod tests {
             ]),
         )
         .with_result_capture(Some(ResultCapture::File));
-        let outcome = worker.run(&request(&dir, &[]));
+        let outcome = worker.run(&request(&dir));
         let got = outcome.result.expect("captured env");
         let parts: Vec<&str> = got.split('|').collect();
         assert_eq!(parts[0], "t", "HEX_GRAPH is the graph name");
@@ -1622,39 +1567,28 @@ mod tests {
     }
 
     #[test]
-    fn result_and_signal_are_captured_together() {
+    fn a_result_and_a_verdict_are_captured_together() {
         let dir = temp_dir("result-signal");
         let worker = CommandWorker::new(
             "fake",
             strs(&[
                 "sh",
                 "-c",
-                "printf summary > \"$HEX_RESULT_FILE\"; printf approved > \"$HEX_EMIT_FILE\"",
+                "printf 'summary\\nVERDICT: approved' > \"$HEX_RESULT_FILE\"",
             ]),
         )
         .with_result_capture(Some(ResultCapture::File));
-        let outcome = worker.run(&request(&dir, &["approved"]));
-        assert_eq!(outcome.signal.as_deref(), Some("approved"));
-        assert_eq!(outcome.result.as_deref(), Some("summary"));
-    }
-
-    #[test]
-    fn signal_from_a_failed_process_is_rejected() {
-        let dir = temp_dir("nonzero");
-        let worker = CommandWorker::new(
-            "fake",
-            strs(&["sh", "-c", "printf ready > \"$HEX_EMIT_FILE\"; exit 3"]),
-        );
-        let outcome = worker.run(&request(&dir, &["ready"]));
-        assert!(outcome.signal.is_none());
-        assert!(outcome.error.unwrap().contains("nonzero"));
+        let outcome = worker.run(&request(&dir));
+        let result = outcome.result.expect("captured");
+        assert!(result.contains("summary"), "{result}");
+        assert!(result.contains("VERDICT: approved"), "{result}");
     }
 
     #[test]
     fn deadline_kills_a_slow_child() {
         let dir = temp_dir("deadline");
         let worker = CommandWorker::new("fake", strs(&["sh", "-c", "sleep 30"]));
-        let mut req = request(&dir, &["ready"]);
+        let mut req = request(&dir);
         req.deadline_ms = Some(100);
         let start = std::time::Instant::now();
         let outcome = worker.run(&req);
@@ -1672,7 +1606,7 @@ mod tests {
             "fake",
             strs(&["sh", "-c", "echo THE REVIEW IS DONE >&2; sleep 30"]),
         );
-        let mut req = request(&dir, &["ready"]);
+        let mut req = request(&dir);
         req.deadline_ms = Some(300);
         let outcome = worker.run(&req);
         assert!(outcome.timed_out);
@@ -1687,7 +1621,7 @@ mod tests {
     fn a_nonzero_exit_keeps_what_the_agent_already_wrote() {
         let dir = temp_dir("partial-crash");
         let worker = CommandWorker::new("fake", strs(&["sh", "-c", "echo PROGRESS; exit 3"]));
-        let outcome = worker.run(&request(&dir, &["ready"]));
+        let outcome = worker.run(&request(&dir));
         assert!(outcome.error.expect("failed").contains("exit 3"));
         let result = outcome.result.expect("the partial output is kept");
         assert!(result.contains("PROGRESS"), "{result}");
@@ -1733,7 +1667,8 @@ mod tests {
             "{argv}"
         );
         // Same for the worktree case: `--add-dir` is unavailable, so the writable
-        // root travels as config or the emit channel breaks under isolation.
+        // root travels as config or the run dir's result file is unwritable
+        // under isolation.
         let iso = w
             .command(Some(std::path::Path::new("/tmp/run")), Some("abc"))
             .join(" ");
@@ -1791,29 +1726,13 @@ mod tests {
         // A real classifier — never the blanket bypass the operator rejected.
         assert!(!c.contains("--dangerously-skip-permissions"), "{c}");
         assert!(c.contains("--permission-mode acceptEdits"), "{c}");
-        // The control channel (`hex emit`, a Bash call) must stay approvable.
+        // `Bash` (how the agent builds and tests) must stay approvable.
         assert!(c.contains("--allowedTools"), "{c}");
         assert!(c.contains("Bash"), "{c}");
         // …while the destructive/exfil set is denied.
         assert!(c.contains("--disallowedTools"), "{c}");
         assert!(c.contains("Bash(sudo:*)"), "{c}");
         assert!(c.contains("Bash(git push:*)"), "{c}");
-    }
-
-    #[test]
-    fn cap_result_bounds_the_final_value_including_the_marker() {
-        let big = "x".repeat(MAX_RESULT_BYTES * 2);
-        let capped = cap_result(big);
-        assert!(
-            capped.len() <= MAX_RESULT_BYTES,
-            "capped len {}",
-            capped.len()
-        );
-        assert!(capped.ends_with('…'));
-        // A multibyte char straddling the cut must not panic or corrupt.
-        let multi = "é".repeat(MAX_RESULT_BYTES);
-        let capped = cap_result(multi);
-        assert!(capped.len() <= MAX_RESULT_BYTES);
     }
 
     #[test]

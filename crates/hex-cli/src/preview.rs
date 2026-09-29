@@ -184,7 +184,6 @@ struct OwnedView {
     kind: NodeKind,
     worker: Option<String>,
     attempt_number: u32,
-    attempts_budget: Option<u32>,
     deadline_ms: Option<u64>,
     stdout_log: PathBuf,
     stderr_log: PathBuf,
@@ -198,7 +197,6 @@ impl From<&AttemptView> for OwnedView {
             kind: v.kind,
             worker: v.worker.clone(),
             attempt_number: v.attempt_number,
-            attempts_budget: v.attempts_budget,
             deadline_ms: v.deadline_ms,
             stdout_log: v.stdout_log.clone(),
             stderr_log: v.stderr_log.clone(),
@@ -343,7 +341,7 @@ fn render_footer(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The one-line status: `node · worker · attempt N/budget · ⣟ M:SS · M:SS left`.
+/// The one-line status: `node · worker · attempt N · ⣟ M:SS · M:SS left`.
 fn status_line(view: &OwnedView, elapsed: Duration, ticks: usize) -> String {
     let spin = SPINNER[ticks % SPINNER.len()];
     // Agent nodes show their worker; a gate/command shows its kind, not "gate".
@@ -352,9 +350,6 @@ fn status_line(view: &OwnedView, elapsed: Duration, ticks: usize) -> String {
         " {} · {} · attempt {}",
         view.node_id, actor, view.attempt_number
     );
-    if let Some(budget) = view.attempts_budget {
-        s.push_str(&format!("/{budget}"));
-    }
     s.push_str(&format!(" · {spin} {}", fmt_mmss(elapsed)));
     if let Some(deadline_ms) = view.deadline_ms {
         let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
@@ -602,7 +597,6 @@ mod tests {
             kind,
             worker: worker.map(str::to_owned),
             attempt_number: 2,
-            attempts_budget: Some(8),
             deadline_ms,
             stdout_log: PathBuf::new(),
             stderr_log: PathBuf::new(),
@@ -691,7 +685,7 @@ mod tests {
             Duration::from_secs(47),
             0,
         );
-        assert!(s.contains("build · codex · attempt 2/8"), "got: {s}");
+        assert!(s.contains("build · codex · attempt 2"), "got: {s}");
         assert!(s.contains("0:47"), "elapsed timer: {s}");
         // 300_000ms budget − 47_000ms elapsed = 253s = 4:13.
         assert!(s.contains("4:13 left"), "countdown: {s}");
@@ -705,7 +699,7 @@ mod tests {
             Duration::from_secs(5),
             0,
         );
-        assert!(c.contains("build · command · attempt 2/8"), "got: {c}");
+        assert!(c.contains("build · command · attempt 2"), "got: {c}");
         assert!(!c.contains("left"), "no countdown without a deadline: {c}");
     }
 

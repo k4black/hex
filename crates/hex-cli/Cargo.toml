@@ -18,8 +18,10 @@ clap = { workspace = true }
 serde_json = { workspace = true }
 ratatui = { workspace = true }
 anstyle = { workspace = true }
+anstream = { workspace = true }
 anstyle-query = { workspace = true }
 unicode-width = { workspace = true }
+humantime = { workspace = true }
 crossterm = { workspace = true }
 
 [dev-dependencies]

@@ -5,11 +5,9 @@
 //! and crash recovery. The kernel decides *what*; the runtime is the only
 //! layer that *does*.
 //!
-//! Clients (CLI, MCP, dashboard) are thin peers over [`Runtime`]: they parse
+//! Clients (today, the CLI) are thin peers over [`Runtime`]: they parse
 //! arguments and render, and every fact they show is one this layer computed.
-//! There was a `RuntimeClient` trait here for a future `Remote` client; it had
-//! one implementation and no callers, so it was deleted — a trait is cheaper to
-//! re-derive from a second implementation than to keep honest without one.
+//! (No `RuntimeClient` trait: one implementation, no callers — deleted 2026-08-01.)
 
 pub mod config;
 pub mod control;
@@ -19,7 +17,9 @@ pub mod error;
 pub mod interrupt;
 pub mod journal;
 pub mod loader;
+pub mod local_log;
 pub mod preset;
+pub mod stats;
 #[cfg(test)]
 mod test_support;
 pub mod workers;
@@ -54,6 +54,9 @@ use journal::Journal;
 const WT_SLOT: &str = "worktree.slot";
 const WT_BRANCH: &str = "worktree.branch";
 const WT_BASE_REF: &str = "worktree.base_ref";
+/// The resolved graph origin (`built-in:<name>` or a path), recorded so a
+/// resumed or cancelled run's stats line keeps the original classification.
+const ORIGIN: &str = "origin";
 
 /// The outcome of starting or resuming a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,28 +70,38 @@ pub struct RunReport {
     pub disposition: Option<Disposition>,
 }
 
+/// What `hex prune` removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Run ids whose directories were removed.
+    pub removed: Vec<String>,
+    /// Run ids deliberately kept (still live, or younger than the cutoff).
+    pub kept: Vec<String>,
+    /// Bytes reclaimed from run directories.
+    pub bytes: u64,
+}
+
 /// One row of `hex runs`: enough to pick a run out of a list without opening it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunSummary {
     /// The run's id.
     pub run_id: String,
-    /// Lifecycle status, or `None` if the run could not be replayed.
-    pub status: Option<Status>,
+    /// The one runtime-facing state: live, interrupted, finished, or unreadable.
+    /// It folds in what used to be three separate fields (`status`, `disposition`,
+    /// `error`) because they all answered the same question.
+    pub state: Liveness,
+    /// Whether a `live` run is still ticking. The lock proves a *process* is
+    /// alive; only a fresh heartbeat proves it is progressing. Meaningless for
+    /// any state other than [`Liveness::Live`].
+    pub hung: bool,
     /// The active node, if any.
     pub current: Option<String>,
     /// Attempts started so far.
     pub attempts: u32,
-    /// Terminal disposition, if finished.
-    pub disposition: Option<Disposition>,
-    /// What can be concluded about the driving process (lock + heartbeat).
-    pub liveness: Liveness,
     /// When the run was created (Unix epoch ms).
     pub created_at_ms: u64,
     /// When the journal last grew (Unix epoch ms) — the run's true "age".
     pub updated_at_ms: u64,
-    /// Why the run could not be replayed, when `status` is `None`. A listing must
-    /// still show a broken run: hiding it is how a run gets lost.
-    pub error: Option<String>,
 }
 
 /// Whether a cancellation was applied directly or handed to a live driver.
@@ -245,6 +258,11 @@ pub struct Runtime {
     config: Config,
     workers: Workers,
     sink: Option<Box<dyn ProgressSink>>,
+    /// Whether finished runs append to the user-global `~/.hex/stats.jsonl`.
+    /// On for the real constructor, off for `with_workers`: the test suite runs
+    /// thousands of mock attempts, and before this gate they all landed in the
+    /// operator's own stats (found as `implement ×666` in a real `hex stats`).
+    stats: bool,
 }
 
 impl Runtime {
@@ -261,11 +279,12 @@ impl Runtime {
             config,
             workers,
             sink: None,
+            stats: true,
         })
     }
 
     /// Build a runtime with an explicit worker registry (used by tests to
-    /// inject mocks instead of real agent CLIs).
+    /// inject mocks instead of real agent CLIs). Never writes usage stats.
     #[must_use]
     pub fn with_workers(root: PathBuf, config: Config, workers: Workers) -> Self {
         Self {
@@ -273,6 +292,7 @@ impl Runtime {
             config,
             workers,
             sink: None,
+            stats: false,
         }
     }
 
@@ -460,60 +480,7 @@ impl Runtime {
         name: Option<&str>,
         isolation: &Isolation,
     ) -> Result<RunReport> {
-        self.start_run(reference, prompt, name, isolation, None)
-    }
-
-    /// Reserve a run id and directory without driving anything.
-    ///
-    /// `hex run --detach` needs the id *before* the driving process exists: it is
-    /// what the launcher prints, and it names the directory the child's stdio is
-    /// redirected into. Resolving and compiling here also means a bad graph, a
-    /// missing prompt, or an uninstalled agent CLI fails in the foreground rather
-    /// than in a detached child nobody is watching.
-    ///
-    /// # Errors
-    /// Fails on the same conditions as [`Runtime::start`], before any run exists.
-    pub fn reserve(
-        &self,
-        reference: &str,
-        prompt: Option<&str>,
-        name: Option<&str>,
-    ) -> Result<(String, PathBuf)> {
-        let resolved = preset::resolve(reference, &self.root)?;
-        let graph = self.prepare(&resolved.source, prompt)?;
-        self.new_run(&graph.name, name)
-    }
-
-    /// Drive a run whose id and directory were already reserved by a launcher.
-    ///
-    /// # Errors
-    /// Fails if the reservation is unusable, or on the same conditions as
-    /// [`Runtime::start`].
-    pub fn start_reserved(
-        &self,
-        run_id: &str,
-        reference: &str,
-        prompt: Option<&str>,
-        isolation: &Isolation,
-    ) -> Result<RunReport> {
-        let run_dir = self.run_dir(run_id)?;
-        if !run_dir.is_dir() {
-            return Err(HexError::new(format!(
-                "run `{run_id}` was not reserved (no run directory)"
-            )));
-        }
-        if run_dir.join("events.jsonl").exists() {
-            return Err(HexError::new(format!(
-                "run `{run_id}` already has a journal — use `resume`, never a second start"
-            )));
-        }
-        self.start_run(
-            reference,
-            prompt,
-            None,
-            isolation,
-            Some((run_id.to_owned(), run_dir)),
-        )
+        self.start_run(reference, prompt, name, isolation)
     }
 
     /// Compile `source` and refuse everything that must not reach a run: an
@@ -539,17 +506,13 @@ impl Runtime {
         prompt: Option<&str>,
         name: Option<&str>,
         isolation: &Isolation,
-        reserved: Option<(String, PathBuf)>,
     ) -> Result<RunReport> {
         // Resolve the source exactly once, then compile that same text — no
         // second resolution that could observe a changed file (TOCTOU).
         let resolved = preset::resolve(reference, &self.root)?;
         let graph = self.prepare(&resolved.source, prompt)?;
 
-        let (run_id, run_dir) = match reserved {
-            Some(pair) => pair,
-            None => self.new_run(&graph.name, name)?,
-        };
+        let (run_id, run_dir) = self.new_run(&graph.name, name)?;
         std::fs::create_dir_all(run_dir.join("attempts"))?;
         let _lock = RunLock::acquire(&run_dir)?;
 
@@ -558,6 +521,7 @@ impl Runtime {
         let mut inputs: BTreeMap<String, String> = prompt
             .map(|p| BTreeMap::from([("prompt".to_owned(), p.to_owned())]))
             .unwrap_or_default();
+        inputs.insert(ORIGIN.to_owned(), resolved.origin.clone());
         let mut workdir = self.root.clone();
         let mut worktree_ctx = None;
         let mut slot = None;
@@ -569,10 +533,10 @@ impl Runtime {
                 leased.dir.to_string_lossy().into_owned(),
             );
             inputs.insert(WT_BRANCH.to_owned(), leased.branch.clone());
-            inputs.insert(WT_BASE_REF.to_owned(), leased.base_ref.clone());
+            inputs.insert(WT_BASE_REF.to_owned(), leased.base_sha.clone());
             worktree_ctx = Some(driver::WorktreeCtx {
                 branch: leased.branch.clone(),
-                base_ref: leased.base_ref.clone(),
+                base_sha: leased.base_sha.clone(),
             });
             slot = Some(leased);
         }
@@ -628,6 +592,22 @@ impl Runtime {
         session.record(None, None, Actor::runtime(), EventBody::RunStarted)?;
 
         let disposition = session.drive()?;
+        // Record the run's cross-repo facts at RunFinished only — a paused run's
+        // line is written by whichever resume finishes it. Best-effort:
+        // telemetry must never fail a run.
+        if let Some(d) = disposition
+            && self.stats
+        {
+            let branch = slot.as_ref().map(|s| s.branch.clone());
+            stats::record_run(
+                &self.root,
+                &graph.name,
+                &resolved.origin,
+                branch.as_deref(),
+                d,
+                session.state(),
+            );
+        }
         drop(slot); // release the worktree lock only after the run finishes
         Ok(RunReport {
             run_id,
@@ -650,9 +630,9 @@ impl Runtime {
             ));
         }
         worktree::ensure_gitignored(&self.root, ".hex/worktrees/")?;
-        let (base_ref, base_sha) = worktree::resolve_base(&self.root, base)?;
+        let (_base_ref, base_sha) = worktree::resolve_base(&self.root, base)?;
         let branch = format!("hex/{run_id}");
-        let slot = worktree::lease(&self.root, &branch, &base_ref, &base_sha)?;
+        let slot = worktree::lease(&self.root, &branch, &base_sha)?;
         if slot.warmup_needed && !init.is_empty() {
             worktree::run_warmup(&slot.dir, init, run_dir)?;
         }
@@ -683,6 +663,11 @@ impl Runtime {
         let created = run_created(&events);
         let inputs = created.as_ref().map(|(_, inputs, _, _)| inputs);
         let prompt = inputs.and_then(|i| i.get("prompt").cloned());
+        // The origin recorded at creation, so a resumed built-in still counts as
+        // one. Runs older than the key fall back to a marker.
+        let origin = inputs
+            .and_then(|i| i.get(ORIGIN).cloned())
+            .unwrap_or_else(|| format!("resume:{run_id}"));
         let mut workdir = self.root.clone();
         let mut worktree_ctx = None;
         // Held for the run's duration (released on drop / crash); never read.
@@ -697,7 +682,7 @@ impl Runtime {
                     HexError::new("run recorded a worktree but no branch — journal is corrupt")
                 })?
                 .clone();
-            let base_ref = inputs
+            let base_sha = inputs
                 .and_then(|i| i.get(WT_BASE_REF))
                 .cloned()
                 .unwrap_or_default();
@@ -706,13 +691,16 @@ impl Runtime {
                 Path::new(slot_dir),
                 &branch,
             )?);
-            worktree_ctx = Some(driver::WorktreeCtx { branch, base_ref });
+            worktree_ctx = Some(driver::WorktreeCtx { branch, base_sha });
             workdir = PathBuf::from(slot_dir);
         }
         let (graph, state) = self.verify_and_fold(run_id, &events)?;
         check_workers(&graph, &self.workers)?;
         doctor::preflight(&graph, &self.workers)?;
 
+        // Captured before `worktree_ctx` moves into the session; the stats line
+        // written at the end still needs them.
+        let resumed_branch = worktree_ctx.as_ref().map(|c| c.branch.clone());
         let mut session = Session::new(
             &graph,
             &self.workers,
@@ -760,6 +748,20 @@ impl Runtime {
         }
 
         let disposition = session.drive()?;
+        // At RunFinished only, like `start`: a pause writes no line, and the
+        // visits are cumulative, so one finished run folds to one line.
+        if let Some(d) = disposition
+            && self.stats
+        {
+            stats::record_run(
+                &self.root,
+                &graph.name,
+                &origin,
+                resumed_branch.as_deref(),
+                d,
+                session.state(),
+            );
+        }
         Ok(RunReport {
             run_id: run_id.to_owned(),
             origin: format!("resume:{run_id}"),
@@ -773,18 +775,14 @@ impl Runtime {
     /// Fails if the run does not exist or cannot be replayed.
     pub fn status(&self, run_id: &str) -> Result<StatusReport> {
         let run_dir = self.run_dir(run_id)?;
-        // The same distinction `hex runs` makes, and for the same reason: a
-        // detached run is reserved a moment before its driver writes anything, and
-        // reporting "not found" in that window sends an operator looking for a run
+        // Look at the directory, not the journal: reporting "not found" for a run
+        // whose first event has not landed yet sends an operator looking for a run
         // that exists. Only a missing *directory* means missing.
         if !run_dir.is_dir() {
             return Err(HexError::new(format!("run `{run_id}` not found")));
         }
-        let events = journal::read_all(&run_dir.join("events.jsonl")).map_err(|_| {
-            HexError::new(format!(
-                "run `{run_id}` has no journal yet (reserved, or never started)"
-            ))
-        })?;
+        let events = journal::read_all(&run_dir.join("events.jsonl"))
+            .map_err(|_| HexError::new(format!("run `{run_id}` has no journal yet")))?;
         let (_, state) = self.verify_and_fold(run_id, &events)?;
         // What is happening *right now*, which is what an operator watching a live
         // loop is asking. The projection knows an attempt is in flight; only the
@@ -805,8 +803,8 @@ impl Runtime {
                 started_at_ms: started.at_ms,
             })
         });
-        // A run parked on a `human` node is *waiting on you*, and used to report a
-        // bare `running` with the question visible only through `hex watch`.
+        // A run parked on a `human` node is *waiting on you*; surface the
+        // question here rather than reporting a bare `running`.
         let question = state.asked.as_ref().and_then(|node| {
             events.iter().rev().find_map(|e| match &e.body {
                 EventBody::HumanRequested { prompt } if e.node_id.as_ref() == Some(node) => {
@@ -990,26 +988,52 @@ impl Runtime {
     /// Fails if the run does not exist or cannot be appended to.
     pub fn cancel(&self, run_id: &str, actor: &Actor) -> Result<Cancellation> {
         let run_dir = self.run_dir(run_id)?;
-        // Taking the same exclusive lock a driver holds proves no live process is
-        // writing, and holding it makes the append atomic w.r.t. a concurrent
-        // resume. `acquire` fails cleanly if the run is active.
-        let Ok(lock) = RunLock::acquire(&run_dir) else {
-            self.control(run_id, actor, &Command::Cancel)?;
-            return Ok(Cancellation::Requested);
-        };
-        // A reserved run whose driver has not started yet has no journal to
-        // append to, so the cancel waits in its inbox instead — the driver
-        // consumes it at its very first boundary, before any attempt runs.
-        if !run_dir.join("events.jsonl").exists() {
-            drop(lock);
+        // Read the journal FIRST, before probing the lock. A finished run needs
+        // no lock — the terminal event is already there — and the probe is the
+        // flaky path: a just-released `fs4` lock intermittently still reads as
+        // busy under load (gotcha 24), which made `hex cancel` right after a run
+        // ended queue a command instead of recording.
+        let journal_path = run_dir.join("events.jsonl");
+        if !journal_path.exists() {
+            // No journal to append to (the writer died between creating the run
+            // directory and its first event): the cancel waits in the inbox, where
+            // a driver would consume it at its first boundary.
             self.control(run_id, actor, &Command::Cancel)?;
             return Ok(Cancellation::Requested);
         }
-        let _lock = lock;
+        let events = journal::read_all(&journal_path)?;
+        // One fold answers both questions: is there anything left to do, and could
+        // a driver be holding the lock?
+        let folded = self.verify_and_fold(run_id, &events);
+        if matches!(&folded, Ok((_, s)) if s.is_finished()) {
+            return Ok(Cancellation::Recorded);
+        }
+        // Taking the same exclusive lock a driver holds proves no live process is
+        // writing, and holding it makes the append atomic w.r.t. a concurrent
+        // resume. A *paused* run has no driver left to hand the command to, so a
+        // busy probe there is usually the fs4 flake (gotcha 24) — retry briefly
+        // before believing it. If it stays busy, a real writer (a concurrent
+        // `resume`) holds it: queue, never append beside another writer.
+        let suspended = matches!(&folded, Ok((_, s)) if matches!(s.status, Status::Paused));
+        let mut lock = RunLock::acquire(&run_dir);
+        for _ in 0..4 {
+            if lock.is_ok() || !suspended {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            lock = RunLock::acquire(&run_dir);
+        }
+        let _lock = match lock {
+            Ok(lock) => lock,
+            Err(_) => {
+                self.control(run_id, actor, &Command::Cancel)?;
+                return Ok(Cancellation::Requested);
+            }
+        };
         // One scan: open the writer (repairs a torn tail, returns events), then
         // verify + fold those same events.
-        let (mut journal, events) = Journal::open_append(run_dir.join("events.jsonl"))?;
-        let (_, state) = self.verify_and_fold(run_id, &events)?;
+        let (mut journal, events) = Journal::open_append(journal_path)?;
+        let (graph, state) = self.verify_and_fold(run_id, &events)?;
         if state.is_finished() {
             return Ok(Cancellation::Recorded);
         }
@@ -1036,6 +1060,23 @@ impl Runtime {
                 disposition: Disposition::Cancelled,
             },
         )?;
+        // This is the run's one RunFinished, so its stats line is written here.
+        if self.stats {
+            let inputs = run_created(&events).map(|(_, inputs, _, _)| inputs);
+            let get = |key| {
+                inputs
+                    .as_ref()
+                    .and_then(|i: &BTreeMap<_, String>| i.get(key).cloned())
+            };
+            stats::record_run(
+                &self.root,
+                &graph.name,
+                get(ORIGIN).as_deref().unwrap_or("unknown"),
+                get(WT_BRANCH).as_deref(),
+                Disposition::Cancelled,
+                &state,
+            );
+        }
         Ok(Cancellation::Recorded)
     }
 
@@ -1048,9 +1089,9 @@ impl Runtime {
     /// be written.
     pub fn control(&self, run_id: &str, actor: &Actor, command: &Command) -> Result<()> {
         let run_dir = self.run_dir(run_id)?;
-        // The *directory* is the existence test, not the journal: a detached run
-        // is reserved a moment before its driver writes anything, and `hex steer`
-        // one keystroke later must queue rather than claim the run is missing.
+        // The *directory* is the existence test, not the journal: a run whose
+        // first event has not landed yet still exists, and `hex steer` one
+        // keystroke later must queue rather than claim the run is missing.
         if !run_dir.is_dir() {
             return Err(HexError::new(format!("run `{run_id}` not found")));
         }
@@ -1075,22 +1116,80 @@ impl Runtime {
     /// # Errors
     /// Fails only if `.hex/runs` exists but cannot be read.
     pub fn list_runs(&self) -> Result<Vec<RunSummary>> {
-        let runs = self.runs_dir();
-        let entries = match std::fs::read_dir(&runs) {
+        let mut out: Vec<RunSummary> = self
+            .run_dirs()?
+            .iter()
+            .map(|(run_id, dir)| self.summarize(run_id, dir))
+            .collect();
+        out.sort_by_key(|r| std::cmp::Reverse(r.updated_at_ms));
+        Ok(out)
+    }
+
+    /// Every run directory under `.hex/runs`, as `(run id, path)`. A missing
+    /// `runs` dir is empty, not an error; an entry whose name is not a legal run
+    /// id is not ours. Order is the filesystem's — callers sort.
+    fn run_dirs(&self) -> Result<Vec<(String, PathBuf)>> {
+        let entries = match std::fs::read_dir(self.runs_dir()) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
-        let mut out = Vec::new();
-        for entry in entries.filter_map(std::result::Result::ok) {
-            let run_id = entry.file_name().to_string_lossy().into_owned();
-            if validate_run_id(&run_id).is_err() || !entry.path().is_dir() {
+        Ok(entries
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| {
+                let run_id = entry.file_name().to_string_lossy().into_owned();
+                let dir = entry.path();
+                (validate_run_id(&run_id).is_ok() && dir.is_dir()).then_some((run_id, dir))
+            })
+            .collect())
+    }
+
+    /// Remove finished and interrupted run directories older than `older_than`,
+    /// releasing any worktree slot their lease names. A `live` run is never
+    /// touched; `all` additionally removes runs whose journal is unreadable.
+    /// `older_than = None` means no age filter.
+    ///
+    /// # Errors
+    /// Fails only if `.hex/runs` exists but cannot be read or a directory cannot
+    /// be removed.
+    pub fn prune(&self, older_than: Option<std::time::Duration>, all: bool) -> Result<PruneReport> {
+        let now_ms = journal::now_ms();
+        let max_age_ms = older_than.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let mut report = PruneReport::default();
+        for (run_id, dir) in self.run_dirs()? {
+            let summary = self.summarize(&run_id, &dir);
+            let removable = match &summary.state {
+                Liveness::Finished(_) | Liveness::Interrupted => true,
+                Liveness::Error(_) => all,
+                Liveness::Live => false,
+            };
+            let too_young =
+                max_age_ms.is_some_and(|max| now_ms.saturating_sub(summary.updated_at_ms) < max);
+            if !removable || too_young {
+                report.kept.push(run_id);
                 continue;
             }
-            out.push(self.summarize(&run_id, &entry.path()));
+            // Hold the run lock through deletion: a `resume` that started after
+            // the liveness probe above would otherwise be writing a journal we
+            // are removing. Also the only check an unreadable (`Error`) run gets.
+            let Ok(_lock) = RunLock::acquire(&dir) else {
+                report.kept.push(run_id);
+                continue;
+            };
+            // Release the slot the run leased — only if it is still on this
+            // run's branch and no live run holds it.
+            if let Ok(events) = self.events(&run_id)
+                && let Some((_, inputs, _, _)) = run_created(&events)
+                && let Some(slot) = inputs.get(WT_SLOT)
+                && let Some(branch) = inputs.get(WT_BRANCH)
+            {
+                let _ = worktree::release_slot(&self.root, Path::new(slot), branch);
+            }
+            report.bytes += dir_size(&dir);
+            std::fs::remove_dir_all(&dir)?;
+            report.removed.push(run_id);
         }
-        out.sort_by_key(|r| std::cmp::Reverse(r.updated_at_ms));
-        Ok(out)
+        Ok(report)
     }
 
     /// One run's summary, including whether a process is still driving it — what
@@ -1111,65 +1210,70 @@ impl Runtime {
         let events = journal::read_all(&run_dir.join("events.jsonl")).unwrap_or_default();
         let created_at_ms = events.first().map_or(0, |e| e.at_ms);
         let updated_at_ms = events.last().map_or(0, |e| e.at_ms);
-        let (status, current, attempts, disposition, error) =
-            match self.verify_and_fold(run_id, &events) {
-                Ok((_, state)) => (
-                    Some(state.status.clone()),
-                    state.current.clone(),
-                    state.attempts_total,
-                    state.disposition(),
-                    None,
-                ),
-                // A journal-less run is normal for a moment (a detached run between
-                // reservation and its driver's first write), so say that rather than
-                // reporting the generic replay failure.
-                Err(_) if events.is_empty() => (
-                    None,
-                    None,
-                    0,
-                    None,
-                    Some("no journal yet (reserved, or never started)".to_owned()),
-                ),
-                Err(e) => (None, None, 0, None, Some(e.to_string())),
-            };
-        RunSummary {
-            run_id: run_id.to_owned(),
-            liveness: liveness_of(run_dir, status.as_ref()),
-            status,
-            current,
-            attempts,
-            disposition,
-            created_at_ms,
-            updated_at_ms,
-            error,
+        // An unreadable journal is a *state*, not a missing field: a listing still
+        // shows the run (hiding it is how a run gets lost) and `hex status` prints
+        // why. A run directory with no journal at all — the writer died between
+        // creating the directory and appending its first event — is the same case
+        // with a plainer message.
+        match self.verify_and_fold(run_id, &events) {
+            Ok((_, kernel)) => {
+                let (state, hung) = liveness_of(run_dir, &kernel.status);
+                RunSummary {
+                    run_id: run_id.to_owned(),
+                    state,
+                    hung,
+                    current: kernel.current.clone(),
+                    attempts: kernel.attempts_total,
+                    created_at_ms,
+                    updated_at_ms,
+                }
+            }
+            Err(e) => RunSummary {
+                run_id: run_id.to_owned(),
+                state: Liveness::Error(if events.is_empty() {
+                    "no journal yet (a run directory with no events)".to_owned()
+                } else {
+                    e.to_string()
+                }),
+                hung: false,
+                current: None,
+                attempts: 0,
+                created_at_ms,
+                updated_at_ms,
+            },
         }
     }
 }
 
-/// Classify a run's process from its lock and heartbeat.
+/// Classify a run from its journal, its lock and its beacon.
 ///
 /// The lock is the primary signal because the OS releases it when the holder
 /// dies — a pidfile cannot promise that, and PID reuse is real. The heartbeat
-/// only refines "a process is alive" into "and it is still ticking".
-fn liveness_of(run_dir: &Path, status: Option<&Status>) -> Liveness {
-    match status {
-        Some(Status::Finished(_)) => return Liveness::Finished,
-        Some(Status::Paused) => return Liveness::Paused,
-        _ => {}
+/// only refines "a process is alive" into "and it is still ticking", which is
+/// why `hung` is a diagnostic beside [`Liveness::Live`] rather than a state of
+/// its own: the operator action is identical either way.
+///
+/// A paused run needs no special case: `hex pause` returns the driver, so the lock
+/// is free and the run is `Interrupted` by the same rule that catches a crash.
+fn liveness_of(run_dir: &Path, status: &Status) -> (Liveness, bool) {
+    if let Status::Finished(d) = status {
+        return (Liveness::Finished(*d), false);
     }
     // Probing takes the lock for an instant; dropping it immediately is the whole
     // test ("could anyone else have it?").
     match try_lock_file(&run_dir.join("run.lock")) {
-        Ok(Some(_free)) => Liveness::Abandoned,
-        Ok(None) => match control::last_beat_ms(run_dir) {
-            Some(beat) if journal::now_ms().saturating_sub(beat) <= control::HEARTBEAT_STALE_MS => {
-                Liveness::Live
-            }
-            _ => Liveness::Hung,
-        },
+        // Nobody holds it and the run is unfinished: paused, Ctrl-C'd, or crashed.
+        Ok(Some(_free)) => (Liveness::Interrupted, false),
+        // A process holds it — live, whether or not it is still ticking.
+        Ok(None) => {
+            let fresh = control::last_beat_ms(run_dir).is_some_and(|beat| {
+                journal::now_ms().saturating_sub(beat) <= control::HEARTBEAT_STALE_MS
+            });
+            (Liveness::Live, !fresh)
+        }
         // Unreadable lock: report the conservative answer rather than guessing
         // that nobody is driving (which would invite a second writer).
-        Err(_) => Liveness::Hung,
+        Err(_) => (Liveness::Live, true),
     }
 }
 
@@ -1279,26 +1383,15 @@ fn slug(name: &str) -> String {
     out.trim_matches('-').to_owned()
 }
 
-/// Today's UTC date as `yyyy-MM-dd`, for the run-id prefix (dependency-free).
+/// Today's UTC date as `yyyy-MM-dd`, for the run-id prefix. UTC, not local: the
+/// prefix is a sort key, and a machine that changes timezone must not reorder
+/// its runs.
 fn today_utc() -> String {
-    let days = i64::try_from(journal::now_ms() / 1000 / 86_400).unwrap_or(0);
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-/// Convert days-since-Unix-epoch to a `(year, month, day)` civil date
-/// (Howard Hinnant's algorithm — valid for the proleptic Gregorian calendar).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    (y + i64::from(m <= 2), m, d)
+    let ms = i64::try_from(journal::now_ms()).unwrap_or(i64::MAX);
+    jiff::Timestamp::from_millisecond(ms)
+        .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+        .strftime("%Y-%m-%d")
+        .to_string()
 }
 
 /// An exclusive per-run lock enforcing the single-writer invariant: only one
@@ -1353,32 +1446,45 @@ pub(crate) fn try_lock_file(path: &Path) -> Result<Option<std::fs::File>> {
 /// sorts before `9-x` lexically, which would reorder the evidence of any node
 /// with ten or more steps.
 fn step_logs(attempt_dir: &Path) -> Vec<StepLog> {
+    step_dirs(attempt_dir)
+        .into_iter()
+        .map(|dir| StepLog {
+            stdout: std::fs::read_to_string(dir.join("stdout.log")).unwrap_or_default(),
+            stderr: std::fs::read_to_string(dir.join("stderr.log")).unwrap_or_default(),
+            exit: std::fs::read_to_string(dir.join("exit"))
+                .ok()
+                .map(|s| s.trim().to_owned()),
+            label: dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        })
+        .collect()
+}
+
+/// The numbered step directories under one attempt, in declared order. See
+/// [`step_logs`] for why the numeric prefix is parsed rather than sorted on.
+fn step_dirs(attempt_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(attempt_dir) else {
         return Vec::new();
     };
-    let mut steps: Vec<(u32, StepLog)> = entries
+    let mut steps: Vec<(u32, PathBuf)> = entries
         .flatten()
         .filter(|e| e.path().is_dir())
         .filter_map(|e| {
-            let label = e.file_name().to_string_lossy().into_owned();
-            let position = label.split_once('-')?.0.parse().ok()?;
-            Some((
-                position,
-                StepLog {
-                    stdout: std::fs::read_to_string(e.path().join("stdout.log"))
-                        .unwrap_or_default(),
-                    stderr: std::fs::read_to_string(e.path().join("stderr.log"))
-                        .unwrap_or_default(),
-                    exit: std::fs::read_to_string(e.path().join("exit"))
-                        .ok()
-                        .map(|s| s.trim().to_owned()),
-                    label,
-                },
-            ))
+            let position = e
+                .file_name()
+                .to_string_lossy()
+                .split_once('-')?
+                .0
+                .parse()
+                .ok()?;
+            Some((position, e.path()))
         })
         .collect();
-    steps.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.label.cmp(&b.1.label)));
-    steps.into_iter().map(|(_, s)| s).collect()
+    steps.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    steps.into_iter().map(|(_, dir)| dir).collect()
 }
 
 /// Every captured stream an attempt owns: its own two, then both of each
@@ -1388,19 +1494,7 @@ fn attempt_streams(attempt_dir: &Path) -> Vec<PathBuf> {
         attempt_dir.join("stdout.log"),
         attempt_dir.join("stderr.log"),
     ];
-    let Ok(entries) = std::fs::read_dir(attempt_dir) else {
-        return files;
-    };
-    let mut steps: Vec<(u32, PathBuf)> = entries
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            Some((name.split_once('-')?.0.parse().ok()?, e.path()))
-        })
-        .collect();
-    steps.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    for (_, dir) in steps {
+    for dir in step_dirs(attempt_dir) {
         files.push(dir.join("stdout.log"));
         files.push(dir.join("stderr.log"));
     }
@@ -1427,6 +1521,27 @@ fn read_span(path: &Path, offset: u64, len: u64) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Total bytes under `dir`, best-effort (an unreadable entry counts as 0).
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            total += dir_size(&path);
+        } else {
+            total += meta.len();
+        }
+    }
+    total
+}
+
 /// The project root for a runtime: the current working directory.
 ///
 /// # Errors
@@ -1447,12 +1562,13 @@ mod tests {
         assert_eq!(slug("---"), "");
     }
 
+    /// The run-id prefix is a path segment and a sort key, so its shape matters
+    /// more than today's value.
     #[test]
-    fn civil_from_days_matches_known_dates() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1)); // Unix epoch
-        assert_eq!(civil_from_days(31), (1970, 2, 1));
-        assert_eq!(civil_from_days(59), (1970, 3, 1)); // 1970 not a leap year
-        assert_eq!(civil_from_days(20_454), (2026, 1, 1));
+    fn today_utc_is_a_sortable_iso_date() {
+        let today = today_utc();
+        assert_eq!(today.len(), 10, "{today}");
+        assert!(validate_run_id(&today).is_ok(), "{today}");
     }
 
     #[test]
@@ -1463,6 +1579,21 @@ mod tests {
         assert!(validate_run_id("a/b").is_err());
         assert!(validate_run_id("a.b").is_err());
         assert!(validate_run_id("").is_err());
+    }
+
+    /// Old journals may carry defaults keys that no longer exist (a run created
+    /// before the run-wide retry budgets were deleted recorded `attempts`). The
+    /// map is read by name, so an unknown key is ignored rather than rejecting
+    /// the journal — a resumed run must stay readable.
+    #[test]
+    fn an_unknown_recorded_default_is_ignored_on_read() {
+        let mut map = BTreeMap::new();
+        map.insert("role".to_owned(), "reviewer".to_owned());
+        map.insert("attempts".to_owned(), "8".to_owned());
+        map.insert("cycle_visits".to_owned(), "4".to_owned());
+        let defaults = defaults_from_map(&map);
+        assert_eq!(defaults.role.as_deref(), Some("reviewer"));
+        assert_eq!(defaults.context, None);
     }
 
     /// Ten steps is where a lexical sort silently reorders the evidence, so that

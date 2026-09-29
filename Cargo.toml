@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"        # floor set by ratatui 0.30 (the live-preview TUI)
 license = "MIT"
@@ -29,6 +29,9 @@ sha2 = "0.10"
 fs4 = { version = "1", features = ["sync"] }   # OS advisory file locks (maintained fs2 successor)
 uuid = { version = "1", features = ["v4"] }    # collision-resistant run-id suffixes
 humantime = "2"              # parse `30m`/`2h`/`500ms` budget durations
+which = "8"                  # "is this agent CLI installed?" without spawning it
+# Calendar math for the `yyyy-MM-dd` run-id prefix. No tzdb: the prefix is UTC.
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 # Safe wrappers for the POSIX signal calls; `killpg` is what lets a timed-out
 # attempt take its whole process group down instead of orphaning grandchildren.
 # A safe wrapper, so the workspace's `unsafe_code = "forbid"` still holds.
@@ -37,16 +40,17 @@ nix = { version = "0.30", features = ["signal"] }
 # no `unsafe` and no async-signal-safety constraints). Already in the tree:
 # crossterm depends on it, so naming it directly adds no crates.
 signal-hook = "0.3"
-# inline-viewport TUI for the live run preview; unstable-rendered-line-info
-# provides Paragraph::line_count for wrapping inserted lines.
-# Terminal styling. All four are already in the tree (anstyle/anstyle-query via
-# clap, crossterm + unicode-width via ratatui), so naming them directly adds no
+# Terminal styling. All five are already in the tree (anstream/anstyle/
+# anstyle-query via clap, crossterm + unicode-width via ratatui), so naming them directly adds no
 # crates — and `anstyle::Style` is the *same* vocabulary clap paints `--help`
 # with, which is the only way help and output can look like one program.
 anstyle = "1"
+anstream = "1"               # only for `strip_str`: measure a painted cell's width
 anstyle-query = "1"          # NO_COLOR / CLICOLOR / CLICOLOR_FORCE / TERM=dumb
 unicode-width = "0.2"        # column width, not char count: `…` and `≥` are not 1 cell everywhere
-crossterm = { version = "0.29", default-features = false, features = ["events"] }   # terminal::size + key input for `hex dash`
+crossterm = { version = "0.29", default-features = false }   # terminal::size only
+# inline-viewport TUI for the live run preview; unstable-rendered-line-info
+# provides Paragraph::line_count for wrapping inserted lines.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 criterion = "0.7"
 # Dev-only: test the `hex` binary end-to-end.

@@ -88,17 +88,11 @@ fn accept_line(graph: &Graph, ui: Ui) -> Option<String> {
 
 fn budget_line(budget: &Budget, ui: Ui) -> String {
     let mut parts = Vec::new();
-    if let Some(a) = budget.attempts {
-        parts.push(format!("{a} attempts"));
-    }
     if let Some(ms) = budget.elapsed_ms {
         parts.push(format!("{} elapsed", human_ms(ms)));
     }
     if let Some(ms) = budget.attempt_elapsed_ms {
         parts.push(format!("{} per attempt", human_ms(ms)));
-    }
-    if let Some(v) = budget.cycle_visits {
-        parts.push(format!("{v} visits per node"));
     }
     if let Some(t) = budget.output_tokens {
         parts.push(format!("{t} generated tokens"));
@@ -340,8 +334,9 @@ fn cycle_note(topo: &Topology, t: &Transition) -> String {
 /// Every loop and the bound that stops it.
 ///
 /// The highest-value section in a design whose central rule is that every cycle
-/// is bounded: the validator already knows this and used to throw it away, so a
-/// reader could see that a graph loops but not what stops it looping.
+/// is bounded: a reader could see that a graph loops but not what stops it
+/// looping. The bound is always a node's `visits`, because that is the only
+/// bound there is.
 fn cycles(out: &mut String, topo: &Topology, ui: Ui) {
     if topo.cycles.is_empty() {
         return;
@@ -379,7 +374,7 @@ fn cycles(out: &mut String, topo: &Topology, ui: Ui) {
             "  {}\n",
             ui.paint(
                 style::FAIL,
-                &format!("{unbounded} UNBOUNDED — validation rejects this")
+                &format!("{unbounded} UNBOUNDED — no visit bound stops this loop")
             )
         ));
     }
@@ -422,100 +417,4 @@ fn human_ms(ms: u64) -> String {
         ms if ms % 1_000 == 0 => format!("{}s", ms / 1_000),
         ms => format!("{ms}ms"),
     }
-}
-
-/// The graph as a machine-readable document.
-///
-/// The value a client cannot compute for itself is **edge classification**:
-/// which transitions close a loop, which loops exist, and what bounds each one.
-/// Everything else is a faithful dump of the compiled IR — the previous version
-/// emitted only node ids and kinds, dropping budgets, roles, acceptance and
-/// every bound.
-pub fn to_json(graph: &Graph, topo: &Topology, origin: &str) -> serde_json::Value {
-    let nodes: Vec<_> = topo
-        .order
-        .iter()
-        .chain(topo.unreachable.iter())
-        .filter_map(|id| {
-            let node = graph.node(id)?;
-            let mut v = serde_json::json!({
-                "id": id,
-                "kind": node.spec.kind().as_str(),
-                "entry": *id == graph.entry,
-                "gate": graph.is_gate(id),
-                "reachable": !topo.unreachable.contains(id),
-                "rank": topo.rank.get(id),
-                "max_visits": node.max_visits,
-            });
-            match &node.spec {
-                NodeSpec::Agent {
-                    worker,
-                    may_propose,
-                    context,
-                    read_only,
-                    ..
-                } => {
-                    v["agent"] = serde_json::json!({
-                        "role": worker,
-                        "may_propose": may_propose,
-                        "context": if *context == hex_runtime::Context::Continue {
-                            "continue"
-                        } else {
-                            "fresh"
-                        },
-                        "read_only": read_only,
-                    });
-                }
-                NodeSpec::Command { steps, mode } => {
-                    v["command"] = serde_json::json!({
-                        "mode": mode.as_str(),
-                        "steps": steps.iter().map(|s| serde_json::json!({
-                            "label": s.label(),
-                            "argv": s.argv,
-                        })).collect::<Vec<_>>(),
-                    });
-                }
-                NodeSpec::Human { prompt } => {
-                    v["human"] = serde_json::json!({ "prompt": prompt });
-                }
-                NodeSpec::Terminal { disposition } => {
-                    v["terminal"] = serde_json::json!({ "disposition": disposition.as_str() });
-                }
-            }
-            Some(v)
-        })
-        .collect();
-
-    serde_json::json!({
-        "name": graph.name,
-        "origin": origin,
-        "entry": graph.entry,
-        "budget": {
-            "attempts": graph.budget.attempts,
-            "elapsed_ms": graph.budget.elapsed_ms,
-            "attempt_elapsed_ms": graph.budget.attempt_elapsed_ms,
-            "cycle_visits": graph.budget.cycle_visits,
-            "output_tokens": graph.budget.output_tokens,
-        },
-        "accept": {
-            "require": graph.accept.require.iter()
-                .map(|r| serde_json::json!({"node": r.node, "signal": r.signal}))
-                .collect::<Vec<_>>(),
-            "on_unmet": graph.accept.on_unmet,
-        },
-        "order": topo.order,
-        "nodes": nodes,
-        "transitions": topo.transitions.iter().map(|t| serde_json::json!({
-            "from": t.from,
-            "on": t.on,
-            "to": t.to,
-            "class": if t.class == EdgeClass::Back { "back" } else { "forward" },
-            "implicit": t.is_reroute(),
-        })).collect::<Vec<_>>(),
-        "cycles": topo.cycles.iter().map(|c| serde_json::json!({
-            "nodes": c.nodes,
-            "via_reroute": c.via_reroute,
-            "bounded_by": c.bounded_by,
-        })).collect::<Vec<_>>(),
-    })
 }

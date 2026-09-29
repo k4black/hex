@@ -3,17 +3,14 @@
 //! A hex graph is cyclic by design (core rule 5 bounds cycles rather than
 //! banning them), so a plain topological sort does not apply. This module runs
 //! the standard "classify, break, layer" pipeline once, in the kernel, and hands
-//! the result to everyone who needs it: the text renderer, the mermaid and DOT
-//! exporters, `--format json`, and the validator's cycle check.
+//! the result to its consumers: the `hex graph` text renderer and the runtime's
+//! live progress strip.
 //!
-//! One implementation, deliberately. The renderer used to be free to invent its
-//! own idea of which edges close a loop, which is how a footer that says "cycle
-//! bounded by X" ends up disagreeing with the validator that accepted the graph
-//! (gotcha 26: a derived fact lives in exactly one place).
-//!
-//! The traversal walks explicit edges **and** [`Graph::implicit_reroutes`], for
-//! the same reason validation must: `a → done` with `accept.on_unmet: a` is
-//! edge-acyclic and still loops forever.
+//! The validator does **not** consume this: with every non-terminal node
+//! visit-bounded by the loader there is no cycle analysis left to run, and a
+//! rendering classifier could not express one anyway. Both this module and the
+//! validator walk the same single source, [`Graph::implicit_reroutes`], so they
+//! cannot disagree about which transitions are implicit (gotcha 26).
 
 use std::collections::BTreeMap;
 
@@ -61,7 +58,8 @@ pub struct Cycle {
     /// authored edge — worth saying, because it is invisible in the YAML.
     pub via_reroute: bool,
     /// The tightest bound that stops it, already resolved to a sentence. `None`
-    /// means nothing bounds it, which validation rejects (`E-unbounded-cycle`).
+    /// means no node on the loop carries a visit bound — only possible for a
+    /// hand-built IR, since the loader defaults every non-terminal node to one.
     pub bounded_by: Option<String>,
 }
 
@@ -298,33 +296,22 @@ fn terminal_weight(graph: &Graph, id: &str) -> u8 {
 ///
 /// Rendering *which* bound stops a loop is the highest-value line about a design
 /// whose central rule is that every cycle is bounded — "bounded" alone tells a
-/// reader nothing they can act on.
+/// reader nothing they can act on. The answer is always a per-node visit bound:
+/// the only bound there is.
 fn tightest_bound(graph: &Graph, nodes: &[String]) -> Option<String> {
-    // A per-node visit bound is the tightest thing there is: it stops this loop
-    // without touching any other.
-    let per_node = nodes
+    nodes
         .iter()
         .filter_map(|id| {
             let visits = graph.node(id)?.max_visits?;
             Some((visits, format!("{id} visits ≤ {visits}")))
         })
-        .min_by_key(|(visits, _)| *visits);
-    if let Some((_, phrase)) = per_node {
-        return Some(phrase);
-    }
-    if let Some(visits) = graph.budget.cycle_visits {
-        return Some(format!("budget.cycle_visits {visits}"));
-    }
-    graph
-        .budget
-        .attempts
-        .map(|attempts| format!("budget.attempts {attempts}"))
+        .min_by_key(|(visits, _)| *visits)
+        .map(|(_, phrase)| phrase)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::Budget;
 
     /// implement → review → done, review loops back, and `done` reroutes back on
     /// unmet acceptance: the flagship shape.
@@ -341,10 +328,8 @@ mod tests {
             .edge("implement", "ready_for_review", "review")
             .edge("review", "approved", "done")
             .edge("review", "changes_requested", "implement")
-            .budget(Budget {
-                attempts: Some(12),
-                ..Budget::default()
-            })
+            .max_visits("implement", 5)
+            .max_visits("review", 4)
             .require("review", "approved")
             .on_unmet("implement")
             .build()
@@ -401,22 +386,22 @@ mod tests {
         let t = Topology::of(&critique_loop());
         assert_eq!(t.cycles.len(), 2);
         assert_eq!(t.cycles[0].nodes, ["implement", "review"]);
-        assert_eq!(
-            t.cycles[0].bounded_by.as_deref(),
-            Some("budget.attempts 12")
-        );
+        assert_eq!(t.cycles[0].bounded_by.as_deref(), Some("review visits ≤ 4"));
         assert!(t.cycles[1].via_reroute);
         assert_eq!(t.cycles[1].nodes, ["implement", "review", "done"]);
     }
 
-    /// A per-node visit bound is tighter than the run-wide attempt budget, and
-    /// naming the wrong one would send a reader to the wrong knob.
+    /// The tightest bound on the loop is the one named — naming a looser one
+    /// would send a reader to the wrong knob.
     #[test]
-    fn a_per_node_visit_bound_wins_over_the_run_budget() {
+    fn the_tightest_visit_bound_on_the_loop_is_named() {
         let mut g = critique_loop();
-        g.nodes.get_mut("review").expect("review").max_visits = Some(4);
+        g.nodes.get_mut("implement").expect("implement").max_visits = Some(2);
         let t = Topology::of(&g);
-        assert_eq!(t.cycles[0].bounded_by.as_deref(), Some("review visits ≤ 4"));
+        assert_eq!(
+            t.cycles[0].bounded_by.as_deref(),
+            Some("implement visits ≤ 2")
+        );
     }
 
     /// The gutter must not claim a transition that does not exist.

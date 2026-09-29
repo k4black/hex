@@ -11,18 +11,18 @@ use assert_cmd::Command;
 use tempfile::TempDir;
 
 /// A fresh project dir with `.hex/graphs/`, plus a config whose `builder`
-/// worker just writes a `ready` signal to the emit file (no external agent).
+/// worker prints a `ready` verdict (no external agent).
 /// The returned `TempDir` owns the directory; keep it alive for the test.
 fn project() -> TempDir {
     let root = TempDir::new().expect("tempdir");
     let p = root.path();
     std::fs::create_dir_all(p.join(".hex").join("graphs")).expect("mkdir");
-    // `slowbuilder` takes long enough that a detached run is provably still
-    // working after its launcher has exited.
+    // `slowbuilder` takes long enough that a backgrounded run is provably still
+    // working while the shell that launched it has moved on.
     std::fs::write(
         p.join(".hex").join("config.yaml"),
-        "workers:\n  builder:\n    command: [sh, -c, 'printf ready > \"$HEX_EMIT_FILE\"']\n  \
-         slowbuilder:\n    command: [sh, -c, 'sleep 1; printf ready > \"$HEX_EMIT_FILE\"']\n",
+        "workers:\n  builder:\n    command: [sh, -c, 'echo \"VERDICT: ready\"']\n    result: text\n  \
+         slowbuilder:\n    command: [sh, -c, 'sleep 1; echo \"VERDICT: ready\"']\n    result: text\n",
     )
     .expect("config");
     std::fs::write(
@@ -32,7 +32,6 @@ fn project() -> TempDir {
 version: 1
 name: demo
 entry: build
-defaults: { budget: { attempts: 6 } }
 nodes:
   build: { agent: { worker: builder, prompt: "x", may_propose: [ready] }, on: { ready: test } }
   test:  { command: { run: [sh, -c, "exit 0"] }, on: { passed: done, failed: build } }
@@ -48,7 +47,6 @@ accept: { require: [test.passed] }
 version: 1
 name: promptdemo
 entry: build
-defaults: { budget: { attempts: 4 } }
 nodes:
   build: { agent: { worker: builder, prompt: "do {{prompt}}", may_propose: [ready] }, on: { ready: done } }
   done:  { terminal: succeeded }
@@ -64,7 +62,6 @@ accept: { require: [] }
 version: 1
 name: stepdemo
 entry: build
-defaults: { budget: { attempts: 4 } }
 nodes:
   build: { agent: { worker: builder, prompt: "x", may_propose: [ready] }, on: { ready: verify } }
   verify:
@@ -78,14 +75,15 @@ accept: { require: [verify.passed] }
 "#,
     )
     .expect("step graph");
-    // A graph slow enough to still be running when `--detach` returns.
+    // A graph slow enough to still be running when a backgrounded launcher
+    // returns.
     std::fs::write(
         p.join(".hex").join("graphs").join("slowdemo.yaml"),
         r#"
 version: 1
 name: slowdemo
 entry: build
-defaults: { budget: { attempts: 4, attempt: 30s } }
+defaults: { budget: { attempt: 30s } }
 nodes:
   build: { agent: { worker: slowbuilder, prompt: "x", may_propose: [ready] }, on: { ready: test } }
   test:  { command: { run: [sh, -c, "exit 0"] }, on: { passed: done, failed: build } }
@@ -98,7 +96,7 @@ accept: { require: [test.passed] }
 }
 
 /// Poll `hex status --json` until the run finishes, returning its disposition.
-/// Detached runs are the only asynchronous surface in the CLI, so every test that
+/// A backgrounded run is the only asynchronous surface, so every test that
 /// touches one needs a bounded wait rather than a sleep.
 fn await_disposition(dir: &Path, run_id: &str) -> String {
     for _ in 0..200 {
@@ -131,6 +129,42 @@ fn hex(dir: &Path, args: &[&str]) -> Output {
         .env("HOME", dir)
         .output()
         .expect("spawn hex")
+}
+
+/// Start `hex run <graph> --name <name>` as a background process — what a shell's
+/// `&` does — and return the child plus the run id it created.
+///
+/// There is no `--detach`: backgrounding is the caller's job, so a test that needs
+/// a *live* run does exactly what a user does — start the child, then find the run
+/// it started by name.
+fn background_run(dir: &Path, graph: &str, name: &str) -> (std::process::Child, String) {
+    let exe = assert_cmd::cargo::cargo_bin("hex");
+    let mut child = std::process::Command::new(exe)
+        .args(["run", graph, "--name", name, "--json"])
+        .current_dir(dir)
+        .env("HOME", dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn hex run in the background");
+    for _ in 0..200 {
+        let out = hex(dir, &["runs", "--json"]);
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout(&out).trim())
+            && let Some(id) = v["runs"].as_array().and_then(|rows| {
+                rows.iter()
+                    .find(|r| r["run_id"].as_str().is_some_and(|s| s.ends_with(name)))
+                    .and_then(|r| r["run_id"].as_str())
+            })
+        {
+            return (child, id.to_owned());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Reap before failing: a leaked `hex run` would keep writing a journal this
+    // temp project is about to delete.
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("the backgrounded run never appeared in `hex runs`");
 }
 
 fn stdout(o: &Output) -> String {
@@ -177,8 +211,6 @@ fn clap_rejects_bad_invocations_with_exit_2() {
         &["list", "--jsonn"][..],
         &["list", "extra"][..],
         &["run", "demo", "-p", "x", "-f", "y"][..],
-        // `dash` would busy-spin at a zero interval: reject it at parse time.
-        &["dash", "--interval", "0"][..],
     ] {
         let out = hex(dir.path(), args);
         assert_eq!(out.status.code(), Some(2), "expected exit 2 for {args:?}");
@@ -186,25 +218,20 @@ fn clap_rejects_bad_invocations_with_exit_2() {
 }
 
 #[test]
-fn dash_refuses_json_because_it_has_no_machine_mode() {
+fn graph_refuses_json_because_it_has_no_machine_mode() {
     let dir = project();
-    // `--json` promises machine output, but `dash` is a TUI. It must refuse
-    // (exit 2) and point a machine consumer at `hex runs --json`, not open the
-    // TUI or silently ignore the flag.
-    let out = hex(dir.path(), &["dash", "--json"]);
+    // `--json` promises machine output, but a graph's only machine form is its
+    // own YAML. It must refuse (exit 2) and point at `--format source` rather
+    // than dropping the flag or inventing a second shape.
+    let out = hex(dir.path(), &["graph", "demo", "--json"]);
     assert_eq!(out.status.code(), Some(2));
     let err = stderr(&out);
-    assert!(err.contains("no machine mode"), "stderr: {err}");
-    assert!(err.contains("hex runs --json"), "stderr: {err}");
-    // The exception must appear in the *short* help too, not only the long form,
-    // so `-h` cannot claim `dash` emits machine output.
-    let short = hex(dir.path(), &["dash", "-h"]);
-    assert!(short.status.success());
-    assert!(
-        stdout(&short).contains("every verb but `dash`"),
-        "short help states the json exception: {}",
-        stdout(&short)
-    );
+    assert!(err.contains("no machine form"), "stderr: {err}");
+    assert!(err.contains("--format source"), "stderr: {err}");
+    // And the machine form really is the graph's source.
+    let src = hex(dir.path(), &["graph", "demo", "--format", "source"]);
+    assert!(src.status.success(), "stderr: {}", stderr(&src));
+    assert!(stdout(&src).contains("name: demo"), "{}", stdout(&src));
 }
 
 #[test]
@@ -304,7 +331,7 @@ fn logs_show_final_message_by_default_and_full_output_with_flag() {
     // A worker that prints to stdout, captures a final message, then emits.
     std::fs::write(
         dir.path().join(".hex").join("config.yaml"),
-        "workers:\n  builder:\n    command: [sh, -c, 'echo HELLO-FROM-AGENT; printf FINAL-SUMMARY > \"$HEX_RESULT_FILE\"; printf ready > \"$HEX_EMIT_FILE\"']\n    result: file\n",
+        "workers:\n  builder:\n    command: [sh, -c, 'echo HELLO-FROM-AGENT; printf \"FINAL-SUMMARY\\nVERDICT: ready\" > \"$HEX_RESULT_FILE\"']\n    result: file\n",
     )
     .expect("config");
     let run = hex(dir.path(), &["run", "demo", "--json"]);
@@ -346,7 +373,7 @@ fn logs_full_puts_the_captured_stderr_on_stdout() {
     let dir = project();
     std::fs::write(
         dir.path().join(".hex").join("config.yaml"),
-        "workers:\n  builder:\n    command: [sh, -c, 'echo HELLO-FROM-AGENT; echo AGENT-DIAGNOSTIC >&2; printf ready > \"$HEX_EMIT_FILE\"']\n",
+        "workers:\n  builder:\n    command: [sh, -c, 'echo HELLO-FROM-AGENT; echo AGENT-DIAGNOSTIC >&2; echo \"VERDICT: ready\"']\n    result: text\n",
     )
     .expect("config");
     let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
@@ -665,18 +692,13 @@ fn follow_returns_immediately_on_an_already_finished_run() {
     let dir = project();
     let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
 
-    for verb in [
-        vec!["logs", &run_id, "--follow"],
-        vec!["watch", &run_id, "--follow"],
-    ] {
-        let out = hex(dir.path(), &verb);
-        assert!(out.status.success(), "{verb:?}: {}", stderr(&out));
-        assert!(
-            stdout(&out).contains("succeeded"),
-            "{verb:?} closes by saying how the run ended: {}",
-            stdout(&out)
-        );
-    }
+    let out = hex(dir.path(), &["logs", &run_id, "--follow"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("succeeded"),
+        "the follower closes by saying how the run ended: {}",
+        stdout(&out)
+    );
 }
 
 /// The live fields exist on a finished run too, as empty/absent rather than
@@ -719,13 +741,12 @@ fn init_preserves_a_gitignore_it_cannot_read_as_utf8() {
     assert!(tail.contains(".hex/worktrees/"), "{tail}");
 }
 
-/// The agent's `hex emit` channel is a plain PATH lookup in the agent's own
-/// shell, so `hex` missing from PATH is a real defect — reported like any missing
-/// worker, not as a note.
+/// `hex doctor` probes every configured worker's program. One that is not on
+/// `PATH` is a real finding, so `doctor` exits 1 — and preflight refuses to
+/// start the run rather than discovering it as a failed first attempt.
 #[test]
-fn doctor_probes_hex_itself() {
+fn doctor_reports_a_worker_whose_program_is_missing() {
     let dir = project();
-    let bin = assert_cmd::cargo::cargo_bin("hex");
 
     let without = Command::cargo_bin("hex")
         .expect("locate hex binary")
@@ -736,44 +757,50 @@ fn doctor_probes_hex_itself() {
         .output()
         .expect("spawn hex");
     let v: serde_json::Value = serde_json::from_str(stdout(&without).trim()).expect("doctor json");
+    // Findings start with the workers; `builder` runs `sh`, which this PATH
+    // cannot resolve.
     let row = &v["findings"][0];
     assert_eq!(
         (row["kind"].as_str(), row["name"].as_str()),
-        (Some("self"), Some("hex"))
+        (Some("worker"), Some("builder"))
     );
     assert_eq!(row["ok"], false, "{v}");
     assert!(
         row["detail"]
             .as_str()
             .unwrap()
-            .contains("put the hex binary on PATH"),
-        "the message says what to do: {v}"
+            .contains("not found on PATH"),
+        "the message says what is wrong: {v}"
     );
     assert_eq!(without.status.code(), Some(1), "a real finding, so exit 1");
 
+    // With a working PATH every worker and check row is usable. The `auth` rows
+    // probe this machine's real credentials, so they are not asserted — only
+    // that the overall verdict and the exit code agree with the rows.
     let with = Command::cargo_bin("hex")
         .expect("locate hex binary")
         .args(["doctor", "--json"])
         .current_dir(dir.path())
         .env("HOME", dir.path())
-        .env("PATH", bin.parent().expect("bin dir"))
         .output()
         .expect("spawn hex");
     let v: serde_json::Value = serde_json::from_str(stdout(&with).trim()).expect("doctor json");
-    assert_eq!(v["findings"][0]["ok"], true, "{v}");
+    let rows = v["findings"].as_array().expect("findings");
+    for row in rows.iter().filter(|r| r["kind"] != "auth") {
+        assert_eq!(row["ok"], true, "{row}");
+    }
+    let all_ok = rows.iter().all(|r| r["ok"] == true);
+    assert_eq!(v["ok"], serde_json::Value::Bool(all_ok), "{v}");
+    assert_eq!(with.status.code(), Some(i32::from(!all_ok)), "{v}");
 }
 
-/// The point of `--detach`: the launcher prints an id and exits, and the run
-/// keeps going in a process of its own. Both halves are asserted — the run is
-/// still unfinished when the launcher returns, and it finishes anyway.
+/// A backgrounded run is listed `live` while it works, and `hex wait` blocks on
+/// it from another process until it finishes, exiting with its disposition code.
 #[test]
-fn a_detached_run_outlives_its_launcher() {
+fn wait_blocks_until_a_backgrounded_run_finishes_and_exits_with_its_code() {
     let dir = project();
-    let out = hex(dir.path(), &["run", "slowdemo", "--detach", "--json"]);
-    assert!(out.status.success(), "stderr: {}", stderr(&out));
-    let run_id = run_id_of(&out);
+    let (mut child, run_id) = background_run(dir.path(), "slowdemo", "wait-test");
 
-    // The launcher is gone (we hold its Output) while the run is still working.
     let listed = hex(dir.path(), &["runs", "--json"]);
     let v: serde_json::Value = serde_json::from_str(stdout(&listed).trim()).expect("runs json");
     let row = v["runs"]
@@ -781,55 +808,48 @@ fn a_detached_run_outlives_its_launcher() {
         .expect("runs array")
         .iter()
         .find(|r| r["run_id"] == run_id.as_str())
-        .expect("the detached run is listed");
-    assert!(
-        row["disposition"].is_null(),
-        "the run must still be unfinished when the launcher exits: {row}"
+        .expect("the backgrounded run is listed");
+    assert_eq!(
+        row["state"], "live",
+        "the run is still working while we look at it: {row}"
     );
 
-    // And it completes without anyone driving it from this process.
-    assert_eq!(await_disposition(dir.path(), &run_id), "succeeded");
-    // Its stdio went to files under the run dir, so the child had somewhere to
-    // stream progress once it was no longer attached to a terminal.
-    let run_dir = dir.path().join(".hex").join("runs").join(&run_id);
-    let child_err = std::fs::read_to_string(run_dir.join("detached.err")).expect("detached.err");
-    assert!(
-        child_err.contains("run_started"),
-        "the detached child streamed its own progress: {child_err}"
-    );
-}
-
-/// `hex wait` blocks on a detached run and exits with its disposition code.
-#[test]
-fn wait_blocks_until_a_detached_run_finishes_and_exits_with_its_code() {
-    let dir = project();
-    let run_id = run_id_of(&hex(dir.path(), &["run", "slowdemo", "--detach", "--json"]));
     let out = hex(dir.path(), &["wait", &run_id]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert!(stdout(&out).contains("succeeded"), "{}", stdout(&out));
+    let _ = child.wait();
 }
 
-/// `hex steer` on a live detached run reaches that run's journal — the whole
-/// control path through a real process boundary, which is what the inbox is for.
+/// `hex steer` on a live run reaches that run's journal — the whole control path
+/// through a real process boundary, which is what the inbox is for.
 #[test]
-fn steer_reaches_a_live_detached_run() {
+fn steer_reaches_a_live_backgrounded_run() {
     let dir = project();
-    let run_id = run_id_of(&hex(dir.path(), &["run", "slowdemo", "--detach", "--json"]));
+    let (mut child, run_id) = background_run(dir.path(), "slowdemo", "steer-test");
     let steer = hex(dir.path(), &["steer", &run_id, "USE-THE-V2-API"]);
     assert!(steer.status.success(), "stderr: {}", stderr(&steer));
     assert!(
-        stdout(&steer).contains("queued steer"),
-        "{}",
+        stdout(&steer).contains("steer"),
+        "the steer is acknowledged: {}",
         stdout(&steer)
     );
 
     assert_eq!(await_disposition(dir.path(), &run_id), "succeeded");
-    let watch = hex(dir.path(), &["watch", &run_id]);
+    // The guidance is on the record: the journal is the authority, and reading it
+    // directly is what a follower would do.
+    let journal = std::fs::read_to_string(
+        dir.path()
+            .join(".hex")
+            .join("runs")
+            .join(&run_id)
+            .join("events.jsonl"),
+    )
+    .expect("journal");
     assert!(
-        stdout(&watch).contains("steer: USE-THE-V2-API"),
-        "the guidance is on the record: {}",
-        stdout(&watch)
+        journal.contains("USE-THE-V2-API"),
+        "the steer was journaled: {journal}"
     );
+    let _ = child.wait();
 }
 
 /// A finished run takes no more commands: queueing one nobody will read would
@@ -876,7 +896,7 @@ fn runs_on_a_project_with_no_runs_says_so() {
 }
 
 #[test]
-fn status_and_watch_reflect_a_finished_run() {
+fn status_reflects_a_finished_run() {
     let dir = project();
     let run = hex(dir.path(), &["run", "demo", "--json"]);
     let v: serde_json::Value = serde_json::from_str(stdout(&run).trim()).unwrap();
@@ -884,9 +904,30 @@ fn status_and_watch_reflect_a_finished_run() {
 
     let st = hex(dir.path(), &["status", run_id]);
     assert!(stdout(&st).contains("succeeded"));
+}
 
-    let watch = hex(dir.path(), &["watch", run_id]);
-    assert!(stdout(&watch).contains("run_finished"));
+/// The two new verbs, end to end: `hex stats` folds the usage log this HOME
+/// accumulated, and `hex prune --all` removes the finished run's directory.
+#[test]
+fn stats_folds_the_usage_log_and_prune_removes_a_finished_run() {
+    let dir = project();
+    let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
+
+    let stats = hex(dir.path(), &["stats", "--json"]);
+    assert!(stats.status.success(), "stderr: {}", stderr(&stats));
+    let v: serde_json::Value = serde_json::from_str(stdout(&stats).trim()).expect("stats json");
+    assert_eq!(v["verbs"]["run"], 1, "{v}");
+    assert_eq!(v["graphs"]["demo"]["runs"], 1, "{v}");
+    assert_eq!(v["dispositions"]["succeeded"], 1, "{v}");
+
+    let prune = hex(dir.path(), &["prune", "--all", "--json"]);
+    assert!(prune.status.success(), "stderr: {}", stderr(&prune));
+    let v: serde_json::Value = serde_json::from_str(stdout(&prune).trim()).expect("prune json");
+    assert_eq!(v["removed"], serde_json::json!([run_id.clone()]), "{v}");
+    assert!(
+        !dir.path().join(".hex").join("runs").join(&run_id).exists(),
+        "the run directory is gone"
+    );
 }
 
 /// `hex feedback` inside a worktree run: the injected context is captured, and

@@ -24,7 +24,7 @@ const LOOP_GRAPH: &str = r#"
 version: 1
 name: control-loop
 entry: implement
-defaults: { budget: { attempts: 8, attempt: 20s } }
+defaults: { budget: { attempt: 20s } }
 nodes:
   implement:
     agent: { worker: implementer, prompt: "implement it", may_propose: [ready] }
@@ -43,7 +43,7 @@ const APPROVAL_GRAPH: &str = r#"
 version: 1
 name: approval
 entry: plan
-defaults: { budget: { attempts: 4, attempt: 20s } }
+defaults: { budget: { attempt: 20s } }
 nodes:
   plan:
     agent: { worker: planner, prompt: "make a plan" }
@@ -71,11 +71,11 @@ fn sh(script: &str) -> Vec<String> {
 
 /// A shell snippet that queues `json` in the *running* run's control inbox,
 /// temp-then-rename, exactly as `hex pause`/`hex cancel` do. The run dir is
-/// derived from `HEX_EMIT_FILE` (`<run_dir>/attempts/<id>/emitted`), the only
-/// path an attempt is handed.
+/// derived from `HEX_RESULT_FILE` (`<run_dir>/attempts/<id>/result.txt`), the
+/// only path outside the workspace an attempt is handed.
 fn queue(json: &str) -> String {
     format!(
-        "d=$(dirname $(dirname $(dirname \"$HEX_EMIT_FILE\")))/control; \
+        "d=$(dirname $(dirname $(dirname \"$HEX_RESULT_FILE\")))/control; \
          mkdir -p \"$d/tmp\" \"$d/inbox\"; \
          printf '%s' '{json}' > \"$d/tmp/c.json\"; \
          mv \"$d/tmp/c.json\" \"$d/inbox/0000000000001-c.json\"; "
@@ -118,7 +118,15 @@ fn answer_when_asked(root: &Path, commands: Vec<Command>) -> std::thread::JoinHa
 fn workers(scripts: &[(&str, String)]) -> Workers {
     let mut ws = Workers::new();
     for (name, script) in scripts {
-        ws.insert(*name, Box::new(CommandWorker::new(*name, sh(script))));
+        // `result: text` so the script's printed `VERDICT:` line is captured —
+        // a worker that captures nothing cannot route a multi-outcome node.
+        ws.insert(
+            *name,
+            Box::new(
+                CommandWorker::new(*name, sh(script))
+                    .with_result_capture(Some(ResultCapture::Text)),
+            ),
+        );
     }
     ws
 }
@@ -148,14 +156,11 @@ fn a_cancel_command_ends_a_live_run() {
             (
                 "implementer",
                 format!(
-                    "{}printf ready > \"$HEX_EMIT_FILE\"",
+                    "{}echo 'VERDICT: ready'",
                     queue(&format!("{{{FROM_OPERATOR},\"command\":\"cancel\"}}"))
                 ),
             ),
-            (
-                "reviewer",
-                "printf approved > \"$HEX_EMIT_FILE\"".to_owned(),
-            ),
+            ("reviewer", "echo 'VERDICT: approved'".to_owned()),
         ]),
     );
 
@@ -201,14 +206,11 @@ fn pause_returns_without_a_terminal_and_resume_continues_the_same_run() {
             (
                 "implementer",
                 format!(
-                    "{}printf ready > \"$HEX_EMIT_FILE\"",
+                    "{}echo 'VERDICT: ready'",
                     queue(&format!("{{{FROM_OPERATOR},\"command\":\"pause\"}}"))
                 ),
             ),
-            (
-                "reviewer",
-                "printf approved > \"$HEX_EMIT_FILE\"".to_owned(),
-            ),
+            ("reviewer", "echo 'VERDICT: approved'".to_owned()),
         ]),
     );
 
@@ -270,7 +272,7 @@ fn steer_text_reaches_the_next_attempts_prompt() {
             (
                 "implementer",
                 format!(
-                    "{}printf ready > \"$HEX_EMIT_FILE\"",
+                    "{}echo 'VERDICT: ready'",
                     queue(&format!(
                         "{{{FROM_OPERATOR},\"command\":{{\"steer\":{{\"text\":\"USE-THE-V2-API\"}}}}}}"
                     ))
@@ -279,7 +281,7 @@ fn steer_text_reaches_the_next_attempts_prompt() {
             // No `{prompt}` in the argv, so the resolved prompt arrives on stdin.
             (
                 "reviewer",
-                "cat > review-prompt.txt; printf approved > \"$HEX_EMIT_FILE\"".to_owned(),
+                "cat > review-prompt.txt; echo 'VERDICT: approved'".to_owned(),
             ),
         ]),
     );
@@ -316,20 +318,18 @@ fn a_human_node_blocks_until_answered_and_its_answer_becomes_the_node_result() {
     let root = temp_root("human");
     write_graph(&root, "ap", APPROVAL_GRAPH);
 
-    let mut ws = Workers::new();
+    // The builder is a standard text-capture script worker; the planner writes
+    // its plan to the result file instead of printing it.
+    let mut ws = workers(&[(
+        "builder",
+        "cat > build-prompt.txt; echo 'VERDICT: ready'".to_owned(),
+    )]);
     ws.insert(
         "planner",
         Box::new(
             CommandWorker::new("planner", sh("printf 'PLAN-A' > \"$HEX_RESULT_FILE\""))
                 .with_result_capture(Some(ResultCapture::File)),
         ),
-    );
-    ws.insert(
-        "builder",
-        Box::new(CommandWorker::new(
-            "builder",
-            sh("cat > build-prompt.txt; printf ready > \"$HEX_EMIT_FILE\""),
-        )),
     );
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), ws);
 
@@ -388,20 +388,18 @@ fn a_respond_and_a_steer_queued_together_both_apply() {
     let root = temp_root("batch");
     write_graph(&root, "ap", APPROVAL_GRAPH);
 
-    let mut ws = Workers::new();
+    // The builder is a standard text-capture script worker; the planner writes
+    // its plan to the result file instead of printing it.
+    let mut ws = workers(&[(
+        "builder",
+        "cat > build-prompt.txt; echo 'VERDICT: ready'".to_owned(),
+    )]);
     ws.insert(
         "planner",
         Box::new(
             CommandWorker::new("planner", sh("printf 'PLAN-A' > \"$HEX_RESULT_FILE\""))
                 .with_result_capture(Some(ResultCapture::File)),
         ),
-    );
-    ws.insert(
-        "builder",
-        Box::new(CommandWorker::new(
-            "builder",
-            sh("cat > build-prompt.txt; printf ready > \"$HEX_EMIT_FILE\""),
-        )),
     );
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), ws);
 
@@ -453,7 +451,7 @@ fn a_respond_with_no_human_waiting_is_journaled_as_ignored() {
             (
                 "implementer",
                 format!(
-                    "{}printf ready > \"$HEX_EMIT_FILE\"",
+                    "{}echo 'VERDICT: ready'",
                     queue(&format!(
                         "{{{FROM_OPERATOR},\"command\":{{\"respond\":{{\"text\":\"yes\"}}}}}}"
                     ))
@@ -461,7 +459,7 @@ fn a_respond_with_no_human_waiting_is_journaled_as_ignored() {
             ),
             (
                 "reviewer",
-                "cat > review-prompt.txt; printf approved > \"$HEX_EMIT_FILE\"".to_owned(),
+                "cat > review-prompt.txt; echo 'VERDICT: approved'".to_owned(),
             ),
         ]),
     );
@@ -501,14 +499,11 @@ fn cancelling_a_crashed_run_closes_its_orphaned_attempt() {
             (
                 "implementer",
                 format!(
-                    "{}printf ready > \"$HEX_EMIT_FILE\"",
+                    "{}echo 'VERDICT: ready'",
                     queue(&format!("{{{FROM_OPERATOR},\"command\":\"pause\"}}"))
                 ),
             ),
-            (
-                "reviewer",
-                "printf approved > \"$HEX_EMIT_FILE\"".to_owned(),
-            ),
+            ("reviewer", "echo 'VERDICT: approved'".to_owned()),
         ]),
     );
     let report = runtime
@@ -570,14 +565,11 @@ fn cancel_of_an_idle_run_is_recorded_directly() {
             (
                 "implementer",
                 format!(
-                    "{}printf ready > \"$HEX_EMIT_FILE\"",
+                    "{}echo 'VERDICT: ready'",
                     queue(&format!("{{{FROM_OPERATOR},\"command\":\"pause\"}}"))
                 ),
             ),
-            (
-                "reviewer",
-                "printf approved > \"$HEX_EMIT_FILE\"".to_owned(),
-            ),
+            ("reviewer", "echo 'VERDICT: approved'".to_owned()),
         ]),
     );
     // Pause it first, so the run exists, is unfinished, and has no driver.
@@ -613,14 +605,8 @@ fn a_summary_reports_liveness_and_age() {
         root.clone(),
         Config::builtin(),
         workers(&[
-            (
-                "implementer",
-                "printf ready > \"$HEX_EMIT_FILE\"".to_owned(),
-            ),
-            (
-                "reviewer",
-                "printf approved > \"$HEX_EMIT_FILE\"".to_owned(),
-            ),
+            ("implementer", "echo 'VERDICT: ready'".to_owned()),
+            ("reviewer", "echo 'VERDICT: approved'".to_owned()),
         ]),
     );
     let report = runtime
@@ -632,11 +618,10 @@ fn a_summary_reports_liveness_and_age() {
     let summary = &runs[0];
     assert_eq!(summary.run_id, report.run_id);
     assert_eq!(
-        summary.status,
-        Some(Status::Finished(Disposition::Succeeded))
+        summary.state,
+        hex_runtime::Liveness::Finished(Disposition::Succeeded)
     );
-    assert_eq!(summary.liveness, hex_runtime::Liveness::Finished);
-    assert!(summary.error.is_none());
+    assert!(!summary.hung, "a finished run is not a live process");
     assert!(summary.updated_at_ms >= summary.created_at_ms);
     assert!(summary.attempts >= 2, "attempts counted: {summary:?}");
 
@@ -645,4 +630,55 @@ fn a_summary_reports_liveness_and_age() {
         .control(&report.run_id, &Actor::human("t"), &Command::Pause)
         .expect_err("must refuse");
     assert!(err.to_string().contains("already finished"), "{err}");
+}
+
+/// The runtime-injected review-scope line (A8) lands on a read-only node whose
+/// prompt runs `git diff` — and ONLY there: a read-only planner or researcher
+/// must not be told to review a diff it never looks at.
+#[test]
+fn the_review_scope_line_lands_only_on_diffing_read_only_nodes() {
+    const SCOPE_GRAPH: &str = r#"
+version: 1
+name: scope
+entry: research
+defaults: { budget: { attempt: 20s } }
+nodes:
+  research:
+    agent: { worker: researcher, prompt: "gather evidence, cite sources", read_only: true }
+    on: { done: review }
+  review:
+    agent: { worker: reviewer, prompt: "run `git diff` and review it", read_only: true, may_propose: [approved] }
+    on: { approved: done }
+  done:
+    terminal: succeeded
+accept: { require: [] }
+"#;
+    let root = temp_root("scopeline");
+    write_graph(&root, "scope", SCOPE_GRAPH);
+    let runtime = Runtime::with_workers(
+        root.clone(),
+        Config::builtin(),
+        workers(&[
+            ("researcher", "cat > research-prompt.txt".to_owned()),
+            (
+                "reviewer",
+                "cat > review-prompt.txt; echo 'VERDICT: approved'".to_owned(),
+            ),
+        ]),
+    );
+    let report = runtime
+        .start("scope", None, None, &Isolation::Shared)
+        .expect("run");
+    assert_eq!(report.disposition, Some(Disposition::Succeeded));
+
+    let prompt = std::fs::read_to_string(root.join("review-prompt.txt")).expect("prompt");
+    assert!(
+        prompt.contains("Review the change, not the repository"),
+        "the scope line is injected on the diffing reviewer: {prompt}"
+    );
+    let research = std::fs::read_to_string(root.join("research-prompt.txt")).expect("prompt");
+    assert!(
+        !research.contains("Review the change"),
+        "a non-diffing read-only node gets no review instruction: {research}"
+    );
 }

@@ -12,7 +12,7 @@ Design rationale: `docs/design/gpt-research-{1,2}.md`; the decisions below
 
 Dependencies point **strictly inward** (a crate may only depend on ones above
 it in this table). One-liner: *kernel decides · worker runs one agent ·
-runtime orchestrates and records · cli/mcp/dashboard are windows.*
+runtime orchestrates and records · the cli is a window.*
 
 | Crate | Purpose | May depend on |
 |---|---|---|
@@ -21,8 +21,10 @@ runtime orchestrates and records · cli/mcp/dashboard are windows.*
 | `hex-worker` | `Worker` trait + capability manifest + adapters (mock, subprocess, coding-agent presets). Runs **one** worker; never coordinates. | proto |
 | `hex-runtime` | Imperative shell: drive loop, effect execution, journal writer, control ingestion, workspace isolation, run supervision. Exposes the concrete `Runtime` — including `read_streams`, so tailing a live attempt needs no knowledge of `.hex/`. (The `RuntimeClient` trait it also exposed was deleted 2026-08-01: one impl, no callers.) | kernel, worker, proto |
 | `hex-cli` | The `hex` binary — thin client over `Runtime`; arg parsing + rendering only. | runtime |
-| `hex-mcp` | *(later)* MCP transport — a peer client of the CLI; can start/control runs. | runtime |
-| `hex-dashboard` | *(later)* TUI/web viewer — another thin client. | runtime |
+
+(The `hex-mcp` / `hex-dashboard` stub crates were deleted 2026-09-13; a future
+transport or viewer is another thin client over `Runtime`, never a second
+implementation.)
 
 ## Commands
 
@@ -50,7 +52,9 @@ into another agent framework. They are non-negotiable.
    *effect intents* (`StartAttempt`, `RunCommand`, `RequestHuman`, …); only the
    runtime performs them, writing intent-before-effect with idempotency keys.
    A model may *propose* an event only from its node's `may_propose`
-   allow-list; the kernel validates the transition. Routing spends no tokens.
+   allow-list — since 2026-09-13 via the `VERDICT: <signal>` line of its final
+   message (gotcha 5), not a `hex emit` subprocess; the kernel still validates
+   the transition. Routing spends no tokens.
 4. **Node kinds stay tiny:** `agent`, `command`, `human`, `terminal` — **four**.
    Roles ("planner", "reviewer") are metadata on an `agent` node; interactivity
    is a *policy flag* on `agent` (`interactive: true`), never a new kind. A
@@ -60,7 +64,12 @@ into another agent framework. They are non-negotiable.
    signal — which already worked for *agent* signals too
    (`accept.require: [review.approved]`), proving gate-ness was never about the
    kind.
-5. **Every cycle is bounded.** An unbounded cycle is a validation *error*.
+5. **Every cycle is bounded, by construction.** The loader fills every
+   non-terminal node's `max_visits` with `DEFAULT_NODE_VISITS` (5) unless the
+   graph declares `budget: { visits: N }`, and `schedule` checks that bound
+   before acting. An unbounded cycle cannot be constructed, so there is no cycle
+   analysis — `check_cycles`/`E-unbounded-cycle` were deleted 2026-09-14 with the
+   run-wide retry budgets.
 6. **Completion is provisional.** A worker's "done" is a proposal; required
    gates + acceptance rules decide the run outcome. Deterministic evidence
    outranks model assertions.
@@ -69,8 +78,9 @@ into another agent framework. They are non-negotiable.
    `retry`/`replay`/`skip` — redoing work is a new run. Never silently rerun a
    side-effecting attempt.
 8. **Human and agent share one control protocol**, with authority scoped per
-   actor. One `Command` type, two worker transports (injected `hex emit` CLI +
-   MCP tool hooks); every surface (CLI, `--json`, MCP, dashboard) is a thin
+   actor. One `Command` type over the file inbox; an agent node's *routing*
+   channel is its final message's verdict line (core rule 3). Every surface
+   (CLI, `--json`, any later transport) is a thin
    client over the runtime — it parses arguments and renders, and every fact it
    shows the runtime computed. That is the substance, and it does not require a
    trait: `RuntimeClient` (nine signatures, one implementation, zero callers)
@@ -167,7 +177,8 @@ template (reserved for `templates:` node reuse inside a graph).
 
 **Interactive session**: An `agent` attempt with `interactive: true` — stays
 open for live human↔agent conversation (grill-me/Q&A), journaled per turn,
-resumable. Requires worker capabilities `live_steering` + `session_resume`.
+resumable. Requires `session_resume` plus a `live_steering` capability
+(re-added when this ships; deleted 2026-09-13 while nothing checked it).
 
 **Approval**: A blocking human decision on a finished proposal — a `human`
 boundary node (designed now, built later), recorded as
@@ -178,11 +189,14 @@ sign-off, confirmation.
 
 1. Binary is `hex`, package is `hex-cli` — use `cargo run --bin hex`, not `-p hex`.
 2. Phase 1 (slim MVP) is implemented and green; Phase 2+ items in TODO.md are
-   still stubs or unbuilt. All four node kinds work, `human` included (answered
-   with `hex respond`), as do `context: continue` (gotcha 33) and token/cost
-   accounting (gotchas 27-29). Still unbuilt: `interactive`,
-   `templates:`/`extends:`, capability matching *for anything but session resume*,
-   and stall detection. `hex-mcp`/`hex-dashboard` are empty stubs.
+   still unbuilt. All four node kinds work, `human` included (answered
+   with `hex respond`), as do `context: continue` (gotcha 33), token/cost
+   accounting (gotchas 27-29), stall detection (a gate failing with identical
+   output twice ends the run `failed`, `driver.rs`), `hex stats` (cross-repo
+   `~/.hex/stats.jsonl`, folded on read) and `hex prune`. Still unbuilt:
+   `interactive`, `templates:`/`extends:`, and capability matching beyond the
+   session-resume and result-capture checks. The `hex-mcp`/`hex-dashboard`
+   stub crates were deleted 2026-09-13.
 3. A node's routing token is an `EventBody::Signal { name }` — agent proposals
    *and* command verdicts (`passed`/`failed`) unify there; edges match on `name`.
    `reduce(graph, state, event)` owns routing (it takes the graph); `schedule`
@@ -196,23 +210,33 @@ sign-off, confirmation.
    k=v`. Named *typed* inputs/outputs are a **node** concern (internal graph
    dataflow, Phase 6), never an operator flag. Keep run-config (budget, worker,
    isolation) on their own CLI flags, off the prompt channel.
-5. The worker↔runtime channel is `hex emit <event>`: the runtime injects
-   `HEX_EMIT_FILE`/`HEX_MAY_PROPOSE` etc.; the agent's argv must be able to
-   reach the `hex` binary. `may_propose` is enforced both at emit and at ingest.
-5b. **Result capture & implicit completion.** The runtime also injects
+5. **The agent→runtime routing channel is the verdict line** (since 2026-09-13;
+   `hex emit`, `HEX_EMIT_FILE` and `HEX_MAY_PROPOSE` are deleted). A
+   multi-outcome agent node ends its final message with `VERDICT: <signal>`;
+   the instruction is **runtime-generated** from the node's `may_propose`
+   (`driver::verdict_instruction`, appended to the interpolated prompt at
+   attempt start) — never authored in a graph, so no preset can forget it and
+   it cannot drift from the edges. `driver::verdict_of` parses it (last marker
+   wins, case-insensitive, decoration-tolerant); a clean exit with a declared
+   verdict routes on it, an undeclared or missing one fails the attempt closed
+   (or routes via an explicit `on: { unknown: … }`). See gotcha 49 for the
+   traps.
+5b. **Result capture & implicit completion.** The runtime injects
    `HEX_RESULT_FILE` and a `{result}` argv token; a worker's `result:`
-   (`file`|`jsonl_result`|`jsonl_last_text`|`pi_jsonl`) says how to capture its
-   final message (codex `--output-last-message {result}`, claude stream-json's
-   last `result` line; `json_result` — a single JSON object — was deleted
-   2026-09-05 with no producer left in-tree).
-   The capture is recorded as `EventBody::NodeResult` and folded into
+   (`file`|`jsonl_result`|`jsonl_last_text`|`pi_jsonl`|`text`) says how to
+   capture its final message (codex `--output-last-message {result}`, claude
+   stream-json's last `result` line; `text` — added 2026-09-13 — is the tail of
+   `stdout.log`, the only mode a plain `kind: command` worker printing a
+   verdict can use; `json_result` was deleted 2026-09-05 with no producer left
+   in-tree). The capture is recorded as `EventBody::NodeResult` and folded into
    `RunState.results`; a downstream prompt references it as `{{node.result}}`,
    interpolated **at attempt-start** in the driver (not compile-time) and wrapped
-   as untrusted. An agent that exits cleanly *without* emitting gets a
-   runtime-synthesized reserved `done` signal (implicit completion), so a
-   single-outcome node needs no `hex emit`; it must have an `on: { done: … }`
-   edge (the validator allows `done` without a `may_propose` entry). Nodes with
-   >1 outcome still emit. `read_signal` returning `Ok(None)` is *not* an error.
+   as untrusted. An agent that exits cleanly on a node with **no** declared
+   outcomes gets a runtime-synthesized reserved `done` signal (implicit
+   completion); such a node must have an `on: { done: … }` edge (the validator
+   allows `done` without a `may_propose` entry, and rejects it *inside*
+   `may_propose` — `E-done-reserved`). Mixing `may_propose` with a `done` edge
+   is `E-mixed-done-and-proposals` (gotcha 49).
 5c. **Workers are typed adapters behind one trait.** Each agent CLI has its own
    `Worker` impl in `hex-worker` (`CodexWorker`/`ClaudeWorker`/`PiWorker`/`OpencodeWorker`)
    owning its argv and result-capture mode; `CommandWorker` is the generic argv
@@ -221,13 +245,14 @@ sign-off, confirmation.
    only ever see `dyn Worker`. A node's `read_only: bool` flows to
    `WorkRequest.read_only`, but is **advisory** today (prompt-enforced): a true
    read-only sandbox (codex `--sandbox read-only`) would also block the agent
-   from writing `HEX_EMIT_FILE`/`HEX_RESULT_FILE` under the workspace and break
-   routing — enforced read-only needs a non-workspace control transport (TODO).
+   from writing `HEX_RESULT_FILE` under the workspace and lose the final
+   message — and with it the verdict — so enforced read-only needs a
+   non-workspace result path (TODO).
    Adding an agent = a new `Worker` impl + `WorkerKind`, not scattered flags.
 5c-perm. **Headless permissioning is per-agent, never a blanket bypass.** codex
    runs under its OS sandbox (`--sandbox workspace-write`); claude uses an *auto
-   classifier* (`--permission-mode acceptEdits` + `--allowedTools` incl. `Bash`
-   for the `hex emit` channel + `--disallowedTools` denying destructive/exfil/
+   classifier* (`--permission-mode acceptEdits` + `--allowedTools` incl. `Bash`,
+   which build/test commands need, + `--disallowedTools` denying destructive/exfil/
    publish commands) — **never `--dangerously-skip-permissions`**; opencode is
    still `--auto` (blanket approve — TODO to generate an `opencode.json`
    `permission` block). The claude deny-list is defense-in-depth, not an OS
@@ -239,15 +264,17 @@ sign-off, confirmation.
 6. `hex run`'s workspace is the project cwd (shared isolation); run it from the
    repo root. Redo = new `run`; `resume` continues the same run and marks an
    orphaned attempt `interrupted` before re-attempting (never a silent rerun).
-7. `hex-mcp`/`hex-dashboard` are deliberate stubs; they become thin clients over
-   `Runtime` — a transport/projection, never orchestration.
+7. *(Retired 2026-09-13.)* The `hex-mcp`/`hex-dashboard` stub crates were
+   deleted; a future transport or viewer is a thin client over `Runtime` —
+   a transport/projection, never orchestration.
 8. Worktree isolation is per-run and opt-in (`hex run --worktree [<base>]` /
    `--no-worktree`), default `shared`; **no auto-merge** — the branch
    `hex/<run-id>` is left for explicit integration. Implemented as a thin slice
    (`hex-runtime/src/worktree.rs`): a **pooled** reusable slot under
    `.hex/worktrees/<n>/` (gitignored, fs4-locked like a run) — clean slots are
    reused (warm deps), dirty ones reclaimed-and-logged, parallel runs grow the
-   pool. `workdir` = the slot; the journal + `emit`/`result` control files stay
+   pool. `workdir` = the slot; the journal + the `result` capture file + the
+   control inbox stay
    in the main `.hex/runs/<id>` (so the worktree diff stays clean and survives a
    discarded slot), and codex gets `--add-dir <run_dir>` so its `workspace-write`
    sandbox can still write them. hex never commits — the driver appends a banner
@@ -286,8 +313,8 @@ sign-off, confirmation.
    abandoned run). A driving agent can branch without parsing output.
 13. **The kernel says *why* a run ended.** `Effect::RecordTerminal` carries
    `why: Option<String>`; the driver journals it as a `Note` before
-   `RunFinished`. This is how `budget_exhausted` distinguishes attempts from
-   cycle visits, and how a success terminal downgraded by an unmet
+   `RunFinished`. This is how `budget_exhausted` names the node whose visit
+   bound ran out, and how a success terminal downgraded by an unmet
    `accept.require` names the missing evidence instead of a bare `failed`.
 14. **Roles are the graph's vocabulary; workers are plumbing.** `roles:` in
    config (implementer/reviewer/planner/researcher) each bind a `worker` plus
@@ -310,14 +337,10 @@ sign-off, confirmation.
    concurrent evidence reads like sequential evidence and the journal stays
    deterministic. Infra failure in any step still fails the *attempt* rather than
    routing `failed` (gotcha 11).
-17. **`accept.on_unmet` routes instead of dead-ending.** Its two former
-   unbounded-loop holes were closed 2026-08-08 in `check_cycles`: a node now
-   breaks a cycle only when its bound is *enforced* there — a terminal's
-   `budget.visits` no longer counts (`schedule` settles terminals before budget
-   checks, so it was never enforced), and `budget.attempts` breaks only cycles
-   containing an `agent`/`command` node (a human response spends no attempt).
-   Both graphs that used to spin forever are now `E-unbounded-cycle` at compile
-   time, with the human-only case named in the message. Reaching a success
+17. **`accept.on_unmet` routes instead of dead-ending.** The transition it adds
+   is real but invisible in the edges, which is why cycle validation used to have
+   to model it; with every non-terminal node visit-bounded by default (core rule
+   5), no loop can outrun its bound, so that analysis is gone. Reaching a success
    terminal with missing evidence used to end the run `failed`, which spent the
    whole budget and fixed nothing. Now the kernel emits `Effect::RerouteUnmet` and
    the runtime journals `EventBody::AcceptanceUnmet` — its own event, *not* a
@@ -325,9 +348,14 @@ sign-off, confirmation.
    in-flight attempt produced (a fail-closed guard that must not be relaxed to
    express this). Without `on_unmet` the run still fails, but the reason names the
    remedy.
-18. **`budget: { visits: N }` bounds one node**, so an expensive review cycle can
-   be capped at 3 without also capping a cheap lint cycle. The run-wide
-   `cycle_visits` remains a blanket backstop; whichever is tighter bites first.
+18. **There is no run-wide retry budget; every node is visit-bounded.** A
+   whole-run attempt count said only how long the burn lasts, never *which* loop
+   caused it. `budget: { visits: N }` bounds one node (an expensive review cycle
+   capped at 3 without capping a cheap lint), and a node that declares none takes
+   `DEFAULT_NODE_VISITS` (5). A terminal keeps `max_visits: None`: `schedule`
+   settles terminals before budget checks. Exceeding a node's bound ends the run
+   `budget_exhausted` with a `why` that names the node and its bound. `elapsed`,
+   `attempt` and `output_tokens` stay run-wide — time and generation are global.
 19. **A `roles:` entry shadows a same-named `workers:` entry.** `Workers::from_config`
    registers workers first, then roles, so a role wins the clash — that is
    intended (the role is the user-facing concept), but it bites: naming a scratch
@@ -357,13 +385,15 @@ sign-off, confirmation.
    not "untrusted agent output" (`driver.rs`, pinned by
    `a_human_answer_is_labelled_operator_input_not_agent_output`) — an earlier
    version of this gotcha claimed otherwise and was stale.
-23. **Detach re-execs, never forks.** `--detach` spawns `current_exe()` with a
-   hidden `--reserved-run-id`, stdio to `detached.{out,err}`, and
-   `process_group(0)`; the launcher exits without `wait()`ing. `fork()` is unsafe
-   in a multithreaded Rust process — do not reintroduce it. Liveness is the
-   existing `RunLock` (kernel-released on death, unlike a pidfile — PID reuse is
-   real) plus a 5s heartbeat file: lock+fresh beat = live, lock+stale = hung, no
-   lock+no terminal = abandoned.
+23. *(Retired 2026-09-13 — `--detach` and the reserved-run machinery were
+   deleted; `hex run` blocks, backgrounding is the shell (`&`) or tmux, and a
+   `&`-backgrounded run can be HUP'd when its shell exits.)* What survives:
+   liveness is still the `RunLock` (kernel-released on death, unlike a pidfile —
+   PID reuse is real) plus a 5s heartbeat file, folded into `Liveness`
+   (`live`/`interrupted`/`finished`/`error`, `control.rs`); a stale heartbeat
+   under a held lock is the *hung* diagnostic on `live`, not a fifth state. If
+   a background mode ever returns: re-exec, never `fork()` — it is unsafe in a
+   multithreaded Rust process.
 24. **An unexplained fs4/flock flake affects *both* lock kinds, and the tests
    that would catch it are serialized.** A just-released lock intermittently still
    reads as busy: worktree slot leasing claims slot 1 instead of the freed slot 0,
@@ -384,6 +414,12 @@ sign-off, confirmation.
    serialized runs pass 8/8, parallel ones failed ~1-in-3, even across separate
    repos with distinct lock inodes. The safety invariant (no two live leases share
    a slot) holds regardless, so the cost is a needless extra slot, not corruption.
+   **Cancel-side fix (2026-09-13):** `Runtime::cancel` now reads the journal
+   *before* probing the lock — a finished run returns `Recorded` without ever
+   touching the flaky probe, and a `Paused` run's refused probe is overridden
+   (no driver can hold it). The reproducer disappeared because the path is no
+   longer taken; the underlying flake is still not root-caused, and the
+   worktree-slot side still has it.
 25. **`hex-kernel/src/lifecycle.rs` is the single home for every "may this event
    apply here?" rule**, and `check_journal` folds *through* `reduce` rather than
    keeping its own projection — so the journal's two consumers cannot disagree
@@ -479,14 +515,11 @@ sign-off, confirmation.
    whether that step was the culprit. It is the recorded string (`"0"`, `"101"`,
    `"signal"`), not a typed status. `StepLog::failed()` treats an *unrecorded*
    status as not-failed — silence is not evidence.
-35. **`hex doctor` probes `hex` itself, and nothing injects it into the agent's
-   `PATH`.** `hex emit` is a plain PATH lookup in the agent's own shell; it
-   returned 127 in 3 of 3 real agent runs, and two only survived because codex went
-   hunting for `target/debug/hex` on its own. Placing the binary on PATH is
-   deliberately the operator's job, so the fix is a `self` row that *reports* the
-   gap (exit 1) rather than a silent environment edit. It is **not** in
-   `preflight`: a single-outcome node completes implicitly without ever calling
-   `hex`, so refusing every run would block work that would have succeeded.
+35. *(Retired 2026-09-13 — the `hex emit` channel and `hex doctor`'s `self` row
+   are gone; an agent never runs `hex`, so there is nothing to probe. The
+   gotcha's evidence — `hex emit` returned 127 in 3 of 3 real runs — is what
+   motivated replacing the protocol with the verdict line, gotcha 5. Do not
+   re-add a PATH probe.)*
 36. **A steer has two "sent but not applied" states, and `Inbox::queued()` must stay
    read-only.** A command sits in `control/inbox/` until the driver claims it at an
    attempt boundary (`hex status`: `queued steer (not yet picked up)`), and only then
@@ -498,13 +531,13 @@ sign-off, confirmation.
    steer the operator was checking on. `hex steer` also prints, on stderr, that an
    in-flight attempt will not see it, since drain happens between attempts.
 37. **An attempt's streams are more than its two logs, and a follower waits for a
-   reserved run's journal.** `attempt_streams` (now in `hex-runtime`) collects the
+   just-created run's journal.** `attempt_streams` (now in `hex-runtime`) collects the
    attempt's own stdout/stderr plus each numbered step dir's, in **declared**
    position order (`10-` after `9-`), because a `command` node writes nothing to
    the attempt dir and a gate is what you actually wait on. Attach at each stream's
-   *tail*, not its head. Both followers call `wait_for_journal` (15s, `FOLLOW_POLL`
-   400ms): `--detach` reserves the run dir before the driver's first write, so
-   `hex logs --follow "$(hex run … --detach)"` would otherwise fail instantly —
+   *tail*, not its head. The follower calls `wait_for_journal` (15s, `FOLLOW_POLL`
+   400ms): the run dir can exist a moment before the driver's first write, so
+   `hex logs --follow` right after `hex run … &` would otherwise fail instantly —
    "not started yet" vs "does not exist" is told apart via `summary`, so a typo
    still fails fast. `Runtime::read_streams(run, attempt, &mut StreamCursor)`
    (`validate_run_id`'d, since an attempt id ends up in a path) hands back chunks,
@@ -512,7 +545,7 @@ sign-off, confirmation.
    which handed one out. Attach/drain mechanics are gotcha 40.
 38. **Preset session policy: the implementer continues, the reviewer stays fresh.**
    `context: continue` is declared on the node a loop revisits (`implement` in
-   `critique-loop`/`implement-until-green`/`plan-build-review`/`tdd`/`checklist`,
+   `critique-loop`/`implement-until-green`/`tdd`/`checklist`,
    plus `tdd`'s
    `spec`, which `red` sends back), and deliberately *not* on `review` — a reviewer
    continuing its own session carries its earlier verdict into the next round, which
@@ -591,28 +624,11 @@ sign-off, confirmation.
    nothing, which reads as a hex bug rather than a typo. **Untested end-to-end**:
    no fake worker reports usage, so enforcement is covered by kernel unit tests
    only (TODO.md).
-44. **A diagram export must survive its renderer's syntax, not just hex's.**
-   `hex graph --format mermaid|dot` (`hex-cli/src/graph_export.rs`) reads the same
-   `Topology` the text renderer does, so the three renderings cannot disagree —
-   but each target has a constraint the IR knows nothing about. Mermaid: node ids
-   are unvalidated YAML map keys, so one can legally be `end` (a keyword that
-   breaks the parser) or hold a dash or a space — every id is emitted as
-   `n_<sanitized>` with the real id kept in the label, and a sanitizing clash
-   takes a numeric suffix rather than silently merging two nodes into one box.
-   Only the **classic** bracket delimiters (`[]`/`[[]]`/`{{}}`/`([])`) are used:
-   GitHub's mermaid lags upstream and the `A@{ shape: … }` form needs 11.3+. A
-   quote in a label is `#quot;`, since mermaid has no backslash escape. DOT: back
-   edges and the `accept.on_unmet` reroute carry **`constraint=false`** — without
-   it graphviz ranks the loop too and the happy-path spine bends around it.
-   **A reroute is not always a back edge**, so both renderers ask `is_reroute()`
-   *before* the edge class: the DFS classifies it `Forward` whenever its target is
-   first discovered through the terminal it leaves (`done → fix`, `fix → implement`),
-   and keying on `EdgeClass::Back` alone drew that reroute as an ordinary forward
-   step. Gate-ness is derived once in `Graph::is_gate`; edge class once in
-   `Topology` — but what a transition *means* still has to be read from the
-   transition, not from where the traversal met it.
-   Escaping is per *line*, before joining: escaping a DOT label's `\n` as data
-   prints a literal backslash instead of breaking the line.
+44. *(Retired 2026-09-13 — the mermaid/DOT/`--format json` graph exports were
+   deleted; `hex graph` renders `text` or `source` only. The surviving lesson:
+   a reroute is not always a back edge — read what a transition *means* from
+   the transition (`is_reroute()`), never from where a traversal met it
+   (`EdgeClass`); both live in `Topology`/`Graph::is_gate`.)*
 45. **Ctrl-C stops the run *and* the agent, and lands it in `paused`.** The
    agent runs in its own process group (gotcha 31), so the tty's SIGINT reaches
    only `hex` — before this, Ctrl-C left the agent spending tokens and writing
@@ -652,21 +668,11 @@ sign-off, confirmation.
    run used to corrupt it, since `RunFinished` over an open attempt is rejected
    by `lifecycle`; `cancel` now writes `AttemptInterrupted` first, as `resume`
    does.
-46. **A ratatui table renders cell text literally — it does not interpret ANSI.**
-   `hex dash` (`hex-cli/src/dash.rs`) is a `Runtime` client like `hex runs`, but
-   it cannot reuse `ui::mark`'s output: that returns an ANSI-escaped `String`,
-   which ratatui would print as visible escape bytes. The shared semantics
-   travel through the `Mark` enum instead — `Mark::glyph(unicode)` and
-   `Mark::hue() -> Option<AnsiColor>` are the backend-neutral single source both
-   the ANSI renderer (`ui::mark`) and the ratatui adapter (`dash::mark_cell` +
-   `hue_to_ratatui`) derive from, so the two can never draw a different badge.
-   Bold/dim are colour too: `dash` gates *every* style on `ui.colored()`, or
-   `hex --color never dash` would still paint. Two lesser traps: the
-   `CrosstermBackend<Stdout>` type alias must not be named `Backend` (it clashes
-   with the `ratatui::backend::Backend` trait `flush` needs — alias is `Term`);
-   and in raw mode the tty sends no SIGINT, so `Ctrl-C` arrives as a
-   `KeyCode::Char('c')` + `CONTROL` key event, handled alongside `q`/`Esc`, not
-   as a signal.
+46. *(Retired 2026-09-13 — `hex dash` was deleted, `hex runs` is the listing.
+   Surviving lessons for any future ratatui client: a ratatui cell renders ANSI
+   escapes as visible bytes, so share semantics through a backend-neutral enum
+   like `ui::Mark`, not rendered strings; and in raw mode Ctrl-C arrives as a
+   key event, not SIGINT.)*
 47. **`hex feedback` writes the *user-global* `~/.hex/`, not a project `.hex/`.**
    `hex-cli/src/feedback.rs` appends one JSON line per call to
    `$HOME/.hex/feedback.jsonl` so feedback from every project aggregates in one
@@ -699,10 +705,40 @@ sign-off, confirmation.
    implemented, reviewed and committed, so the branch merged fine anyway.
    Fix candidates are in `~/.hex/feedback.jsonl` and TODO.md: scope gate checks
    to the branch diff, or refuse to start a gated run whose gate is already red
-   at the base. Cost datum from the same run: opus ≈ $2–3 per implemented item,
+   at the base. Since 2026-09-13 stall detection at least bounds the burn: a
+   gate failing with the identical output signature twice ends the run `failed`
+   instead of looping to `budget_exhausted`. Cost datum from the same run: opus ≈ $2–3 per implemented item,
    gemini-flash ≈ $0.04–0.08 per review — the pi reviewer is ~50× cheaper than
    the codex reviewer this repo used before, with substantive verdicts.
    Reviewer binding note: pi needs the provider in the model pattern
    (`model: openrouter/google/gemini-3.8-flash`) because `PiWorker` passes only
    `--model` and bare `gemini-3.8-flash` is ambiguous across providers.
-49. _add new gotchas here as they are discovered_
+49. **The verdict is parsed from the RAW capture, before `cap_result`.**
+   `cap_result` keeps the *head* of a >16 KiB message and drops the tail — where
+   the trailing `VERDICT:` line lives — so parsing after the cap would turn
+   every long compliant review into `unknown`. `run_agent` therefore calls
+   `verdict_of` on the uncapped text and caps only what `NodeResult` stores
+   (pinned by `a_verdict_after_a_very_long_message_is_still_found`). Two
+   related traps: `unknown` is a **reserved** signal like `done` — never listed
+   in `may_propose` (`E-unknown-reserved`), never in the generated instruction,
+   fails closed unless an `on: { unknown: … }` edge routes it (an edge needs no
+   declaration, like `done`); and a node mixing `may_propose` with a `done`
+   edge is `E-mixed-done-and-proposals` at compile time — a clean no-verdict
+   exit would otherwise mean both "implicitly done" and "reported nothing".
+50. **The run-wide retry budgets were deleted 2026-09-14; bound every node
+   instead.** `Budget.attempts` and `Budget.cycle_visits` are gone, from the IR
+   and from the loader's `RawBudget` — so a graph still writing
+   `budget: { attempts: 8 }` fails loudly at compile time with serde's
+   unknown-field error, which is the intended migration signal, not a silent
+   ignore. Every non-terminal node's `max_visits` defaults to
+   `DEFAULT_NODE_VISITS` (5) in the loader; `elapsed_ms`,
+   `attempt_elapsed_ms` and `output_tokens` stay run-wide. `E-budget-zero` now
+   also rejects a node's `budget: { visits: 0 }`. The unbounded-cycle analysis
+   (`check_cycles`, `E-unbounded-cycle`) was deleted because the default bound
+   makes it unfireable. Old runs stay readable: a recorded snapshot's
+   `attempts`/`cycle_visits` are stripped on the replay path only
+   (`loader::strip_legacy_budget`, after the snapshot hash is verified), so a
+   paused or crashed pre-change run still resumes while a freshly authored
+   graph is still refused. `RunCreated.defaults` is a `BTreeMap<String, String>`
+   read by name, so an unknown recorded key is ignored there too.
+51. _add new gotchas here as they are discovered_

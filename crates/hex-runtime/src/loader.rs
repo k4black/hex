@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use hex_kernel::graph::{
-    Accept, Budget, CommandMode, CommandStep, Context, DEFAULT_ATTEMPT_ELAPSED_MS, Edge, Graph,
-    Node, NodeSpec, Requirement,
+    Accept, Budget, CommandMode, CommandStep, Context, DEFAULT_ATTEMPT_ELAPSED_MS,
+    DEFAULT_NODE_VISITS, Edge, Graph, Node, NodeSpec, Requirement,
 };
 use hex_proto::Disposition;
 use indexmap::IndexMap;
@@ -83,12 +83,10 @@ struct RawDefaults {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBudget {
-    attempts: Option<u32>,
     elapsed: Option<String>,
     /// Per-attempt wall-clock bound (e.g. `20m`). Defaults to
     /// [`DEFAULT_ATTEMPT_ELAPSED_MS`] so no attempt ever waits forever.
     attempt: Option<String>,
-    cycle_visits: Option<u32>,
     /// Run-wide bound on *generation* tokens (see [`Budget::output_tokens`]).
     /// A plain count: unlike a duration there is no unit to spell.
     output_tokens: Option<u64>,
@@ -250,12 +248,17 @@ pub fn load_with(
                 to: to.clone(),
             });
         }
-        let max_visits = node.budget.as_ref().and_then(|b| b.visits);
-        if max_visits == Some(0) {
-            return Err(HexError::new(format!(
-                "node `{id}` has `budget.visits: 0`, so it could never run"
-            )));
-        }
+        let declared_visits = node.budget.as_ref().and_then(|b| b.visits);
+        // Every non-terminal node gets a visit bound, whether or not the graph
+        // declares one, so no loop can churn unbounded. A terminal keeps `None`:
+        // `schedule` settles a terminal before any budget check, so a bound there
+        // would be recorded but never enforced (gotcha 18). A declared `0` is
+        // left for `validate` to reject as `E-budget-zero`, with a message that
+        // names the node.
+        let max_visits = match spec.kind() {
+            hex_kernel::NodeKind::Terminal => None,
+            _ => Some(declared_visits.unwrap_or(DEFAULT_NODE_VISITS)),
+        };
         nodes.insert(
             id.clone(),
             Node::new(id.clone(), spec).with_max_visits(max_visits),
@@ -469,7 +472,6 @@ fn compile_budget(raw: Option<&RawBudget>) -> Result<Budget> {
         });
     };
     Ok(Budget {
-        attempts: raw.attempts,
         elapsed_ms: raw.elapsed.as_deref().map(parse_duration_ms).transpose()?,
         // Always bounded: an unbounded attempt let a hung agent block forever.
         attempt_elapsed_ms: Some(
@@ -479,7 +481,6 @@ fn compile_budget(raw: Option<&RawBudget>) -> Result<Budget> {
                 .transpose()?
                 .unwrap_or(DEFAULT_ATTEMPT_ELAPSED_MS),
         ),
-        cycle_visits: raw.cycle_visits,
         output_tokens: raw.output_tokens,
     })
 }
@@ -591,7 +592,13 @@ nodes:
     fn compiles_the_builtin_critique_loop() {
         let g = load(CRITIQUE, &builtin()).expect("loads");
         assert_eq!(g.entry, "implement");
-        assert_eq!(g.budget.attempts, Some(12));
+        // `implement` declares no visits, so it takes the default bound; `review`
+        // declares 4 and keeps it.
+        assert_eq!(
+            g.node("implement").unwrap().max_visits,
+            Some(hex_kernel::graph::DEFAULT_NODE_VISITS)
+        );
+        assert_eq!(g.node("review").unwrap().max_visits, Some(4));
         assert_eq!(g.accept.require.len(), 1);
         assert_eq!(g.accept.on_unmet.as_deref(), Some("implement"));
         // And it passes kernel validation.
@@ -643,8 +650,8 @@ nodes:
             "role preamble comes first: {prompt:.60}"
         );
         assert!(
-            prompt.contains("hex emit approved"),
-            "the node's own prompt survives"
+            prompt.contains("verdict"),
+            "the node's own prompt survives: {prompt:.120}"
         );
     }
 
@@ -738,7 +745,7 @@ nodes:
     }
 
     #[test]
-    fn a_per_node_visit_bound_compiles_and_zero_is_rejected() {
+    fn a_per_node_visit_bound_compiles_and_a_terminal_keeps_none() {
         let src = r#"
 version: 1
 name: bounded
@@ -752,12 +759,39 @@ nodes:
 "#;
         let g = load(src, &builtin()).expect("loads");
         assert_eq!(g.node("a").unwrap().max_visits, Some(3));
-        let zero = src.replace("visits: 3", "visits: 0");
+        // A terminal's `visits` is never enforced (`schedule` settles a terminal
+        // before any budget check), so the loader leaves it `None`.
+        assert_eq!(g.node("done").unwrap().max_visits, None);
+
+        // An undeclared bound is filled with the default rather than left open.
+        let undeclared = src.replace("    budget: { visits: 3 }\n", "");
+        let g = load(&undeclared, &builtin()).expect("loads");
+        assert_eq!(
+            g.node("a").unwrap().max_visits,
+            Some(hex_kernel::graph::DEFAULT_NODE_VISITS)
+        );
+    }
+
+    /// `visits: 0` is spent before the first visit, so it is refused by the
+    /// validator (not the loader) as `E-budget-zero`, naming the node.
+    #[test]
+    fn a_zero_visit_bound_is_rejected_by_validation() {
+        let src = r#"
+version: 1
+name: bounded
+entry: a
+nodes:
+  a:
+    agent: { prompt: "x", may_propose: [again, fin] }
+    budget: { visits: 0 }
+    on: { again: a, fin: done }
+  done: { terminal: succeeded }
+"#;
+        let g = load(src, &builtin()).expect("loads");
+        let issues = hex_kernel::validate(&g).unwrap_err();
         assert!(
-            load(&zero, &builtin())
-                .unwrap_err()
-                .to_string()
-                .contains("could never run")
+            issues.iter().any(|i| i.code == "E-budget-zero"),
+            "{issues:?}"
         );
     }
 

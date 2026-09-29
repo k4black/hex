@@ -97,13 +97,6 @@ impl Ui {
         self.unicode
     }
 
-    /// Whether this stream may emit colour. A backend adapter (e.g. the ratatui
-    /// `hex dash` table) needs the resolved policy, not just the raw `--color`.
-    #[must_use]
-    pub const fn colored(self) -> bool {
-        self.color
-    }
-
     /// Terminal width, when one is knowable. `None` means never truncate.
     #[must_use]
     pub const fn width(self) -> Option<usize> {
@@ -146,16 +139,23 @@ impl Ui {
         )
     }
 
-    /// A status glyph, coloured to match its meaning. Both the glyph and the
-    /// colour come from [`Mark`] itself, so a backend adapter can derive the
-    /// same badge from the same data.
+    /// A status glyph, coloured to match its meaning. Glyph and colour come
+    /// from one match on [`Mark`], so a green `✗` is unrepresentable.
     #[must_use]
     pub fn mark(self, m: Mark) -> String {
-        let style = match m.hue() {
+        let (uni, ascii, hue) = match m {
+            Mark::Ok => ("✓", "+", Some(AnsiColor::Green)),
+            Mark::Fail => ("✗", "x", Some(AnsiColor::Red)),
+            Mark::Warn => ("!", "!", Some(AnsiColor::Yellow)),
+            Mark::Running => ("▸", ">", Some(AnsiColor::Cyan)),
+            Mark::Idle => ("·", ".", None),
+        };
+        let style = match hue {
             Some(c) => Style::new().fg_color(Some(anstyle::Color::Ansi(c))),
             None => style::DIM,
         };
-        self.paint(style, m.glyph(self.unicode)).to_string()
+        self.paint(style, if self.unicode { uni } else { ascii })
+            .to_string()
     }
 }
 
@@ -248,40 +248,6 @@ pub enum Mark {
     Running,
     /// Paused, queued, cancelled.
     Idle,
-}
-
-impl Mark {
-    /// The glyph for this mark in the given charset — the single source of
-    /// truth shared by [`Ui::mark`] and any backend adapter (e.g. the ratatui
-    /// `hex dash` table), so the two can never draw a different badge.
-    #[must_use]
-    pub const fn glyph(self, unicode: bool) -> &'static str {
-        match (self, unicode) {
-            (Mark::Ok, true) => "✓",
-            (Mark::Ok, false) => "+",
-            (Mark::Fail, true) => "✗",
-            (Mark::Fail, false) => "x",
-            (Mark::Warn, _) => "!",
-            (Mark::Running, true) => "▸",
-            (Mark::Running, false) => ">",
-            (Mark::Idle, true) => "·",
-            (Mark::Idle, false) => ".",
-        }
-    }
-
-    /// The mark's semantic colour as a four-bit ANSI hue, or `None` for the
-    /// hueless "dim" marks. Backend-neutral: [`Ui::mark`] renders it with
-    /// anstyle, a ratatui adapter maps it to `ratatui::style::Color`.
-    #[must_use]
-    pub const fn hue(self) -> Option<AnsiColor> {
-        match self {
-            Mark::Ok => Some(AnsiColor::Green),
-            Mark::Fail => Some(AnsiColor::Red),
-            Mark::Warn => Some(AnsiColor::Yellow),
-            Mark::Running => Some(AnsiColor::Cyan),
-            Mark::Idle => None,
-        }
-    }
 }
 
 /// The palette. Four-bit ANSI only, so it inherits the user's theme instead of
@@ -538,20 +504,7 @@ fn reclothe(original: &str, body: &str) -> String {
 
 /// Text without ANSI escapes, for measuring.
 fn strip(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_escape = false;
-    for c in s.chars() {
-        if in_escape {
-            if c == 'm' {
-                in_escape = false;
-            }
-        } else if c == '\u{1b}' {
-            in_escape = true;
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    anstream::adapter::strip_str(s).to_string()
 }
 
 #[cfg(test)]

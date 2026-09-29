@@ -3,22 +3,22 @@
 # This layers over the built-in defaults (crates/hex-runtime/src/defaults.yaml);
 # only the keys below differ, and each key set here wins for this project.
 
+# Cross-model through one CLI: deepseek implements, glm reviews, both via pi.
+# (opencode as the reviewer worker is parked 2026-09-15: its `--format json`
+# mode errors and its default mode hangs on piped stdout — headless-unusable.)
+# Pi model ids need the provider prefix (gotcha 48).
 roles:
-  # pi (gemini flash via openrouter) reviews what claude wrote: a different
-  # model reviews than wrote the code (rationale: TODO.md; was codex before
-  # the 2026-09-05 dogfood pass).
+  implementer:
+    worker: pi
+    model: openrouter/deepseek/deepseek-v4.1-flash
+
   reviewer:
     worker: pi
-    model: openrouter/google/gemini-3.8-flash
+    model: openrouter/z-ai/glm-5.3
     prompt_append: |
       This is a Rust workspace with hard architectural invariants in AGENTS.md —
       read it before judging a design choice, and say so if a change violates one.
       Prefer concrete objections (file:line, a failure scenario) over style notes.
-
-  implementer:
-    worker: claude
-    model: opus
-    effort: high
 
 # What "green" means here. Referenced by graphs as `command: { check: <name> }`.
 checks:

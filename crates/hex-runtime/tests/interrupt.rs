@@ -17,7 +17,7 @@ use common::temp_root;
 use hex_proto::EventBody;
 use hex_runtime::config::Config;
 use hex_runtime::{Isolation, Runtime, Status, Workers};
-use hex_worker::CommandWorker;
+use hex_worker::{CommandWorker, ResultCapture};
 
 mod common;
 
@@ -27,7 +27,7 @@ const SLOW_GRAPH: &str = r#"
 version: 1
 name: slow
 entry: work
-defaults: { budget: { attempts: 4, attempt: 120s } }
+defaults: { budget: { attempt: 120s } }
 nodes:
   work:
     agent: { worker: sleeper, prompt: "work", may_propose: [ready] }
@@ -57,17 +57,22 @@ fn an_interrupt_kills_the_agent_and_pauses_the_run() {
     let mut ws = Workers::new();
     ws.insert(
         "sleeper",
-        Box::new(CommandWorker::new(
-            "sleeper",
-            vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                // `exec` so the process we signal *is* the sleeper: if the group
-                // kill regressed to `child.kill()`, a wrapping shell would die
-                // and the sleep would survive, which is the original bug.
-                "exec sleep 120".to_owned(),
-            ],
-        )),
+        Box::new(
+            CommandWorker::new(
+                "sleeper",
+                vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    // `exec` so the process we signal *is* the sleeper: if the group
+                    // kill regressed to `child.kill()`, a wrapping shell would die
+                    // and the sleep would survive, which is the original bug.
+                    "exec sleep 120".to_owned(),
+                ],
+            )
+            // The node declares an outcome, so the worker must be able to capture
+            // a verdict — even though this attempt dies before writing one.
+            .with_result_capture(Some(ResultCapture::Text)),
+        ),
     );
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), ws);
 

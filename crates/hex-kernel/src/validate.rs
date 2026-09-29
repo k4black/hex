@@ -2,8 +2,8 @@
 //!
 //! Operates on the compiled [`Graph`] only (surface parsing lives in the
 //! runtime). Catches the errors that make a run undefined *before* any worker
-//! spends a token: dangling references, unreachable nodes, unbounded cycles,
-//! and agent proposals that cannot route.
+//! spends a token: dangling references, unreachable nodes, a zero budget that is
+//! spent before the first visit, and agent proposals that cannot route.
 
 use std::collections::BTreeSet;
 
@@ -15,7 +15,7 @@ use crate::lifecycle;
 /// A single validation failure, located by node/edge where possible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Issue {
-    /// Machine-stable code, e.g. `E-unbounded-cycle`.
+    /// Machine-stable code, e.g. `E-budget-zero`.
     pub code: &'static str,
     /// Human-readable explanation.
     pub message: String,
@@ -54,6 +54,18 @@ pub fn validate(graph: &Graph) -> Result<(), Vec<Issue>> {
              for no bound, or give it a real ceiling",
         ));
     }
+    for node in graph.nodes.values() {
+        if node.max_visits == Some(0) {
+            issues.push(Issue::new(
+                "E-budget-zero",
+                format!(
+                    "node `{}` has `budget: {{ visits: 0 }}`, so it could never run — \
+                     omit it for the default bound, or give it a real ceiling",
+                    node.id
+                ),
+            ));
+        }
+    }
 
     if graph.nodes.is_empty() {
         issues.push(Issue::new("E-empty", "graph has no nodes"));
@@ -86,8 +98,6 @@ pub fn validate(graph: &Graph) -> Result<(), Vec<Issue>> {
     check_signal_names(graph, &mut issues);
     check_acceptance(graph, &mut issues);
     check_result_refs(graph, &mut issues);
-
-    check_cycles(graph, &mut issues);
 
     if issues.is_empty() {
         Ok(())
@@ -149,13 +159,27 @@ fn check_routing(graph: &Graph, issues: &mut Vec<Issue>) {
         match &node.spec {
             NodeSpec::Agent { may_propose, .. } => {
                 let proposable: BTreeSet<&str> = may_propose.iter().map(String::as_str).collect();
-                // `done` is reserved for runtime-synthesized implicit completion;
-                // an agent must not list it as something it proposes.
-                if proposable.contains(DONE_SIGNAL) {
-                    issues.push(Issue::new(
-                        "E-done-reserved",
-                        format!("agent `{}` lists reserved `done` in may_propose", node.id),
-                    ));
+                // `done` and `unknown` are the runtime's to raise — `done` for a
+                // clean finish, `unknown` for a missing or unrecognised verdict.
+                // An agent declaring either would be claiming a signal it can
+                // never produce.
+                for (name, code, what) in [
+                    (DONE_SIGNAL, "E-done-reserved", "implicit completion"),
+                    (
+                        UNKNOWN_SIGNAL,
+                        "E-unknown-reserved",
+                        "a missing or unrecognised verdict",
+                    ),
+                ] {
+                    if proposable.contains(name) {
+                        issues.push(Issue::new(
+                            code,
+                            format!(
+                                "agent `{}` lists reserved `{name}` ({what}) in may_propose",
+                                node.id
+                            ),
+                        ));
+                    }
                 }
                 // Every proposable event must have an edge...
                 for sig in &proposable {
@@ -170,10 +194,9 @@ fn check_routing(graph: &Graph, issues: &mut Vec<Issue>) {
                     }
                 }
                 // ...and every outgoing edge must be proposable — except the
-                // reserved `done`, synthesized by the runtime when an agent
-                // completes cleanly without emitting (implicit completion).
+                // reserved signals, which the runtime raises without an agent.
                 for sig in &edge_signals {
-                    if *sig != DONE_SIGNAL && !proposable.contains(sig) {
+                    if *sig != DONE_SIGNAL && *sig != UNKNOWN_SIGNAL && !proposable.contains(sig) {
                         issues.push(Issue::new(
                             "E-edge-not-proposable",
                             format!(
@@ -182,6 +205,20 @@ fn check_routing(graph: &Graph, issues: &mut Vec<Issue>) {
                             ),
                         ));
                     }
+                }
+                // A node that declares proposals *and* handles `done` is
+                // ambiguous: a clean finish with no verdict would mean both
+                // "implicitly done" and "reported nothing". The runtime cannot
+                // choose, so the shape is refused instead of guessed at.
+                if !proposable.is_empty() && edge_signals.contains(DONE_SIGNAL) {
+                    issues.push(Issue::new(
+                        "E-mixed-done-and-proposals",
+                        format!(
+                            "agent `{}` declares may_propose and also has a `done` edge; a node \
+                             either completes implicitly (`done` only) or reports a verdict",
+                            node.id
+                        ),
+                    ));
                 }
             }
             NodeSpec::Command { .. } => {
@@ -236,8 +273,15 @@ fn check_routing(graph: &Graph, issues: &mut Vec<Issue>) {
 }
 
 /// The reserved routing signal the runtime synthesizes when an agent finishes
-/// cleanly without emitting (implicit completion). Not agent-proposable.
+/// cleanly without reporting a verdict (implicit completion). Not
+/// agent-proposable.
 pub const DONE_SIGNAL: &str = "done";
+
+/// The reserved routing signal the runtime raises when an agent's final message
+/// carried no `VERDICT:` line, or one this node does not declare. Reserved
+/// exactly like `done`: the runtime produces it, never an agent — so it is
+/// exempt from `E-edge-not-proposable` and rejected inside `may_propose`.
+pub const UNKNOWN_SIGNAL: &str = "unknown";
 
 /// Validate the template tokens in agent/human prompts: every `{{…}}` must be
 /// terminated, and every `{{<node>.result}}` must name a node that actually
@@ -351,8 +395,8 @@ fn check_acceptance(graph: &Graph, issues: &mut Vec<Issue>) {
     }
 }
 
-/// Routing event names must fit a small grammar so they survive the
-/// comma-delimited `HEX_MAY_PROPOSE` channel and stay unambiguous.
+/// Routing event names must fit a small grammar so an agent's `VERDICT:` line
+/// and the edge it routes to can never be ambiguous.
 fn check_signal_names(graph: &Graph, issues: &mut Vec<Issue>) {
     let mut check = |name: &str, where_: &str| {
         if !is_valid_signal_name(name) {
@@ -648,138 +692,37 @@ fn reachable_from<'a>(graph: &'a Graph, start: &'a str) -> BTreeSet<&'a str> {
     seen
 }
 
-/// Core rule 5: every cycle is bounded, and an unbounded one is an *error*.
-///
-/// Two things make this more than back-edge detection over `graph.edges`:
-///
-/// 1. **`accept.on_unmet` is a transition no edge describes.** `schedule` moves a
-///    run from a success terminal back to `on_unmet` when the contract is unmet,
-///    so `a → done` with `on_unmet: a` is an edge-acyclic graph that loops for
-///    real. It passed validation with no bound and spun until the driver's
-///    100_000-iteration ceiling — exactly the failure this rule exists to
-///    prevent, hiding from the check that enforces it.
-/// 2. **A per-node `budget.visits` bounds the cycles through that node.** So the
-///    question is not "is there a cycle?" but "is there a cycle that no bound
-///    stops?" — answered by deleting the nodes that carry their own bound and
-///    looking for a cycle in what is left. A cycle that survives that deletion
-///    passes through no bounded node, so nothing stops it.
-fn check_cycles(graph: &Graph, issues: &mut Vec<Issue>) {
-    // The blanket visit cap stops every cycle: every cycle contains a
-    // non-terminal node (a terminal's only exit is the implicit reroute, whose
-    // target is validated non-terminal), and `schedule` checks `cycle_visits`
-    // at every non-terminal before acting.
-    if graph.budget.cycle_visits.is_some() {
-        return;
-    }
-    // `budget.attempts` stops only cycles that *spend* attempts. A human
-    // response and a terminal reroute cost none, so a cycle of only those
-    // nodes spins under any attempt budget — it needs a visit bound.
-    let attempts_bounded = graph.budget.attempts.is_some();
-    let implicit = graph.implicit_reroutes();
-    if !has_unbounded_cycle(graph, &implicit, attempts_bounded) {
-        return;
-    }
-    // Name the implicit transition when it is what closes the loop: an author
-    // staring at acyclic-looking edges has no other way to see it.
-    let via_unmet = !has_unbounded_cycle(graph, &[], attempts_bounded);
-    let mut message = if attempts_bounded {
-        String::from(
-            "graph contains a cycle that spends no attempts (human/terminal \
-             only), so budget.attempts cannot stop it — set budget.cycle_visits \
-             or `budget: { visits: N }` on a non-terminal node in the cycle",
-        )
-    } else {
-        String::from(
-            "graph contains a cycle that no bound stops (set budget.attempts, \
-             budget.cycle_visits, or `budget: { visits: N }` on a non-terminal \
-             node in the cycle)",
-        )
-    };
-    if via_unmet && let Some(to) = &graph.accept.on_unmet {
-        message.push_str(&format!(
-            " — the cycle is closed by `accept.on_unmet: {to}`, which sends a success \
-             terminal back to `{to}` whenever the acceptance contract is unmet"
-        ));
-    }
-    issues.push(Issue::new("E-unbounded-cycle", message));
-}
-
-/// DFS back-edge detection over the graph's transitions (`edges` plus `extra`),
-/// ignoring nodes something already bounds every cycle through. A back edge
-/// found among what remains is an unbounded cycle.
-///
-/// A node breaks a cycle when its own `budget.visits` is enforced there, or —
-/// with `attempts_bounded` — when entering it spends an attempt. Two former
-/// holes (TODO round 3) live in that sentence: a **terminal's** `visits` is
-/// *not* enforced (`schedule` settles terminals before any budget check, so a
-/// reroute past it spins forever), and a `human` node spends **no attempt**
-/// (a human-only cycle runs free under any attempt budget).
-fn has_unbounded_cycle(graph: &Graph, extra: &[(&str, &str)], attempts_bounded: bool) -> bool {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Mark {
-        Open,
-        Done,
-    }
-    fn breaks_cycle(graph: &Graph, id: &str, attempts_bounded: bool) -> bool {
-        graph.node(id).is_some_and(|n| {
-            let kind = n.spec.kind();
-            let own_bound = n.max_visits.is_some() && kind != NodeKind::Terminal;
-            let spends_attempt = matches!(kind, NodeKind::Agent | NodeKind::Command);
-            own_bound || (attempts_bounded && spends_attempt)
-        })
-    }
-    fn visit<'a>(
-        graph: &'a Graph,
-        extra: &[(&'a str, &'a str)],
-        attempts_bounded: bool,
-        id: &'a str,
-        marks: &mut std::collections::BTreeMap<&'a str, Mark>,
-    ) -> bool {
-        marks.insert(id, Mark::Open);
-        let targets = graph
-            .edges
-            .iter()
-            .filter(|e| e.from == id)
-            .map(|e| e.to.as_str())
-            .chain(
-                extra
-                    .iter()
-                    .filter(|(from, _)| *from == id)
-                    .map(|(_, to)| *to),
-            );
-        for to in targets {
-            if breaks_cycle(graph, to, attempts_bounded) {
-                continue; // any cycle through `to` is stopped at `to`
-            }
-            match marks.get(to) {
-                Some(Mark::Open) => return true,
-                Some(Mark::Done) => {}
-                None => {
-                    if visit(graph, extra, attempts_bounded, to, marks) {
-                        return true;
-                    }
-                }
-            }
-        }
-        marks.insert(id, Mark::Done);
-        false
-    }
-
-    let mut marks = std::collections::BTreeMap::new();
-    graph.nodes.keys().any(|id| {
-        !breaks_cycle(graph, id, attempts_bounded)
-            && !marks.contains_key(id.as_str())
-            && visit(graph, extra, attempts_bounded, id, &mut marks)
-    })
-}
-
+// Core rule 5 — every cycle is bounded — no longer needs an analysis here:
+// with every non-terminal node visit-bounded by the loader, an unbounded cycle
+// cannot be constructed. There is deliberately no `check_cycles`.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Budget, Graph};
+    use crate::graph::Graph;
     use hex_proto::Disposition;
 
-    fn cyclic(budget: Budget) -> Graph {
+    /// Core rule 5 is enforced *by construction* now: the loader fills every
+    /// non-terminal node's visit bound (`DEFAULT_NODE_VISITS`, or a declared
+    /// `budget: { visits: N }`), so an unbounded cycle cannot be built and the
+    /// old `check_cycles`/`E-unbounded-cycle` analysis is gone. What is still
+    /// worth validating is a bound that is spent before anything runs: a
+    /// declared `visits: 0`.
+    #[test]
+    fn a_zero_visit_bound_is_rejected() {
+        let g = Graph::builder("t", "a")
+            .agent("a", "w", "p", &["go"])
+            .terminal("done", Disposition::Succeeded)
+            .edge("a", "go", "done")
+            .max_visits("a", 0)
+            .build();
+        let issues = validate(&g).unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.code == "E-budget-zero"),
+            "{issues:?}"
+        );
+    }
+
+    fn cyclic() -> Graph {
         Graph::builder("t", "implement")
             .agent("implement", "codex", "p", &["ready"])
             .command("test", &["true"])
@@ -787,17 +730,25 @@ mod tests {
             .edge("implement", "ready", "test")
             .edge("test", "passed", "done")
             .edge("test", "failed", "implement")
-            .budget(budget)
             .require("test", "passed")
             .build()
     }
 
-    /// A run-bounding budget, so cycle validation is not the thing under test.
-    fn bounded() -> Budget {
-        Budget {
-            attempts: Some(2),
-            ..Budget::default()
+    /// `implement --ready|blocked--> done`, acceptance requiring `implement.ready`
+    /// and rerouting on unmet. A visit bound is optional here: with the run-wide
+    /// retry budgets gone, cycle validation no longer exists to require one.
+    fn unmet_loop_graph(node_visits: Option<u32>) -> Graph {
+        let mut builder = Graph::builder("t", "implement")
+            .agent("implement", "w", "p", &["ready", "blocked"])
+            .terminal("done", Disposition::Succeeded)
+            .edge("implement", "ready", "done")
+            .edge("implement", "blocked", "done")
+            .require("implement", "ready")
+            .on_unmet("implement");
+        if let Some(visits) = node_visits {
+            builder = builder.max_visits("implement", visits);
         }
+        builder.build()
     }
 
     /// Assert `validate` rejects the graph with the given issue code.
@@ -807,150 +758,10 @@ mod tests {
     }
 
     #[test]
-    fn bounded_cycle_is_valid() {
-        let g = cyclic(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        });
-        assert!(validate(&g).is_ok(), "{:?}", validate(&g));
-    }
-
-    #[test]
-    fn unbounded_cycle_is_rejected() {
-        let g = cyclic(Budget::default());
-        rejects(&g, "E-unbounded-cycle");
-    }
-
-    /// `implement --ready|blocked--> done`, acceptance requiring `implement.ready`
-    /// and rerouting on unmet. **Edge-acyclic**, yet it loops: reaching `done`
-    /// having emitted `blocked` sends the run back to `implement` via
-    /// `accept.on_unmet`, a transition no `Edge` describes.
-    fn unmet_loop_graph(budget: Budget, node_visits: Option<u32>) -> Graph {
-        let mut builder = Graph::builder("t", "implement")
-            .agent("implement", "w", "p", &["ready", "blocked"])
-            .terminal("done", Disposition::Succeeded)
-            .edge("implement", "ready", "done")
-            .edge("implement", "blocked", "done")
-            .budget(budget)
-            .require("implement", "ready")
-            .on_unmet("implement");
-        if let Some(visits) = node_visits {
-            builder = builder.max_visits("implement", visits);
-        }
-        builder.build()
-    }
-
-    /// Core rule 5, at the one place it was blind: the cycle `accept.on_unmet`
-    /// creates is invisible to edge traversal, so an unbounded one used to pass
-    /// validation and then spin until the driver's iteration ceiling.
-    #[test]
-    fn an_unbounded_on_unmet_cycle_is_rejected() {
-        let g = unmet_loop_graph(Budget::default(), None);
-        let issues = validate(&g).unwrap_err();
-        let issue = issues
-            .iter()
-            .find(|i| i.code == "E-unbounded-cycle")
-            .unwrap_or_else(|| panic!("{issues:?}"));
-        assert!(
-            issue.message.contains("accept.on_unmet"),
-            "the message must name the transition that closes the loop: {issue}"
-        );
-    }
-
-    #[test]
-    fn a_bounded_on_unmet_cycle_is_valid() {
-        let g = unmet_loop_graph(
-            Budget {
-                attempts: Some(4),
-                ..Budget::default()
-            },
-            None,
-        );
-        assert!(validate(&g).is_ok(), "{:?}", validate(&g));
-    }
-
-    /// A per-node bound bounds the cycles through that node, so it is a bound for
-    /// core rule 5's purposes even with no run-wide budget declared.
-    #[test]
-    fn a_per_node_visit_bound_bounds_its_cycle() {
-        let g = unmet_loop_graph(Budget::default(), Some(3));
-        assert!(validate(&g).is_ok(), "{:?}", validate(&g));
-    }
-
-    /// A **terminal's** `budget.visits` is never enforced — `schedule` settles
-    /// terminals before any budget check — so it must not count as a cycle
-    /// breaker. This graph passed validation and then rerouted forever (open
-    /// bug from review round 3).
-    #[test]
-    fn a_terminal_visit_bound_does_not_bound_a_reroute_cycle() {
-        let g = Graph::builder("t", "implement")
-            .agent("implement", "w", "p", &["ready", "blocked"])
-            .terminal("done", Disposition::Succeeded)
-            .edge("implement", "ready", "done")
-            .edge("implement", "blocked", "done")
-            .require("implement", "ready")
-            .on_unmet("implement")
-            .max_visits("done", 3)
-            .build();
-        rejects(&g, "E-unbounded-cycle");
-    }
-
-    /// A human response spends no attempt, so `budget.attempts` cannot stop a
-    /// human-only cycle — with `attempts: 2` this spun forever while validation
-    /// passed (open bug from review round 3). A visit bound on a node in the
-    /// cycle is the fix, and must satisfy the validator.
-    #[test]
-    fn an_attempt_budget_does_not_bound_a_human_only_cycle() {
-        let human_loop = |visits: Option<u32>| {
-            let mut b = Graph::builder("t", "ask")
-                .human("ask", "q1")
-                .human("confirm", "q2")
-                .terminal("done", Disposition::Succeeded)
-                .edge("ask", "answered", "confirm")
-                .edge("confirm", "answered", "ask")
-                .budget(bounded());
-            if let Some(v) = visits {
-                b = b.max_visits("ask", v);
-            }
-            b.build()
-        };
-        let issues = validate(&human_loop(None)).unwrap_err();
-        assert!(
-            issues
-                .iter()
-                .any(|i| i.code == "E-unbounded-cycle" && i.message.contains("spends no attempts")),
-            "{issues:?}"
-        );
-        let bounded = human_loop(Some(3));
-        // Only the cycle finding may remain absent; other validators (e.g. the
-        // human single-edge rule) are not under test here.
-        if let Err(issues) = validate(&bounded) {
-            assert!(
-                !issues.iter().any(|i| i.code == "E-unbounded-cycle"),
-                "{issues:?}"
-            );
-        }
-    }
-
-    /// An `accept.require` that can never be unmet adds no implicit transition, so
-    /// an `on_unmet` on an otherwise acyclic graph must not be reported as a loop.
-    #[test]
-    fn on_unmet_without_requirements_is_not_a_cycle() {
-        let g = Graph::builder("t", "a")
-            .agent("a", "w", "p", &["go"])
-            .terminal("done", Disposition::Succeeded)
-            .edge("a", "go", "done")
-            .on_unmet("a")
-            .build();
-        assert!(validate(&g).is_ok(), "{:?}", validate(&g));
-    }
-
-    #[test]
     fn dangling_edge_target_is_rejected() {
         let g = Graph::builder("t", "a")
             .agent("a", "w", "p", &["go"])
             .edge("a", "go", "nowhere")
-            .budget(bounded())
             .build();
         rejects(&g, "E-edge-to");
     }
@@ -961,7 +772,6 @@ mod tests {
             .agent("a", "w", "p", &["go", "stop"])
             .terminal("done", Disposition::Succeeded)
             .edge("a", "go", "done")
-            .budget(bounded())
             .build();
         rejects(&g, "E-proposal-no-edge");
     }
@@ -1007,19 +817,13 @@ mod tests {
 
     #[test]
     fn check_journal_accepts_a_well_formed_prefix() {
-        let g = cyclic(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        });
+        let g = cyclic();
         assert!(check_journal(&g, &started_journal()).is_ok());
     }
 
     #[test]
     fn check_journal_rejects_attempt_on_wrong_node() {
-        let g = cyclic(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        });
+        let g = cyclic();
         let mut events = started_journal();
         // The graph's entry is `implement`; an attempt on `test` is impossible.
         events[2].node_id = Some("test".to_owned());
@@ -1028,10 +832,7 @@ mod tests {
 
     #[test]
     fn check_journal_rejects_success_flavored_failure() {
-        let g = cyclic(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        });
+        let g = cyclic();
         let mut events = started_journal();
         events.push(ev(
             3,
@@ -1047,10 +848,7 @@ mod tests {
 
     #[test]
     fn check_journal_accepts_one_node_result_on_an_agent_attempt() {
-        let g = cyclic(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        });
+        let g = cyclic();
         let mut events = started_journal();
         events.push(ev(
             3,
@@ -1065,10 +863,7 @@ mod tests {
 
     #[test]
     fn check_journal_rejects_two_node_results_for_one_attempt() {
-        let g = cyclic(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        });
+        let g = cyclic();
         let mut events = started_journal();
         for seq in 3..=4 {
             events.push(ev(
@@ -1085,10 +880,7 @@ mod tests {
 
     #[test]
     fn check_journal_rejects_node_result_on_a_gate_attempt() {
-        let g = cyclic(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        });
+        let g = cyclic();
         let mut events = started_journal();
         // Route implement → test (a gate), start its attempt, then forge a result.
         events.push(ev(
@@ -1126,7 +918,6 @@ mod tests {
             .agent("a", "w", "p", &["go"])
             .terminal("done", Disposition::Succeeded)
             .edge("a", "go", "done")
-            .budget(bounded())
             .require("a", "nope")
             .build();
         rejects(&g, "E-accept-unsatisfiable");
@@ -1138,7 +929,6 @@ mod tests {
             .agent("a", "w", "p", &["Go Now"])
             .terminal("done", Disposition::Succeeded)
             .edge("a", "Go Now", "done")
-            .budget(bounded())
             .build();
         rejects(&g, "E-bad-signal-name");
     }
@@ -1154,10 +944,6 @@ mod tests {
             .edge("implement", "done", "test")
             .edge("test", "passed", "done")
             .edge("test", "failed", "implement")
-            .budget(Budget {
-                attempts: Some(4),
-                ..Budget::default()
-            })
             .require("test", "passed")
             .build();
         assert!(validate(&g).is_ok(), "{:?}", validate(&g));
@@ -1169,7 +955,6 @@ mod tests {
             .agent("a", "w", "use {{ghost.result}}", &["go"])
             .terminal("done", Disposition::Succeeded)
             .edge("a", "go", "done")
-            .budget(bounded())
             .build();
         rejects(&g, "E-result-ref");
     }
@@ -1184,10 +969,6 @@ mod tests {
             .edge("a", "go", "check")
             .edge("check", "passed", "done")
             .edge("check", "failed", "a")
-            .budget(Budget {
-                attempts: Some(4),
-                ..Budget::default()
-            })
             .require("check", "passed")
             .build();
         rejects(&g, "E-result-ref");
@@ -1199,7 +980,6 @@ mod tests {
             .agent("a", "w", "look at {{ghost.result and go", &["go"])
             .terminal("done", Disposition::Succeeded)
             .edge("a", "go", "done")
-            .budget(bounded())
             .build();
         rejects(&g, "E-result-ref");
     }
@@ -1211,7 +991,6 @@ mod tests {
             .agent("a", "w", "p", &[])
             .terminal("fin", Disposition::Succeeded)
             .edge("a", "done", "fin")
-            .budget(bounded())
             .require("a", "done")
             .build();
         assert!(validate(&g).is_ok(), "{:?}", validate(&g));
@@ -1223,9 +1002,48 @@ mod tests {
             .agent("a", "w", "p", &["done"])
             .terminal("fin", Disposition::Succeeded)
             .edge("a", "done", "fin")
-            .budget(bounded())
             .build();
         rejects(&g, "E-done-reserved");
+    }
+
+    /// `unknown` is the runtime's to raise (a missing or unrecognised verdict),
+    /// so an agent declaring it would be claiming a signal it cannot produce.
+    #[test]
+    fn reserved_unknown_in_may_propose_is_rejected() {
+        let g = Graph::builder("t", "a")
+            .agent("a", "w", "p", &["unknown"])
+            .terminal("fin", Disposition::Succeeded)
+            .edge("a", "unknown", "fin")
+            .build();
+        rejects(&g, "E-unknown-reserved");
+    }
+
+    /// A node may route its `unknown` case without declaring it, exactly as it
+    /// does `done`: the runtime raises both, an agent reports neither.
+    #[test]
+    fn an_unknown_edge_needs_no_declaration() {
+        let g = Graph::builder("t", "a")
+            .agent("a", "w", "p", &["go"])
+            .terminal("fin", Disposition::Succeeded)
+            .terminal("stop", Disposition::Failed)
+            .edge("a", "go", "fin")
+            .edge("a", "unknown", "stop")
+            .build();
+        assert!(validate(&g).is_ok(), "{:?}", validate(&g));
+    }
+
+    /// Declaring outcomes *and* handling `done` is ambiguous: a clean finish with
+    /// no verdict would mean both "implicitly done" and "reported nothing", and
+    /// the runtime must not guess which the author meant.
+    #[test]
+    fn declaring_outcomes_and_a_done_edge_together_is_rejected() {
+        let g = Graph::builder("t", "a")
+            .agent("a", "w", "p", &["go"])
+            .terminal("fin", Disposition::Succeeded)
+            .edge("a", "go", "fin")
+            .edge("a", "done", "fin")
+            .build();
+        rejects(&g, "E-mixed-done-and-proposals");
     }
 
     /// A `human` node with the edges it needs: `hex validate` used to accept
@@ -1282,10 +1100,7 @@ mod tests {
 
     #[test]
     fn check_journal_accepts_a_pause_resume_bracket() {
-        let g = cyclic(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        });
+        let g = cyclic();
         let mut events = vec![started_journal()[0].clone(), started_journal()[1].clone()];
         events.push(ev(2, None, None, EventBody::RunPaused));
         events.push(ev(
@@ -1308,10 +1123,7 @@ mod tests {
     /// A failed attempt journal, optionally followed by a `RunFinished` — the
     /// shape the driver now writes on every path.
     fn failed_journal(trailing: Option<Disposition>) -> (Graph, Vec<Event>) {
-        let g = cyclic(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        });
+        let g = cyclic();
         let mut events = started_journal();
         events.push(ev(
             3,
@@ -1374,10 +1186,7 @@ mod tests {
 
     #[test]
     fn check_journal_rejects_an_attempt_started_while_paused() {
-        let g = cyclic(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        });
+        let g = cyclic();
         let mut events = vec![started_journal()[0].clone(), started_journal()[1].clone()];
         events.push(ev(2, None, None, EventBody::RunPaused));
         events.push(started_journal()[2].clone());
@@ -1478,13 +1287,7 @@ mod tests {
     /// because `reduce` moved its current node and this function did not.
     #[test]
     fn check_journal_accepts_a_reroute_and_the_attempt_that_follows_it() {
-        let g = unmet_loop_graph(
-            Budget {
-                attempts: Some(4),
-                ..Budget::default()
-            },
-            None,
-        );
+        let g = unmet_loop_graph(None);
         let mut events = vec![
             ev(
                 0,
@@ -1568,13 +1371,7 @@ mod tests {
     /// `accept.on_unmet` never named) is a forgery, not a transition.
     #[test]
     fn check_journal_rejects_a_reroute_the_kernel_could_not_emit() {
-        let g = unmet_loop_graph(
-            Budget {
-                attempts: Some(4),
-                ..Budget::default()
-            },
-            None,
-        );
+        let g = unmet_loop_graph(None);
         let events = vec![
             ev(
                 0,
@@ -1666,10 +1463,7 @@ mod tests {
     /// `Steered` planted before `run_created` reached the very first prompt.
     #[test]
     fn check_journal_rejects_steering_before_the_run_exists() {
-        let g = cyclic(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        });
+        let g = cyclic();
         let mut events = vec![ev(
             0,
             None,
@@ -1689,10 +1483,7 @@ mod tests {
     /// nothing drains the inbox and no `Steered` can be recorded.
     #[test]
     fn check_journal_rejects_steering_mid_attempt() {
-        let g = cyclic(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        });
+        let g = cyclic();
         let mut events = started_journal();
         events.push(ev(
             3,
@@ -1712,7 +1503,6 @@ mod tests {
             .terminal("done", Disposition::Succeeded)
             .terminal("orphan", Disposition::Failed)
             .edge("a", "go", "done")
-            .budget(bounded())
             .build();
         rejects(&g, "E-unreachable");
     }

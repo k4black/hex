@@ -31,14 +31,14 @@ workers:
 # implementer, so the model that judges the change is not the one that wrote it.
 roles:
   implementer:
-    worker: codex
+    worker: claude
     prompt: |
       You are making a focused change in this repository. Prefer the smallest
       diff that fully does the job, and follow the conventions already present
       in the files you touch.
 
   reviewer:
-    worker: claude
+    worker: codex
     read_only: true
     prompt: |
       You are reviewing, not implementing. Do not edit files. Judge correctness,

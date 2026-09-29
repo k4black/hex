@@ -1,6 +1,6 @@
 //! Writing to stdout without dying when the reader goes away.
 //!
-//! `println!` panics on `EPIPE`, so `hex watch <run> | head` ended in a Rust
+//! `println!` panics on `EPIPE`, so `hex logs <run> | head` ended in a Rust
 //! panic and a backtrace hint instead of simply stopping — and piping into
 //! `head`, `less` or `grep -q` is the whole point of half these verbs. A closed
 //! pipe is a normal end of output, not a failure, so it exits 0 quietly, the way

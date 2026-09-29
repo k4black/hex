@@ -20,7 +20,6 @@ defaults:
   role: reviewer
   context: fresh
   budget:
-    attempts: 6
     elapsed: 90m
     # A real review of a large diff at high reasoning effort takes a while: 15m
     # killed codex mid-review on a ~5k-line change. Bound it, but not tightly.
@@ -71,11 +70,9 @@ nodes:
             journal record desync the projection
           - anything documented as working that is not, or vice versa
 
-        If the change is sound, run:
-          hex emit approved
-        Otherwise put your findings in your final message, ordered most serious
-        first, each with file:line and why it matters. Then run:
-          hex emit changes_requested
+        If the change is sound say so in your verdict; otherwise put your
+        findings in your final message, ordered most serious first, each with
+        file:line and why it matters.
       may_propose: [approved, changes_requested]
     # At most two review rounds: this graph has no implementer, so a second pass
     # only helps if a human fixed something in between.

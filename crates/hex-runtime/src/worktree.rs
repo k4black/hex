@@ -35,8 +35,10 @@ pub struct Slot {
     pub dir: PathBuf,
     /// The run's branch, `hex/<run-id>`.
     pub branch: String,
-    /// The base ref requested (`HEAD` or a branch name), recorded for resume.
-    pub base_ref: String,
+    /// The resolved base commit the branch was cut from. The sha, not the ref
+    /// name: on the run's branch `HEAD` points at the branch tip, so a banner
+    /// telling a reviewer to `git diff HEAD...HEAD` would name an empty range.
+    pub base_sha: String,
     /// Whether the slot needs warmup (freshly created or reclaimed — not a clean
     /// warm reuse).
     pub warmup_needed: bool,
@@ -123,7 +125,7 @@ pub fn ensure_gitignored(root: &Path, entry: &str) -> Result<()> {
 ///
 /// # Errors
 /// Fails on git or IO errors, or if the pool is implausibly exhausted.
-pub fn lease(root: &Path, branch: &str, base_ref: &str, base_sha: &str) -> Result<Slot> {
+pub fn lease(root: &Path, branch: &str, base_sha: &str) -> Result<Slot> {
     let pool = root.join(WORKTREES_DIR);
     std::fs::create_dir_all(&pool)?;
     for n in 0..1024u32 {
@@ -164,7 +166,7 @@ pub fn lease(root: &Path, branch: &str, base_ref: &str, base_sha: &str) -> Resul
         return Ok(Slot {
             dir,
             branch: branch.to_owned(),
-            base_ref: base_ref.to_owned(),
+            base_sha: base_sha.to_owned(),
             warmup_needed,
             reclaimed,
             _lock: lock,
@@ -181,12 +183,7 @@ pub fn lease(root: &Path, branch: &str, base_ref: &str, base_sha: &str) -> Resul
 /// # Errors
 /// Fails if the slot is locked by another process or cannot be recreated.
 pub fn reattach(root: &Path, dir: &Path, branch: &str) -> Result<File> {
-    let pool = root.join(WORKTREES_DIR);
-    let n = dir
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let lock = crate::try_lock_file(&pool.join(format!("{n}.lock")))?
+    let lock = slot_lock(root, dir)?
         .ok_or_else(|| HexError::new("this run's worktree is locked by another process"))?;
     if dir.join(".git").exists() {
         return Ok(lock); // checkout intact
@@ -205,6 +202,48 @@ pub fn reattach(root: &Path, dir: &Path, branch: &str) -> Result<File> {
     let _ = git(root, &["worktree", "prune"]);
     git(root, &["worktree", "add", &dir.to_string_lossy(), branch])?;
     Ok(lock)
+}
+
+/// The advisory lock anchoring slot `dir`, `Ok(Some)` when acquired. One home
+/// for the pool's lock-naming convention — `lease`, `reattach` and
+/// `release_slot` (which gates a `remove_dir_all` on it) all derive it here.
+fn slot_lock(root: &Path, dir: &Path) -> Result<Option<File>> {
+    let n = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| HexError::new("worktree slot path has no name"))?;
+    crate::try_lock_file(&root.join(WORKTREES_DIR).join(format!("{n}.lock")))
+}
+
+/// Remove a slot directory if no live run holds it and it is still on `branch`.
+/// Returns whether it was removed. Best-effort by design: a busy, already-gone,
+/// or reused slot returns false, and the branch is left alone either way (hex
+/// never deletes a run's branch).
+pub fn release_slot(root: &Path, dir: &Path, branch: &str) -> bool {
+    if !dir.is_dir() {
+        return false; // an earlier prune of a run sharing this slot already took it
+    }
+    // Hold the slot's lock while removing: a live run leases it for the run's
+    // duration, and an OS lock is the only thing that proves nobody is using it.
+    let Ok(Some(lock)) = slot_lock(root, dir) else {
+        return false;
+    };
+    // Slots are pooled: a newer (possibly paused, so unlocked) run may have
+    // reclaimed this one since the pruned run recorded it. Only delete a slot
+    // still checked out on the pruned run's own branch.
+    if git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok()
+        .as_deref()
+        != Some(branch)
+    {
+        return false;
+    }
+    let removed = std::fs::remove_dir_all(dir).is_ok();
+    // Tell git while still holding the lock: a concurrent `lease` that grabbed
+    // the freed slot must not race `worktree add` against stale bookkeeping.
+    let _ = git(root, &["worktree", "prune"]);
+    drop(lock);
+    removed
 }
 
 /// Run the warmup `argv` in `dir`, capturing output under `log_dir`.

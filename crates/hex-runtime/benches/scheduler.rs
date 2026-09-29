@@ -3,7 +3,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use hex_kernel::graph::{Budget, Graph};
+use hex_kernel::graph::Graph;
 use hex_kernel::{RunState, Status, schedule};
 use hex_proto::Disposition;
 use hex_runtime::config::Config;
@@ -16,10 +16,7 @@ fn loop_graph() -> Graph {
         .edge("implement", "ready", "test")
         .edge("test", "passed", "done")
         .edge("test", "failed", "implement")
-        .budget(Budget {
-            attempts: Some(8),
-            ..Budget::default()
-        })
+        .max_visits("implement", 5)
         .require("test", "passed")
         .build()
 }
