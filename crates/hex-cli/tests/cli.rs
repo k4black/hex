@@ -632,6 +632,7 @@ fn init_sets_up_a_bare_repo_and_is_idempotent() {
             ".hex/config.yaml",
             ".gitignore:.hex/runs/",
             ".gitignore:.hex/worktrees/",
+            "~/.config/hex/config.yaml",
         ]
     );
     assert_eq!(
@@ -644,6 +645,12 @@ fn init_sets_up_a_bare_repo_and_is_idempotent() {
     let config = std::fs::read_to_string(p.join(".hex").join("config.yaml")).expect("config");
     assert!(config.contains("checks: {}"), "{config}");
     assert!(config.contains("#     test: [cargo, test"), "{config}");
+    // The user layer is created commented out, so it changes nothing.
+    let user = std::fs::read_to_string(p.join(".config/hex/config.yaml")).expect("user config");
+    assert!(
+        user.contains("#   roles:") && !user.contains("\nroles:"),
+        "{user}"
+    );
 
     let second = hex(p, &["init", "--json"]);
     assert!(second.status.success(), "stderr: {}", stderr(&second));
@@ -652,7 +659,7 @@ fn init_sets_up_a_bare_repo_and_is_idempotent() {
         v["created"].as_array().unwrap().is_empty(),
         "the second run creates nothing: {v}"
     );
-    assert_eq!(v["existed"].as_array().unwrap().len(), 5, "{v}");
+    assert_eq!(v["existed"].as_array().unwrap().len(), 6, "{v}");
     assert_eq!(
         std::fs::read_to_string(p.join(".gitignore")).expect("gitignore"),
         "target/\n.hex/runs/\n.hex/worktrees/\n",
@@ -661,6 +668,10 @@ fn init_sets_up_a_bare_repo_and_is_idempotent() {
     assert_eq!(
         std::fs::read_to_string(p.join(".hex").join("config.yaml")).expect("config"),
         config
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join(".config/hex/config.yaml")).expect("user config"),
+        user
     );
 }
 

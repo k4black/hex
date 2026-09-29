@@ -536,7 +536,7 @@ impl Runtime {
         // with the verified hash), not live config. The prompt is verified
         // present and re-substituted at attempt-start.
         let prompt = inputs.get("prompt").map(String::as_str);
-        // Roles come from the CURRENT live config, by design (gotcha 18): a live
+        // Roles come from the CURRENT live config, by design: a live
         // run keeps the roles it compiled, and pause/stop + resume recompiles
         // with the updated `roles:` (worker, model, preamble). Role changes
         // cannot change the graph's shape.
@@ -992,8 +992,8 @@ impl Runtime {
     /// Registry name → the program each entry actually spawns.
     ///
     /// A graph names a *role*; which CLI that lands on comes from config and is
-    /// the fact a reader of someone else's graph most wants — and the only way
-    /// gotcha 18's role-shadows-worker trap is visible at all.
+    /// the fact a reader of someone else's graph most wants — and the only place
+    /// a role shadowing a same-named worker is visible at all.
     #[must_use]
     pub fn worker_bindings(&self) -> BTreeMap<String, String> {
         self.workers
@@ -1023,7 +1023,7 @@ impl Runtime {
         // Read the journal FIRST, before probing the lock. A finished run needs
         // no lock — the terminal event is already there — and the probe is the
         // flaky path: a just-released `fs4` lock intermittently still reads as
-        // busy under load (gotcha 26), which made `hex cancel` right after a run
+        // busy under load, which made `hex cancel` right after a run
         // ended queue a command instead of recording.
         let journal_path = run_dir.join("events.jsonl");
         if !journal_path.exists() {
@@ -1043,7 +1043,7 @@ impl Runtime {
         // Taking the same exclusive lock a driver holds proves no live process is
         // writing, and holding it makes the append atomic w.r.t. a concurrent
         // resume. A *paused* run has no driver left to hand the command to, so a
-        // busy probe there is usually the fs4 flake (gotcha 26) — retry briefly
+        // busy probe there is usually the fs4 flake — retry briefly
         // before believing it. If it stays busy, a real writer (a concurrent
         // `resume`) holds it: queue, never append beside another writer.
         let suspended = matches!(&folded, Ok((_, s)) if matches!(s.status, Status::Paused));

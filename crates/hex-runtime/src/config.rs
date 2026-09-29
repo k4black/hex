@@ -213,7 +213,7 @@ impl Config {
     }
 }
 
-fn user_config_path() -> Option<PathBuf> {
+pub(crate) fn user_config_path() -> Option<PathBuf> {
     Some(
         crate::local_log::home_dir()?
             .join(".config")

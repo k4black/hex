@@ -43,8 +43,8 @@ fn temp_repo(tag: &str) -> PathBuf {
 
 /// Serializes every test that asserts *which* pool slot is leased: `lease` takes
 /// the first slot it can lock, so "slot 0 is reused" only holds when no sibling
-/// test is leasing concurrently. Not root-caused, and not a product bug — see
-/// AGENTS.md gotcha 26.
+/// test is leasing concurrently. Not root-caused, and not a product bug: the
+/// fs4 lock flake.
 fn pool_shape_gate() -> std::sync::MutexGuard<'static, ()> {
     static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GATE.lock()

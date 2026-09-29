@@ -420,7 +420,8 @@ fn cmd_init(json: bool) -> Result<ExitCode, String> {
             outln!("exists   {name}");
         }
         outln!(
-            "\ndeclare your checks in .hex/config.yaml, then `hex list` to see what you can run"
+            "\ndeclare your checks in .hex/config.yaml, pin models in \
+             ~/.config/hex/config.yaml, then `hex list` to see what you can run"
         );
     }
     Ok(ExitCode::SUCCESS)
@@ -780,8 +781,9 @@ impl Payoff {
             outln!("why: {why}");
         }
         if let Some(usage) = &self.usage {
+            // `cost_cell` marks a partly priced total `≥`, as `hex status` does.
             let cost = if usage.cost_micro_usd > 0 {
-                format!(", {}", usd(usage.cost_micro_usd))
+                format!(", {}", cost_cell(usage))
             } else {
                 String::new()
             };

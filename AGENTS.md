@@ -50,9 +50,8 @@ into another agent framework. They are non-negotiable.
    *effect intents* (`StartAttempt`, `RunCommand`, `RequestHuman`, …); only the
    runtime performs them, writing intent-before-effect with idempotency keys.
    A model may *propose* an event only from its node's `may_propose`
-   allow-list, via the `VERDICT: <signal>` line of its final message
-   (gotcha 6); the kernel still validates the transition. Routing spends no
-   tokens.
+   allow-list, via the `VERDICT: <signal>` line of its final message;
+   the kernel still validates the transition. Routing spends no tokens.
 4. **Node kinds stay tiny:** `agent`, `command`, `human`, `terminal`. Roles
    ("planner", "reviewer") are metadata on an `agent` node; interactivity is a
    *policy flag* on `agent` (`interactive: true`), not a new kind. A **gate is
@@ -60,7 +59,7 @@ into another agent framework. They are non-negotiable.
    (`accept.require: [test.passed]`, and equally `[review.approved]` for an
    agent).
 5. **Every cycle is bounded, by construction.** Every non-terminal node has a
-   visit bound (gotcha 22), and `schedule` checks it before acting. An
+   visit bound, and `schedule` checks it before acting. An
    unbounded cycle cannot be constructed, so there is no cycle analysis.
 6. **Completion is provisional.** A worker's "done" is a proposal; required
    gates + acceptance rules decide the run outcome. Deterministic evidence
@@ -85,6 +84,8 @@ into another agent framework. They are non-negotiable.
 - Prefer `argv` execution, NOT shell strings, for subprocess workers.
 - Machine output: stdout carries requested data only, diagnostics to stderr,
   stable exit codes, `--json`/NDJSON, no interactive prompts in machine mode.
+- Comments and docs stand alone: never cite a gotcha by number. The gotcha
+  list below is for agents; renumbering it must not break any other text.
 
 ## Terminology
 
@@ -131,8 +132,8 @@ acceptance. _Avoid_: calling it a node kind; hook.
 **Check**: A named argv in project config (`checks:` in `.hex/config.yaml`),
 referenced by a graph as `command: { check: <name> }` and resolved at
 **compile** time. **Empty by default**: what "green" means is per-project. A
-graph naming an undeclared check is **refused before the run starts**
-(gotcha 13). _Avoid_: gate (a check is what a gate node *runs*).
+graph naming an undeclared check is **refused before the run starts**.
+_Avoid_: gate (a check is what a gate node *runs*).
 
 **Role**: The user-facing unit a graph names (`role: reviewer`):
 implementer / reviewer / planner / researcher. A role binds a **worker** to a
@@ -168,7 +169,7 @@ when this ships).
 
 **Approval**: A blocking human decision on a finished proposal, recorded as
 `human.requested`/`human.responded` events with actor + rationale. Today a
-`human` node answered by `hex respond` (gotcha 25); approve/reject routing is
+`human` node answered by `hex respond`; approve/reject routing is
 not built. _Avoid_: sign-off, confirmation.
 
 ## Gotchas
@@ -268,7 +269,11 @@ not built. _Avoid_: sign-off, confirmation.
 15. **A broken check is not a failing test.** `run_process` returns `Err` for
    an infrastructure failure (spawn/log/kill) and `Ok(false)` only for a real
    non-zero exit; only the latter routes `failed`. `doctor::preflight` (run by
-   `run` and `resume`) refuses to start a run whose agent CLI is missing.
+   `run` and `resume`) refuses to start a run whose agent CLI is missing, or
+   whose model the CLI's own catalog does not list (`Worker::model_probe` +
+   `model_verdict`: `codex debug models`, `opencode models`; pi's model check is
+   its `auth_probe`). A catalog read spends no tokens. An unreadable catalog
+   decides nothing. claude has no free catalog, so its model is not checked.
 16. **Exit codes encode the disposition:** 0 succeeded · 1 failed · 2 usage
    error (clap) · 3 timed out · 4 budget exhausted · 5 cancelled · 6 paused.
    `hex wait` also uses 1 for an abandoned run.
@@ -295,7 +300,7 @@ not built. _Avoid_: sign-off, confirmation.
    step writes `attempts/<id>/<n>-<label>/`, numbered in **declared** order,
    plus an `exit` file with its status (`"0"`, `"101"`, `"signal"`).
    `StepLog::failed()` treats an unrecorded status as not-failed. Infra
-   failure in any step fails the attempt (gotcha 15).
+   failure in any step fails the attempt.
 21. **`accept.on_unmet` routes instead of dead-ending.** At a success terminal
    with missing evidence, the kernel emits `Effect::RerouteUnmet` and the
    runtime journals `EventBody::AcceptanceUnmet`, its own event. It is not a
@@ -417,7 +422,7 @@ not built. _Avoid_: sign-off, confirmation.
    `.hex/research-notes.md`). `checklist` keeps state in the checklist's `[x]`
    marks, and its `final_review` is a separate fresh node. Binding
    `implementer` to a `kind: command` worker makes these presets refuse to
-   start until the node says `context: fresh` (gotcha 36).
+   start until the node says `context: fresh`.
 38. **A session's identity is the *program*, not the worker name.** A role
    registers under its own alias, so `"implementer" == "implementer"` holds
    after rebinding it from codex to claude. `AttemptReported.agent` records
@@ -451,7 +456,7 @@ not built. _Avoid_: sign-off, confirmation.
      before its first event. `--follow` honours `--node` and conflicts with
      `--json`.
 41. **Ctrl-C stops the run and the agent, and lands the run in `paused`.** The
-   agent has its own process group (gotcha 34), so SIGINT reaches only `hex`.
+   agent has its own process group, so SIGINT reaches only `hex`.
    - `hex_runtime::interrupt::install` (signal-hook, no `unsafe`) sets the
      process-global flag in `hex_worker::interrupt`; `wait_bounded` checks it
      each 25ms tick and kills the group. A second press exits 130.

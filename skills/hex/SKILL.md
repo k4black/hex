@@ -49,8 +49,9 @@ hex list                # graphs available here (project > user > built-in)
 hex validate <graph>    # schema, references, a reachable success
 ```
 
-`doctor` matters because preflight **refuses to start** a run whose agent CLI is missing instead of
-burning an attempt.
+`doctor` matters because preflight **refuses to start** a run whose agent CLI is missing, or whose
+model is not in the CLI's own catalog (codex, opencode, pi; claude has none), instead of burning an
+attempt.
 
 **Always run `hex` from the repository root.** It reads `.hex/` from the current directory and
 **does not walk up**. From a subdirectory `hex list` silently shows nothing and `hex run` creates a

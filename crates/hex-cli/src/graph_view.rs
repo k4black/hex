@@ -103,7 +103,7 @@ fn budget_line(budget: &Budget, ui: Ui) -> String {
     if let Some(t) = budget.output_tokens {
         parts.push(format!("{t} generated tokens"));
     }
-    // Never empty: the loader always sets the per-attempt bound (gotcha 14).
+    // Never empty: the loader always sets the per-attempt bound.
     parts.join(&format!(" {} ", ui.glyphs().sep))
 }
 
@@ -248,7 +248,7 @@ fn policy(
             parts.push("agent".to_owned());
             // Both halves of the binding: a graph names a role, and which CLI
             // it lands on is exactly what you want when reading someone else's
-            // graph — it is also the only way gotcha 18's shadowing is visible.
+            // graph — it is also the only place a role shadowing a same-named worker shows.
             parts.push(match bindings.get(worker) {
                 Some(program) if program != worker => format!("{worker} {} {program}", g.binds),
                 _ => worker.clone(),
@@ -291,7 +291,7 @@ fn policy(
 
 /// A command node's resolved argv, one per line.
 ///
-/// The *resolved* argv, not the check name: gotcha 13's whole point is that a
+/// The *resolved* argv, not the check name: a
 /// gate whose verdict means nothing is worse than no gate, so the thing a reader
 /// has to be able to audit is the command that will actually run.
 fn steps(node: &hex_runtime::Node) -> Vec<String> {

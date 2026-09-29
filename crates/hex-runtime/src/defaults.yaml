@@ -23,12 +23,15 @@ workers:
   pi:
     kind: pi
 
-# Roles are the user-facing concept a graph names (`worker: reviewer`). A role
+# Roles are the user-facing concept a graph names (`role: reviewer`). A role
 # binds a worker to a model, a reasoning effort, a read-only policy, and a prompt
 # preamble prepended to the node's own prompt.
 #
 # Cross-model by default: the reviewer runs a different agent from the
 # implementer, so the model that judges the change is not the one that wrote it.
+#
+# No role sets a `model` or `effort`: a fresh install runs each CLI's own
+# default model. Pin models in `~/.config/hex/config.yaml`.
 roles:
   implementer:
     worker: claude

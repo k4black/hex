@@ -170,6 +170,18 @@ impl Worker for CodexWorker {
     fn auth_probe(&self) -> Option<Vec<String>> {
         Some(strs(&["codex", "login", "status"]))
     }
+    fn model_probe(&self) -> Option<Vec<String>> {
+        self.model
+            .as_ref()
+            .map(|_| strs(&["codex", "debug", "models"]))
+    }
+    fn model_verdict(&self, catalog: &str) -> Result<String, String> {
+        codex_model_verdict(
+            catalog,
+            self.model.as_deref().unwrap_or_default(),
+            self.effort.as_deref(),
+        )
+    }
     fn capabilities(&self) -> &'static [Capability] {
         RESUMABLE
     }
@@ -327,6 +339,17 @@ impl Worker for OpencodeWorker {
         // Local credential listing only — opencode has no per-provider check.
         Some(strs(&["opencode", "auth", "list"]))
     }
+    fn model_probe(&self) -> Option<Vec<String>> {
+        self.model.as_ref().map(|_| strs(&["opencode", "models"]))
+    }
+    fn model_verdict(&self, catalog: &str) -> Result<String, String> {
+        let model = self.model.as_deref().unwrap_or_default();
+        if catalog.lines().any(|line| line.trim() == model) {
+            Ok(model.to_owned())
+        } else {
+            Err(format!("`{model}` is not listed by `opencode models`"))
+        }
+    }
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         run_agent(
             "opencode",
@@ -379,7 +402,7 @@ impl Worker for PiWorker {
     fn auth_probe(&self) -> Option<Vec<String>> {
         // Per model on purpose: `pi auth check --model openrouter/x/y` verifies
         // the provider the configured model resolves to, so it also catches the
-        // bare-model ambiguity trap (gotcha 8) — it prints `not_ready`. With no
+        // bare-model ambiguity trap: it prints `not_ready`. With no
         // model configured there is no provider to name, so nothing to probe.
         let model = self.model.as_deref()?;
         Some(strs(&["pi", "auth", "check", "--model", model]))
@@ -521,7 +544,7 @@ fn run_agent(
             request.worktree_branch.as_deref().unwrap_or(""),
         )
         // The program actually spawned, so `hex feedback` records the real agent
-        // (matches `AttemptReported.agent`, gotcha 38).
+        // (matches `AttemptReported.agent`).
         .env("HEX_AGENT", &command[0])
         .env(RESULT_FILE_ENV, &result_file)
         .stdin(if uses_placeholder {
@@ -612,6 +635,36 @@ fn run_agent(
 }
 
 /// `.result` from a claude result object, failing closed on `.is_error`.
+/// Find `model` in `codex debug models` JSON and, when an effort is set, check
+/// it against that model's `supported_reasoning_levels`.
+fn codex_model_verdict(catalog: &str, model: &str, effort: Option<&str>) -> Result<String, String> {
+    let catalog: serde_json::Value = serde_json::from_str(catalog)
+        .map_err(|e| format!("cannot read `codex debug models` output: {e}"))?;
+    let entry = catalog["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| m["slug"] == model)
+        .ok_or_else(|| format!("`{model}` is not in codex's model catalog"))?;
+    let Some(effort) = effort else {
+        return Ok(model.to_owned());
+    };
+    let levels: Vec<&str> = entry["supported_reasoning_levels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l["effort"].as_str())
+        .collect();
+    if levels.is_empty() || levels.contains(&effort) {
+        Ok(format!("{model}, effort {effort}"))
+    } else {
+        Err(format!(
+            "`{model}` does not support effort `{effort}` (supports {})",
+            levels.join(", ")
+        ))
+    }
+}
+
 fn result_field(v: &serde_json::Value) -> Result<Option<String>, String> {
     if v.get("is_error")
         .and_then(serde_json::Value::as_bool)
@@ -1182,6 +1235,45 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(name)
+    }
+
+    #[test]
+    fn a_model_is_judged_against_the_cli_catalog() {
+        let codex = fs::read_to_string(fixture("codex-debug-models.json")).expect("fixture");
+        let opencode = fs::read_to_string(fixture("opencode-models.txt")).expect("fixture");
+        let codex_with = |model: &str, effort: Option<&str>| {
+            CodexWorker::new(Some(model.to_owned()), effort.map(ToOwned::to_owned))
+                .model_verdict(&codex)
+        };
+        let opencode_with =
+            |model: &str| OpencodeWorker::new(Some(model.to_owned())).model_verdict(&opencode);
+        let cases = [
+            ("codex known model", codex_with("gpt-6-sol", None), true),
+            (
+                "codex supported effort",
+                codex_with("gpt-6-sol", Some("medium")),
+                true,
+            ),
+            ("codex unknown model", codex_with("gpt-sol-6", None), false),
+            (
+                "codex unsupported effort",
+                codex_with("gpt-6-sol", Some("turbo")),
+                false,
+            ),
+            (
+                "opencode listed model",
+                opencode_with("opencode/big-pickle"),
+                true,
+            ),
+            (
+                "opencode unlisted model",
+                opencode_with("big-pickle"),
+                false,
+            ),
+        ];
+        for (case, verdict, ok) in cases {
+            assert_eq!(verdict.is_ok(), ok, "{case}: {verdict:?}");
+        }
     }
 
     #[test]

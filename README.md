@@ -15,8 +15,8 @@ hex run critique-loop -p "Investigate problem with blocked google auth, fix bug 
 
 ```bash
 cargo build --workspace          # binary is `hex` (package `hex-cli`)
-hex init                         # .hex/ + a starter config; safe to re-run
-hex doctor                       # are codex/claude/pi installed? checks runnable?
+hex init                         # .hex/ + starter project and user configs; safe to re-run
+hex doctor                       # CLIs installed and logged in? models known? checks runnable?
 hex list                         # runnable graphs: project > user > built-in
 ```
 
@@ -129,11 +129,13 @@ workers:
   pi:     { kind: pi }
 
 # Roles are what a graph names. Shipped defaults: claude implements, codex
-# reviews -- cross-model, so a different model judges than wrote.
+# reviews -- cross-model, so a different model judges than wrote. Built-in
+# roles set no model, so each CLI runs its own default; pin models here.
 roles:
   implementer: { worker: claude, effort: high }
   reviewer:
     worker: codex
+    model: gpt-6-sol
     read_only: true
     prompt_append: "Only flag correctness and security issues."
 
@@ -271,9 +273,9 @@ final message; `--json` carries the same fields.
 Every verb takes `--json` where a machine form exists.
 
 ```text
-hex init                 scaffold `.hex/` + a starter config in this repo
+hex init                 scaffold `.hex/`, a project config and ~/.config/hex/config.yaml
 hex list                 list runnable graphs (project > user > built-in)
-hex doctor               are the configured workers and checks usable?
+hex doctor               are the configured workers, models and checks usable?
 hex validate <graph>     schema, references, a reachable success
 hex graph <graph>        render a graph [--format text|source]
 hex run [<graph>]        start a NEW run and block until it ends [--worktree]

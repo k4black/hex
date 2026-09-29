@@ -10,7 +10,7 @@
 //! visit-bounded by the loader there is no cycle analysis left to run, and a
 //! rendering classifier could not express one anyway. This module and
 //! `schedule` read the same single source, [`Graph::implicit_reroutes`], so they
-//! cannot disagree about which transitions are implicit (gotcha 21).
+//! cannot disagree about which transitions are implicit.
 
 use std::collections::BTreeMap;
 

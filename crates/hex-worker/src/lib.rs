@@ -221,6 +221,22 @@ pub trait Worker {
         None
     }
 
+    /// An argv that prints this CLI's model catalog without buying a
+    /// completion (`codex debug models`, `opencode models`). `None` when no
+    /// model is configured or the CLI has no catalog command.
+    fn model_probe(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Judge the configured model (and effort) against `model_probe`'s stdout:
+    /// `Ok(detail)` when the catalog lists it, `Err(why)` when it does not.
+    ///
+    /// # Errors
+    /// The catalog does not list the model, or the model rejects the effort.
+    fn model_verdict(&self, _catalog: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+
     /// Whether this worker can produce a final-message `result` at all. A node
     /// with more than one outcome routes on a verdict read out of that message,
     /// so the runtime refuses such a node bound to a worker that captures

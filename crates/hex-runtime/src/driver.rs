@@ -623,7 +623,7 @@ impl<'a> Session<'a> {
             resume_session,
             graph: self.graph.name.clone(),
             // run_dir is `<root>/.hex/runs/<id>` (the journal stays in the main
-            // `.hex` even under worktree isolation, gotcha 12), so the project
+            // `.hex` even under worktree isolation), so the project
             // root is three levels up.
             project_root: self
                 .run_dir

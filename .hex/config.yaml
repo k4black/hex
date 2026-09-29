@@ -6,7 +6,7 @@
 # Cross-model through one CLI: deepseek implements, glm reviews, both via pi.
 # (opencode as the reviewer worker is parked 2026-09-15: its `--format json`
 # mode errors and its default mode hangs on piped stdout — headless-unusable.)
-# Pi model ids need the provider prefix (gotcha 8).
+# Pi model ids need the provider prefix.
 roles:
   implementer:
     worker: pi

@@ -44,7 +44,7 @@ Review cost and quality:
 - [ ] A/B the reviewer/implementer pairing. Defaults: claude implements, codex
       reviews. One paper claims Claude reviewing Codex helps more than the
       reverse.
-- [ ] A red gate at the branch base wedges a scoped run (AGENTS.md gotcha 43):
+- [ ] A red gate at the branch base wedges a scoped run:
       scope gate checks to the branch diff, or refuse to start when the gate is
       already red at the base.
 - [ ] tdd's red/green gates run the whole suite, so an unrelated failure reads
@@ -66,7 +66,7 @@ Correctness:
       the inbox scan shows as neither queued nor pending.
 - [ ] `VISITS` in the spend table is a visit count; a crash between
       `AttemptReported` and the terminal leaves two reports on one visit.
-- [ ] fs4/flock flake (AGENTS.md gotcha 26): not root-caused; worktree slot
+- [ ] fs4/flock flake: not root-caused; worktree slot
       leasing still hits it, and the concurrent leasing path is untested.
 
 Tests:
@@ -98,14 +98,15 @@ Journal and surface:
       `RunCreated.graph_hash`) goes.
 - [ ] Typed worktree record: `worktree.*` rides as strings in
       `RunCreated.inputs` (`WT_*` in `hex-runtime/src/lib.rs`).
-- [ ] Roles and workers share one namespace (AGENTS.md gotcha 18). A
+- [ ] Roles and workers share one namespace. A
       `WorkerRef::Role | Direct` in the IR would remove the shadowing trap.
 - [ ] `hex config show` with per-key provenance.
 - [ ] `hex logs --json --follow` (needs a per-line event shape).
 - [ ] Worktree follow-ups: integration verbs (`diff`/`merge`/`apply`), a
       concurrency cap, a graph-YAML `isolation:` field, a deadline on
       `--worktree-init`.
-- [ ] `hex doctor`: version/auth probing. `hex init`: write an example graph.
+- [ ] `hex doctor`: CLI version probing; a claude model check if claude ever
+      ships a free model catalog. `hex init`: write an example graph.
 
 ## On demand
 

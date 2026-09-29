@@ -253,7 +253,7 @@ pub fn load_with(
         // Every non-terminal node gets a visit bound, whether or not the graph
         // declares one, so no loop can churn unbounded. A terminal keeps `None`:
         // `schedule` settles a terminal before any budget check, so a bound there
-        // would be recorded but never enforced (gotcha 22). A declared `0` is
+        // would be recorded but never enforced. A declared `0` is
         // left for `validate` to reject as `E-budget-zero`, with a message that
         // names the node.
         let max_visits = match spec.kind() {

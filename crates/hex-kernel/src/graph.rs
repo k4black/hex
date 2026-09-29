@@ -241,7 +241,7 @@ pub const DEFAULT_ATTEMPT_ELAPSED_MS: u64 = 30 * 60 * 1000;
 ///
 /// Applied by the loader, so every cycle is bounded by construction. Terminal
 /// nodes keep `None`: `schedule` settles a terminal before any budget check, so
-/// a bound there is recorded but never enforced (gotcha 22).
+/// a bound there is recorded but never enforced.
 pub const DEFAULT_NODE_VISITS: u32 = 5;
 
 /// The run's acceptance contract: the evidence a success terminal requires, and

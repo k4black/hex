@@ -94,7 +94,7 @@ facts the pure kernel may not compute (core rule 1).
   crashed one — a run mid-attempt writes nothing to the journal (`AttemptStarted` is
   the last event). `Hung` becomes a *diagnostic on `live`* (lock held, heartbeat stale),
   not a fifth state.
-- **Fix the fs4 lock flake (gotcha 26) where it actually bites:** in `cancel`, read the
+- **Fix the fs4 lock flake where it actually bites:** in `cancel`, read the
   journal **before** probing the lock. A finished run then returns `Recorded` and never
   reaches the flaky probe. The `cancel_of_an_idle_run_is_recorded_directly` reproducer
   disappears because the path is not taken.

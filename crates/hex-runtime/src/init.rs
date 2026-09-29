@@ -1,4 +1,5 @@
-//! `hex init`: the project's `.hex/` layout, created idempotently.
+//! `hex init`: the project's `.hex/` layout and the user config file, created
+//! idempotently.
 //!
 //! The layout is the runtime's knowledge (it reads `.hex/config.yaml`, writes
 //! `.hex/runs/`, leases `.hex/worktrees/`), so it is created here and a client
@@ -45,11 +46,33 @@ checks: {}
 #         design choice.
 
 # Workers are the CLI adapters behind a role — internal plumbing a graph never
-# names directly. `kind` picks the adapter: codex | claude | opencode | command.
+# names directly. `kind` picks the adapter: codex | claude | pi | opencode | command.
 #
 #   workers:
 #     codex:
 #       kind: codex
+";
+
+/// The starter `~/.config/hex/config.yaml`: every key commented out, so it
+/// changes nothing until the operator edits it. It exists so the user layer is
+/// easy to find.
+const USER_CONFIG_TEMPLATE: &str = "\
+# hex user configuration: applies to every project on this machine.
+#
+# The middle of three layers: the built-in defaults (embedded in the `hex`
+# binary), then this file, then a project's `.hex/config.yaml`. Layers deep-merge
+# per key, so set only what should differ. Built-in roles set no model, so each
+# agent CLI runs its own default until you pin one here. `hex doctor` checks the
+# models against each CLI's catalog.
+#
+#   roles:
+#     implementer:
+#       model: claude-opus-5-5
+#     reviewer:
+#       model: gpt-6-sol
+#       effort: medium
+#     researcher:
+#       model: claude-sonnet-5-5
 ";
 
 /// What `hex init` made and what was already there, as root-relative names
@@ -65,11 +88,11 @@ pub struct InitReport {
 /// Set `root` up for hex.
 ///
 /// Idempotent by construction: every step reports `created` or `existed` and an
-/// existing `.hex/config.yaml` is never rewritten — the operator's checks and role
+/// existing `.hex/config.yaml` or user config is never rewritten — the operator's checks and role
 /// overrides are exactly the content a second `hex init` must not be able to lose.
 ///
 /// # Errors
-/// Fails if a directory, the config, or `.gitignore` cannot be read or written.
+/// Fails if a directory, a config, or `.gitignore` cannot be read or written.
 pub fn init(root: &Path) -> Result<InitReport> {
     let mut report = InitReport::default();
     for name in [".hex/", ".hex/graphs/"] {
@@ -103,6 +126,20 @@ pub fn init(root: &Path) -> Result<InitReport> {
             &mut report.existed
         };
         list.push(format!(".gitignore:{line}"));
+    }
+
+    if let Some(path) = crate::config::user_config_path() {
+        let name = "~/.config/hex/config.yaml";
+        if path.exists() {
+            report.existed.push(name.to_owned());
+        } else {
+            let write = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, USER_CONFIG_TEMPLATE));
+            write.map_err(|e| HexError::new(format!("cannot write {name}: {e}")))?;
+            report.created.push(name.to_owned());
+        }
     }
     Ok(report)
 }
