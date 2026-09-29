@@ -83,6 +83,11 @@ enum Command {
     List,
     /// Check that configured workers and checks are actually usable
     Doctor,
+    /// Manage the agent skill in ~/.claude/skills and ~/.agents/skills
+    Skill {
+        #[command(subcommand)]
+        verb: SkillVerb,
+    },
     /// Validate a graph: schema, references, a reachable success
     Validate {
         /// Graph reference: a preset name or a path to a `.yaml` file
@@ -212,6 +217,17 @@ enum Command {
     },
 }
 
+/// The `hex skill` verbs.
+#[derive(Subcommand)]
+enum SkillVerb {
+    /// Write the embedded skill to ~/.claude/skills/hex and ~/.agents/skills/hex
+    Install {
+        /// Overwrite a copy hex did not install (never a symlink)
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 /// How `hex graph` renders. Both go to stdout and exit 0.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GraphFormat {
@@ -263,8 +279,19 @@ fn dispatch(cli: Cli, verb: &str) -> Result<ExitCode, String> {
         );
     }
 
+    // A stamped skill copy follows the binary's version. Refreshing never fails
+    // the verb: an IO error is one more stderr line.
+    if matches!(verb, "run" | "resume" | "init" | "doctor") {
+        for line in hex_runtime::skill::refresh() {
+            eprintln!("{line}");
+        }
+    }
+
     match command {
         Command::Init => cmd_init(json),
+        Command::Skill {
+            verb: SkillVerb::Install { force },
+        } => cmd_skill_install(force, json),
         Command::List => cmd_list(json, ui::Ui::stdout(cli.color, json)),
         Command::Doctor => cmd_doctor(json, cli.color, ui::Ui::stdout(cli.color, json)),
         Command::Validate { graph } => cmd_validate(&graph, json),
@@ -423,6 +450,29 @@ fn cmd_init(json: bool) -> Result<ExitCode, String> {
             "\ndeclare your checks in .hex/config.yaml, pin models in \
              ~/.config/hex/config.yaml, then `hex list` to see what you can run"
         );
+        if !hex_runtime::skill::installed() {
+            outln!("install the agent skill: hex skill install");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Install the embedded agent skill and print one line per target dir.
+fn cmd_skill_install(force: bool, json: bool) -> Result<ExitCode, String> {
+    use hex_runtime::skill::Outcome;
+    let report = hex_runtime::skill::install(force).map_err(|e| e.to_string())?;
+    if json {
+        outln!("{}", serde_json::json!({ "skills": report }));
+    } else {
+        for row in &report {
+            let what = match &row.outcome {
+                Outcome::Installed { version } => format!("installed ({version})"),
+                Outcome::Updated { from, to } => format!("updated ({from} → {to})"),
+                Outcome::UpToDate { version } => format!("up to date ({version})"),
+                Outcome::Skipped { why } => format!("skipped: {why}"),
+            };
+            outln!("{}  {what}", row.path);
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -539,7 +589,11 @@ fn cmd_doctor(json: bool, color: ui::When, ui: ui::Ui) -> Result<ExitCode, Strin
         let mut table = ui::Table::new(&["", "KIND", "NAME", "DETAIL"], &[false; 4]).flex(3);
         for f in &report.findings {
             table.row(vec![
-                ui.mark(if f.ok { ui::Mark::Ok } else { ui::Mark::Fail }),
+                ui.mark(match (f.ok, f.kind) {
+                    (true, _) => ui::Mark::Ok,
+                    (false, "skill") => ui::Mark::Idle,
+                    (false, _) => ui::Mark::Fail,
+                }),
                 ui.paint(ui::style::DIM, f.kind).to_string(),
                 ui.paint(ui::style::ID, &f.name).to_string(),
                 ui.paint(ui::style::DIM, first_line(&f.detail)).to_string(),
@@ -555,7 +609,11 @@ fn cmd_doctor(json: bool, color: ui::When, ui: ui::Ui) -> Result<ExitCode, Strin
                 report.broken().len(),
                 report.findings.len()
             );
-            for f in report.findings.iter().filter(|f| !f.ok) {
+            for f in report
+                .findings
+                .iter()
+                .filter(|f| !f.ok && f.kind != "skill")
+            {
                 eprintln!("\n  {}  {}", err.paint(ui::style::ID, &f.name), f.detail);
             }
         }

@@ -26,7 +26,7 @@ use crate::workers::Workers;
 /// One preflight finding.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Finding {
-    /// What was probed: `worker` or `check`.
+    /// What was probed: `worker`, `check`, `auth`, `model` or `skill`.
     pub kind: &'static str,
     /// Registry/check name as configured.
     pub name: String,
@@ -46,10 +46,11 @@ pub struct Report {
 }
 
 impl Report {
-    /// Whether every probed entry is usable.
+    /// Whether every probed entry is usable. `skill` rows are informational:
+    /// a missing skill does not fail doctor.
     #[must_use]
     pub fn ok(&self) -> bool {
-        self.findings.iter().all(|f| f.ok)
+        self.findings.iter().all(|f| f.ok || f.kind == "skill")
     }
 
     /// The names of unusable entries, for a one-line summary.
@@ -57,7 +58,7 @@ impl Report {
     pub fn broken(&self) -> Vec<&str> {
         self.findings
             .iter()
-            .filter(|f| !f.ok)
+            .filter(|f| !f.ok && f.kind != "skill")
             .map(|f| f.name.as_str())
             .collect()
     }

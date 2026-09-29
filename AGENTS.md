@@ -19,7 +19,7 @@ runtime orchestrates and records · the cli is a window.*
 | `hex-proto` | Versioned protocol: `Event`, `Command`, `Capability`. Only stable public surface. | — |
 | `hex-kernel` | **Pure**: Graph IR, journal model, projections, `reduce` + `schedule` (acceptance is checked inside `schedule`). No IO/subprocess/clock. | proto |
 | `hex-worker` | `Worker` trait + capability manifest + adapters (mock, subprocess, coding-agent presets). Runs **one** worker; never coordinates. | proto |
-| `hex-runtime` | Imperative shell: drive loop, effect execution, journal writer, control ingestion, workspace isolation, run supervision, `init`. Exposes the concrete `Runtime`, including `read_streams`, so tailing a live attempt needs no knowledge of `.hex/`. | kernel, worker, proto |
+| `hex-runtime` | Imperative shell: drive loop, effect execution, journal writer, control ingestion, workspace isolation, run supervision, `init`, the embedded agent skill (`skill.rs`). Exposes the concrete `Runtime`, including `read_streams`, so tailing a live attempt needs no knowledge of `.hex/`. | kernel, worker, proto |
 | `hex-cli` | The `hex` binary: thin client over `Runtime`; arg parsing + rendering only. | runtime |
 
 A future transport or viewer is another thin client over `Runtime`, never a
@@ -486,4 +486,15 @@ not built. _Avoid_: sign-off, confirmation.
    an implementer told to touch only its scope cannot turn it green. Stall
    detection (`failure_signature` in `driver.rs`) ends the run `failed` after
    two identical failing outputs. Fix candidates are in TODO.md.
-44. _add new gotchas here as they are discovered_
+44. **The agent skill is embedded and version-stamped.** `skill.rs` embeds
+   `crates/hex-runtime/skill/hex/` (`skills/hex` is a symlink to it).
+   `hex skill install` writes it to `~/.claude/skills/hex/` and
+   `~/.agents/skills/hex/` and stamps `metadata.hex-version` into SKILL.md.
+   - A stamped copy is hex-owned. `run`, `resume`, `init` and `doctor`
+     rewrite one whose stamp differs from the binary. The refresh never
+     installs and never fails the verb.
+   - A symlink (the dev checkout) is never touched. An unstamped copy is
+     skipped unless `install --force`.
+   - A new skill file needs its own `include_str!` entry in `skill::FILES`.
+   - doctor's `skill` rows are informational: `Report::ok` ignores them.
+45. _add new gotchas here as they are discovered_

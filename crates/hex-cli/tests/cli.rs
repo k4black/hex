@@ -793,11 +793,16 @@ fn doctor_reports_a_worker_whose_program_is_missing() {
         .output()
         .expect("spawn hex");
     let v: serde_json::Value = serde_json::from_str(stdout(&with).trim()).expect("doctor json");
+    // `skill` rows are informational: this HOME has no skill installed, and
+    // that must not fail doctor.
     let rows = v["findings"].as_array().expect("findings");
-    for row in rows.iter().filter(|r| r["kind"] != "auth") {
+    for row in rows
+        .iter()
+        .filter(|r| r["kind"] != "auth" && r["kind"] != "skill")
+    {
         assert_eq!(row["ok"], true, "{row}");
     }
-    let all_ok = rows.iter().all(|r| r["ok"] == true);
+    let all_ok = rows.iter().all(|r| r["ok"] == true || r["kind"] == "skill");
     assert_eq!(v["ok"], serde_json::Value::Bool(all_ok), "{v}");
     assert_eq!(with.status.code(), Some(i32::from(!all_ok)), "{v}");
 }
@@ -1031,4 +1036,89 @@ fn feedback_rejects_an_empty_message() {
         !dir.path().join(".hex").join("feedback.jsonl").exists(),
         "no file created for a rejected empty message"
     );
+}
+
+/// `hex skill install` writes both dirs and stamps them. It leaves a symlink
+/// alone, and an unstamped copy too unless `--force`. `hex doctor` refreshes a
+/// copy stamped by an older binary and lists each dir as a `skill` row.
+#[test]
+fn skill_install_stamps_skips_and_refreshes() {
+    let dir = project();
+    let home = dir.path();
+    let claude = home.join(".claude/skills/hex");
+    let agents = home.join(".agents/skills/hex");
+    let version = env!("CARGO_PKG_VERSION");
+
+    let first = hex(home, &["skill", "install"]);
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(
+        stdout(&first),
+        format!(
+            "~/.claude/skills/hex  installed ({version})\n~/.agents/skills/hex  installed ({version})\n"
+        )
+    );
+    let md = std::fs::read_to_string(claude.join("SKILL.md")).expect("installed");
+    assert!(
+        md.contains(&format!("metadata:\n  hex-version: \"{version}\"\n")),
+        "{md}"
+    );
+    assert!(agents.join("SKILL.md").exists());
+
+    let again = hex(home, &["skill", "install", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(stdout(&again).trim()).expect("json");
+    assert_eq!(v["skills"][0]["status"], "up_to_date", "{v}");
+    assert_eq!(v["skills"][1]["status"], "up_to_date", "{v}");
+
+    // A symlink is the author's dev checkout; an unstamped copy is someone else's.
+    std::fs::remove_dir_all(&claude).expect("rm");
+    std::os::unix::fs::symlink(home.join("elsewhere"), &claude).expect("symlink");
+    std::fs::write(agents.join("SKILL.md"), "---\nname: hex\n---\nmine\n").expect("write");
+    let skipped = stdout(&hex(home, &["skill", "install"]));
+    assert!(
+        skipped.contains("~/.claude/skills/hex  skipped: symlink → "),
+        "{skipped}"
+    );
+    assert!(
+        skipped.contains("~/.agents/skills/hex  skipped: not installed by hex"),
+        "{skipped}"
+    );
+    let forced = stdout(&hex(home, &["skill", "install", "--force"]));
+    assert!(
+        forced.contains("~/.claude/skills/hex  skipped: symlink"),
+        "{forced}"
+    );
+    assert!(
+        forced.contains(&format!("~/.agents/skills/hex  installed ({version})")),
+        "{forced}"
+    );
+
+    // An older stamp is refreshed on doctor; the symlink is not touched.
+    std::fs::write(
+        agents.join("SKILL.md"),
+        "---\nname: hex\nmetadata:\n  hex-version: \"0.0.1\"\n---\nold\n",
+    )
+    .expect("write");
+    let doctor = hex(home, &["doctor", "--json"]);
+    assert!(
+        stderr(&doctor).contains(&format!(
+            "refreshed skill ~/.agents/skills/hex (0.0.1 → {version})"
+        )),
+        "{}",
+        stderr(&doctor)
+    );
+    assert!(
+        std::fs::symlink_metadata(&claude)
+            .expect("link")
+            .is_symlink()
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout(&doctor).trim()).expect("json");
+    let skills: Vec<_> = v["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .filter(|f| f["kind"] == "skill")
+        .map(|f| (f["name"].as_str().unwrap(), f["detail"].as_str().unwrap()))
+        .collect();
+    assert_eq!(skills[1], ("~/.agents/skills/hex", version));
+    assert!(skills[0].1.starts_with("symlink → "), "{skills:?}");
 }

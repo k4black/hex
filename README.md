@@ -276,6 +276,7 @@ Every verb takes `--json` where a machine form exists.
 hex init                 scaffold `.hex/`, a project config and ~/.config/hex/config.yaml
 hex list                 list runnable graphs (project > user > built-in)
 hex doctor               are the configured workers, models and checks usable?
+hex skill install        install the agent skill to ~/.claude and ~/.agents [--force]
 hex validate <graph>     schema, references, a reachable success
 hex graph <graph>        render a graph [--format text|source]
 hex run [<graph>]        start a NEW run and block until it ends [--worktree]
