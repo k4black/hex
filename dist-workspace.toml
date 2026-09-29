@@ -1,0 +1,33 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.33.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "npm", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
+# A GitHub repo to push Homebrew formulas to
+tap = "k4black/homebrew-tap"
+# Customize the Homebrew formula name
+formula = "hex-cli"
+# A namespace to use when publishing this package to the npm registry
+npm-scope = "@k4black"
+# Plan jobs to run in CI
+plan-jobs = ["./test"]
+# Publish jobs to run in CI
+publish-jobs = ["homebrew", "npm", "./publish-pypi"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+# Tests run in test.yml; do not run dist on every pull request
+pr-run-mode = "skip"
+
+[dist.github-custom-runners]
+# Native arm64 runner: builds the aarch64 musl binary without cross.
+aarch64-unknown-linux-musl = "ubuntu-24.04-arm"

@@ -1,12 +1,12 @@
 [package]
 name = "hex-runtime"
-description = "hex: imperative shell — drive loop, effect execution, journal writer, run supervision"
+description = "Internal crate of hex: drive loop, effect execution, journal writer, run supervision. No stable API; install hex-cli instead."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+homepage.workspace = true
 
 [dependencies]
 signal-hook = { workspace = true }
