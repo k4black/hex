@@ -20,6 +20,7 @@ pub mod journal;
 pub mod loader;
 pub mod local_log;
 pub mod preset;
+pub mod skill;
 pub mod stats;
 #[cfg(test)]
 mod test_support;
@@ -1003,10 +1004,12 @@ impl Runtime {
     }
 
     /// Probe every configured worker and check for usability — the preflight
-    /// behind `hex doctor`.
+    /// behind `hex doctor` — then list the installed agent skill copies.
     #[must_use]
     pub fn doctor(&self) -> DoctorReport {
-        doctor::report(&self.workers, &self.config.checks)
+        let mut report = doctor::report(&self.workers, &self.config.checks);
+        report.findings.extend(skill::findings());
+        report
     }
 
     /// Cancel a run, whether or not something is driving it.
