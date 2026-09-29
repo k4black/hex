@@ -175,8 +175,9 @@ not built. _Avoid_: sign-off, confirmation.
 ## Gotchas
 
 1. Binary is `hex`, package is `hex-cli`: use `cargo run --bin hex`, not `-p hex`.
-2. **What exists:** README.md "Status" lists what works, what is broken and
-   what is not built; TODO.md is the forward list. Not built: `interactive`,
+2. **What exists:** TODO.md lists what is open, what is broken and what is
+   not built. The README's first ```yaml block must stay a valid graph:
+   `the_readme_example_graph_is_valid` loads it. Not built: `interactive`,
    `templates:`/`extends:`, capability matching beyond session-resume and
    result capture.
 3. A node's routing token is an `EventBody::Signal { name }`. Agent proposals
