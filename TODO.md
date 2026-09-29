@@ -52,7 +52,6 @@ Review cost and quality:
 - [ ] Agent-result stall detection (gate-signature stall detection exists).
 
 Skill:
-- [ ] Embed `skill/hex/agents/openai.yaml` in `skill::FILES` once it lands.
 
 Correctness:
 - [ ] `gate_sigs` is in-memory: a pause/resume between two identical gate

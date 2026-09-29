@@ -16,7 +16,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The skill's files, as paths relative to the skill dir. SKILL.md is stamped on
 /// write; add a new file here with its own `include_str!`.
-const FILES: &[(&str, &str)] = &[("SKILL.md", include_str!("../skill/hex/SKILL.md"))];
+const FILES: &[(&str, &str)] = &[
+    ("SKILL.md", include_str!("../skill/hex/SKILL.md")),
+    (
+        "agents/openai.yaml",
+        include_str!("../skill/hex/agents/openai.yaml"),
+    ),
+];
 
 /// Where an installed copy lives, relative to `$HOME`.
 const TARGETS: [&str; 2] = [".claude/skills/hex", ".agents/skills/hex"];
