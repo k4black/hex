@@ -782,9 +782,10 @@ fn doctor_reports_a_worker_whose_program_is_missing() {
     );
     assert_eq!(without.status.code(), Some(1), "a real finding, so exit 1");
 
-    // With a working PATH every worker and check row is usable. The `auth` rows
-    // probe this machine's real credentials, so they are not asserted — only
-    // that the overall verdict and the exit code agree with the rows.
+    // With a working PATH the project's own worker is usable. The built-in
+    // agent CLIs and their `auth` rows depend on what this machine has
+    // installed (CI has none), so they are not asserted — only that the
+    // overall verdict and the exit code agree with the rows.
     let with = Command::cargo_bin("hex")
         .expect("locate hex binary")
         .args(["doctor", "--json"])
@@ -796,12 +797,11 @@ fn doctor_reports_a_worker_whose_program_is_missing() {
     // `skill` rows are informational: this HOME has no skill installed, and
     // that must not fail doctor.
     let rows = v["findings"].as_array().expect("findings");
-    for row in rows
+    let builder = rows
         .iter()
-        .filter(|r| r["kind"] != "auth" && r["kind"] != "skill")
-    {
-        assert_eq!(row["ok"], true, "{row}");
-    }
+        .find(|r| r["kind"] == "worker" && r["name"] == "builder")
+        .expect("builder row");
+    assert_eq!(builder["ok"], true, "{builder}");
     let all_ok = rows.iter().all(|r| r["ok"] == true || r["kind"] == "skill");
     assert_eq!(v["ok"], serde_json::Value::Bool(all_ok), "{v}");
     assert_eq!(with.status.code(), Some(i32::from(!all_ok)), "{v}");
