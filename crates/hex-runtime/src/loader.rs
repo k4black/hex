@@ -73,9 +73,9 @@ fn one() -> u32 {
 struct RawDefaults {
     /// Default role for agent nodes (`role:`; `worker:` is accepted as an alias
     /// since a graph names one thing and needn't care that it resolves via the
-    /// worker registry).
+    /// worker registry). Both at once is serde's duplicate-field error.
+    #[serde(alias = "worker")]
     role: Option<String>,
-    worker: Option<String>,
     context: Option<String>,
     budget: Option<RawBudget>,
 }
@@ -135,8 +135,8 @@ struct RawNodeBudget {
 #[serde(deny_unknown_fields)]
 struct RawAgent {
     /// The role this node runs as (`role:`, or `worker:` as an alias).
+    #[serde(alias = "worker")]
     role: Option<String>,
-    worker: Option<String>,
     prompt: String,
     #[serde(default)]
     may_propose: Vec<String>,
@@ -154,29 +154,31 @@ struct RawAgent {
 struct RawRun {
     /// One literal argv, or several.
     #[serde(default)]
-    run: Option<Argvs>,
+    run: Option<OneOrMany<Vec<String>>>,
     /// One project check name, or several.
     #[serde(default)]
-    check: Option<Names>,
+    check: Option<OneOrMany<String>>,
     /// `ordered` (stop at the first failure) or `parallel` (run everything).
     #[serde(default)]
     mode: Option<String>,
 }
 
-/// One argv or a list of them, so the single-command case stays terse.
+/// One value or a list of them (an argv or several, a check name or several),
+/// so the single case stays terse.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum Argvs {
-    One(Vec<String>),
-    Many(Vec<Vec<String>>),
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
 }
 
-/// One check name or a list of them.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum Names {
-    One(String),
-    Many(Vec<String>),
+impl<T: Clone> OneOrMany<T> {
+    fn to_vec(&self) -> Vec<T> {
+        match self {
+            Self::One(one) => vec![one.clone()],
+            Self::Many(many) => many.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,7 +222,6 @@ pub fn load_with(
         .defaults
         .role
         .clone()
-        .or_else(|| raw.defaults.worker.clone())
         .or_else(|| config_defaults.role.clone());
     let default_context = raw
         .defaults
@@ -252,7 +253,7 @@ pub fn load_with(
         // Every non-terminal node gets a visit bound, whether or not the graph
         // declares one, so no loop can churn unbounded. A terminal keeps `None`:
         // `schedule` settles a terminal before any budget check, so a bound there
-        // would be recorded but never enforced (gotcha 18). A declared `0` is
+        // would be recorded but never enforced (gotcha 22). A declared `0` is
         // left for `validate` to reject as `E-budget-zero`, with a message that
         // names the node.
         let max_visits = match spec.kind() {
@@ -261,7 +262,10 @@ pub fn load_with(
         };
         nodes.insert(
             id.clone(),
-            Node::new(id.clone(), spec).with_max_visits(max_visits),
+            Node {
+                max_visits,
+                ..Node::new(id.clone(), spec)
+            },
         );
     }
 
@@ -333,7 +337,6 @@ fn compile_node(
         let role_name = agent
             .role
             .clone()
-            .or_else(|| agent.worker.clone())
             .or_else(|| default_role.map(ToOwned::to_owned))
             .ok_or_else(|| HexError::new(format!("agent `{id}` has no role and no default")))?;
         // A role the config does not define is refused here rather than at the
@@ -409,10 +412,7 @@ fn compile_command(
             )));
         }
         (Some(argvs), None) => {
-            let argvs = match argvs {
-                Argvs::One(argv) => vec![argv.clone()],
-                Argvs::Many(many) => many.clone(),
-            };
+            let argvs = argvs.to_vec();
             if argvs.is_empty() || argvs.iter().any(Vec::is_empty) {
                 return Err(HexError::new(format!("command `{id}` has an empty `run`")));
             }
@@ -422,10 +422,7 @@ fn compile_command(
                 .collect()
         }
         (None, Some(names)) => {
-            let names = match names {
-                Names::One(name) => vec![name.clone()],
-                Names::Many(many) => many.clone(),
-            };
+            let names = names.to_vec();
             if names.is_empty() {
                 return Err(HexError::new(format!(
                     "command `{id}` has an empty `check`"
@@ -465,12 +462,8 @@ fn compile_requirement(raw: &str) -> Result<Requirement> {
 }
 
 fn compile_budget(raw: Option<&RawBudget>) -> Result<Budget> {
-    let Some(raw) = raw else {
-        return Ok(Budget {
-            attempt_elapsed_ms: Some(DEFAULT_ATTEMPT_ELAPSED_MS),
-            ..Budget::default()
-        });
-    };
+    let none = RawBudget::default();
+    let raw = raw.unwrap_or(&none);
     Ok(Budget {
         elapsed_ms: raw.elapsed.as_deref().map(parse_duration_ms).transpose()?,
         // Always bounded: an unbounded attempt let a hung agent block forever.
@@ -531,15 +524,6 @@ mod tests {
 
     const CRITIQUE: &str = include_str!("presets/critique-loop.yaml");
 
-    fn no_defaults() -> Config {
-        Config::default()
-    }
-
-    /// The real built-in layer, so tests exercise the shipped roles.
-    fn builtin() -> Config {
-        Config::builtin()
-    }
-
     #[test]
     fn parses_duration_units() {
         assert_eq!(parse_duration_ms("500ms").unwrap(), 500);
@@ -556,21 +540,16 @@ mod tests {
         assert_eq!(parse_duration_ms("0s").unwrap(), 0);
     }
 
+    /// The operator prompt is substituted at attempt-start, not at load, so the
+    /// compiled prompt keeps `{{prompt}}` verbatim — and `uses_prompt` sees it.
     #[test]
-    fn load_keeps_the_prompt_token_for_runtime_substitution() {
-        // The operator prompt is substituted at attempt-start, not at load, so
-        // the compiled prompt keeps `{{prompt}}` verbatim.
-        let g = load(CRITIQUE, &no_defaults()).expect("loads");
+    fn load_keeps_the_prompt_token_and_uses_prompt_detects_it() {
+        let g = load(CRITIQUE, &Config::default()).expect("loads");
         let NodeSpec::Agent { prompt, .. } = &g.node("implement").unwrap().spec else {
             panic!("implement is an agent");
         };
         assert!(prompt.contains(PROMPT_TOKEN));
-    }
-
-    #[test]
-    fn uses_prompt_detects_the_token() {
-        let graph = load(CRITIQUE, &no_defaults()).expect("loads");
-        assert!(uses_prompt(&graph));
+        assert!(uses_prompt(&g));
     }
 
     #[test]
@@ -584,33 +563,16 @@ nodes:
   done:
     terminal: succeeded
 "#;
-        let graph = load(source, &no_defaults()).expect("loads");
+        let graph = load(source, &Config::default()).expect("loads");
         assert!(!uses_prompt(&graph));
-    }
-
-    #[test]
-    fn compiles_the_builtin_critique_loop() {
-        let g = load(CRITIQUE, &builtin()).expect("loads");
-        assert_eq!(g.entry, "implement");
-        // `implement` declares no visits, so it takes the default bound; `review`
-        // declares 4 and keeps it.
-        assert_eq!(
-            g.node("implement").unwrap().max_visits,
-            Some(hex_kernel::graph::DEFAULT_NODE_VISITS)
-        );
-        assert_eq!(g.node("review").unwrap().max_visits, Some(4));
-        assert_eq!(g.accept.require.len(), 1);
-        assert_eq!(g.accept.on_unmet.as_deref(), Some("implement"));
-        // And it passes kernel validation.
-        hex_kernel::validate(&g).expect("valid graph");
     }
 
     /// The built-ins must run in a repo that has declared nothing at all — that
     /// is the whole reason they ship gate-free.
     #[test]
     fn every_builtin_preset_compiles_and_validates_with_no_project_config() {
-        for entry in crate::preset::BUILTINS {
-            let graph = match load(entry.source, &builtin()) {
+        for (name, source) in crate::preset::BUILTINS {
+            let graph = match load(source, &Config::builtin()) {
                 Ok(g) => g,
                 Err(e) => {
                     // A preset whose gate IS the preset (tdd, implement-until-green)
@@ -618,14 +580,13 @@ nodes:
                     let msg = e.to_string();
                     assert!(
                         msg.contains("does not declare") && msg.contains("checks."),
-                        "preset `{}` failed for an unexpected reason: {msg}",
-                        entry.name
+                        "preset `{name}` failed for an unexpected reason: {msg}"
                     );
                     continue;
                 }
             };
             hex_kernel::validate(&graph)
-                .unwrap_or_else(|i| panic!("preset `{}` is invalid: {i:?}", entry.name));
+                .unwrap_or_else(|i| panic!("preset `{name}` is invalid: {i:?}"));
         }
     }
 
@@ -633,7 +594,7 @@ nodes:
     /// policy reaches the node without the graph restating it.
     #[test]
     fn a_role_contributes_its_preamble_and_read_only_policy() {
-        let g = load(CRITIQUE, &builtin()).expect("loads");
+        let g = load(CRITIQUE, &Config::builtin()).expect("loads");
         let NodeSpec::Agent {
             prompt,
             read_only,
@@ -657,7 +618,7 @@ nodes:
 
     #[test]
     fn a_project_can_append_to_a_shipped_role_prompt() {
-        let mut config = builtin();
+        let mut config = Config::builtin();
         config.merge(
             yaml_serde::from_str(
                 "roles:\n  reviewer:\n    prompt_append: \"Only flag security issues.\"\n",
@@ -672,23 +633,6 @@ nodes:
         assert!(prompt.contains("Only flag security issues."));
     }
 
-    /// A check the project has not declared is refused, with the fix in the
-    /// message — never silently passed.
-    #[test]
-    fn an_unconfigured_check_is_refused_with_an_actionable_message() {
-        let src = r#"
-version: 1
-name: needs-check
-entry: t
-nodes:
-  t: { command: { check: test }, on: { passed: done, failed: done } }
-  done: { terminal: succeeded }
-"#;
-        let err = load(src, &builtin()).unwrap_err().to_string();
-        assert!(err.contains("does not declare"), "got: {err}");
-        assert!(err.contains("checks.test"), "names the key to add: {err}");
-    }
-
     #[test]
     fn a_configured_check_resolves_to_its_argv_at_compile_time() {
         let src = r#"
@@ -699,7 +643,7 @@ nodes:
   t: { command: { check: test }, on: { passed: done, failed: done } }
   done: { terminal: succeeded }
 "#;
-        let mut config = builtin();
+        let mut config = Config::builtin();
         config.checks.insert(
             "test".to_owned(),
             vec!["pytest".to_owned(), "-q".to_owned()],
@@ -728,7 +672,7 @@ nodes:
     on: { passed: done, failed: done }
   done: { terminal: succeeded }
 "#;
-        let g = load(src, &no_defaults()).expect("loads");
+        let g = load(src, &Config::default()).expect("loads");
         let NodeSpec::Command { steps, mode } = &g.node("t").unwrap().spec else {
             panic!("command");
         };
@@ -737,7 +681,7 @@ nodes:
 
         let bad = src.replace("mode: parallel", "mode: sideways");
         assert!(
-            load(&bad, &no_defaults())
+            load(&bad, &Config::default())
                 .unwrap_err()
                 .to_string()
                 .contains("unknown mode")
@@ -757,7 +701,7 @@ nodes:
     on: { again: a, fin: done }
   done: { terminal: succeeded }
 "#;
-        let g = load(src, &builtin()).expect("loads");
+        let g = load(src, &Config::builtin()).expect("loads");
         assert_eq!(g.node("a").unwrap().max_visits, Some(3));
         // A terminal's `visits` is never enforced (`schedule` settles a terminal
         // before any budget check), so the loader leaves it `None`.
@@ -765,7 +709,7 @@ nodes:
 
         // An undeclared bound is filled with the default rather than left open.
         let undeclared = src.replace("    budget: { visits: 3 }\n", "");
-        let g = load(&undeclared, &builtin()).expect("loads");
+        let g = load(&undeclared, &Config::builtin()).expect("loads");
         assert_eq!(
             g.node("a").unwrap().max_visits,
             Some(hex_kernel::graph::DEFAULT_NODE_VISITS)
@@ -787,7 +731,7 @@ nodes:
     on: { again: a, fin: done }
   done: { terminal: succeeded }
 "#;
-        let g = load(src, &builtin()).expect("loads");
+        let g = load(src, &Config::builtin()).expect("loads");
         let issues = hex_kernel::validate(&g).unwrap_err();
         assert!(
             issues.iter().any(|i| i.code == "E-budget-zero"),
@@ -814,13 +758,13 @@ nodes:
   done: { terminal: succeeded }
 "#;
         assert!(
-            load(both, &no_defaults())
+            load(both, &Config::default())
                 .unwrap_err()
                 .to_string()
                 .contains("both `run` and `check`")
         );
         assert!(
-            load(neither, &no_defaults())
+            load(neither, &Config::default())
                 .unwrap_err()
                 .to_string()
                 .contains("must set `run: [argv]` or `check: <name>`")
@@ -838,7 +782,7 @@ nodes:
   done:
     terminal: succeeded
 "#;
-        let g = load(source, &no_defaults()).expect("loads");
+        let g = load(source, &Config::default()).expect("loads");
         assert_eq!(g.budget.elapsed_ms, None, "no run bound was declared");
         assert_eq!(
             g.budget.attempt_elapsed_ms,
@@ -850,7 +794,7 @@ nodes:
             "entry: done",
             "entry: done\ndefaults:\n  budget:\n    attempt: 90s",
         );
-        let g = load(&explicit, &no_defaults()).expect("loads");
+        let g = load(&explicit, &Config::default()).expect("loads");
         assert_eq!(g.budget.attempt_elapsed_ms, Some(90_000));
     }
 
@@ -871,7 +815,7 @@ nodes:
             .expect("README has a ```yaml block");
         // The example demonstrates a project check, so give it one — the point of
         // this test is that the YAML is valid, not that checks are optional.
-        let mut config = builtin();
+        let mut config = Config::builtin();
         config
             .checks
             .insert("test".to_owned(), vec!["true".to_owned()]);
@@ -893,7 +837,7 @@ nodes:
   done:
     terminal: succeeded
 "#;
-        let err = load(src, &no_defaults()).unwrap_err();
+        let err = load(src, &Config::default()).unwrap_err();
         assert!(err.to_string().contains("exactly one kind"));
     }
 }

@@ -94,7 +94,7 @@ facts the pure kernel may not compute (core rule 1).
   crashed one — a run mid-attempt writes nothing to the journal (`AttemptStarted` is
   the last event). `Hung` becomes a *diagnostic on `live`* (lock held, heartbeat stale),
   not a fifth state.
-- **Fix the fs4 lock flake (gotcha 24) where it actually bites:** in `cancel`, read the
+- **Fix the fs4 lock flake (gotcha 26) where it actually bites:** in `cancel`, read the
   journal **before** probing the lock. A finished run then returns `Recorded` and never
   reaches the flaky probe. The `cancel_of_an_idle_run_is_recorded_directly` reproducer
   disappears because the path is not taken.
@@ -137,7 +137,7 @@ An agent node's only output channel is its terminating message.
   `E-edge-not-proposable` stay.
 - **Delete:** the `hex emit` verb, `HEX_EMIT_FILE`, `HEX_MAY_PROPOSE`, the emitted-file
   read/validation, and — as a consequence — `hex doctor`'s `self` row, the preflight
-  `self` exception, and the skill's "put `hex` on `PATH`" trap. Retires **gotcha 35**
+  `self` exception, and the skill's "put `hex` on `PATH`" trap. Retires the old `hex emit` PATH gotcha
   (`hex emit` returned 127 in **3 of 3** real runs).
 
 Core rule 3 survives: a model still proposes an event only from its allow-list and the
@@ -243,7 +243,7 @@ a journal makes polling visible.
 2. **Process + state** — detach deletion, runtime enum collapse, `cancel` ordering.
 3. **Surface** — delete `dash`/`watch`/export/stubs; add `prune`; add `stats`.
 4. **Hardening** — stall detection, usage `Note`, `topology.rs` doc fix.
-5. **Docs** — README, AGENTS.md (gotchas 5, 24, 34, 35, 44 + terminology), the hex
+5. **Docs** — README, AGENTS.md (the verdict-line, fs4-flake, step-exit, `hex emit` and graph-export gotchas + terminology), the hex
    skill, `defaults.yaml`, preset comments.
 
 ## Risks

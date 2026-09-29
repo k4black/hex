@@ -2,9 +2,10 @@
 //! runs to `succeeded`, and a killed run resumes from its journal.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use common::temp_root;
+use common::{sh, temp_root, write_graph};
 use hex_proto::{Actor, Disposition, EventBody};
 use hex_runtime::config::Config;
 use hex_runtime::journal::Journal;
@@ -34,14 +35,6 @@ accept:
   require: [test.passed]
 "#;
 
-fn write_graph(root: &std::path::Path) -> PathBuf {
-    let dir = root.join(".hex").join("graphs");
-    std::fs::create_dir_all(&dir).expect("mkdir graphs");
-    let path = dir.join("test-critique.yaml");
-    std::fs::write(&path, GRAPH).expect("write graph");
-    path
-}
-
 fn recorded_prompt() -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     m.insert("prompt".to_owned(), "the thing".to_owned());
@@ -69,9 +62,7 @@ accept: { require: [] }
 #[test]
 fn node_result_is_captured_and_handed_to_the_downstream_prompt() {
     let root = temp_root("handoff");
-    let dir = root.join(".hex").join("graphs");
-    std::fs::create_dir_all(&dir).expect("mkdir graphs");
-    std::fs::write(dir.join("handoff.yaml"), HANDOFF_GRAPH).expect("write graph");
+    write_graph(&root, "handoff", HANDOFF_GRAPH);
 
     // planner: writes a result to $HEX_RESULT_FILE and emits nothing (implicit
     // completion). builder: has no {prompt} in argv, so its (interpolated)
@@ -124,10 +115,6 @@ fn node_result_is_captured_and_handed_to_the_downstream_prompt() {
     )));
 }
 
-fn sh(script: &str) -> Vec<String> {
-    vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()]
-}
-
 /// A graph whose acceptance can only be met on the *second* pass: `implement`
 /// routes to the success terminal either way, and `accept.on_unmet` sends the run
 /// back when the required evidence is missing. Edge-acyclic on purpose — the loop
@@ -156,9 +143,7 @@ accept:
 #[test]
 fn a_rerouted_run_stays_readable_by_status_logs_and_resume() {
     let root = temp_root("reroute");
-    let dir = root.join(".hex").join("graphs");
-    std::fs::create_dir_all(&dir).expect("mkdir graphs");
-    std::fs::write(dir.join("reroute.yaml"), REROUTE_GRAPH).expect("write graph");
+    write_graph(&root, "reroute", REROUTE_GRAPH);
 
     // First attempt: `blocked` (acceptance unmet → reroute). Second: `ready`.
     let mut workers = Workers::new();
@@ -222,8 +207,6 @@ enum Entry {
         node: String,
         number: u32,
         worker: Option<String>,
-        stdout_log: PathBuf,
-        attempt_id: String,
     },
     /// `attempt_finished` fired.
     Finish,
@@ -241,8 +224,6 @@ impl hex_runtime::ProgressSink for Recorder {
             node: v.node_id.clone(),
             number: v.attempt_number,
             worker: v.worker.clone(),
-            stdout_log: v.stdout_log.clone(),
-            attempt_id: v.attempt_id.clone(),
         });
     }
     fn attempt_finished(&self) {
@@ -253,7 +234,7 @@ impl hex_runtime::ProgressSink for Recorder {
 #[test]
 fn progress_sink_brackets_every_attempt_with_a_correct_view() {
     let root = temp_root("progress");
-    write_graph(&root);
+    write_graph(&root, "test-critique", GRAPH);
 
     // implement → review(approved) → test(gate) → done: three attempts.
     let mock = MockWorker::new()
@@ -264,7 +245,7 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
 
     let rec = Recorder::default();
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers)
-        .with_progress(Box::new(rec.clone()));
+        .with_progress(Arc::new(rec.clone()));
     let report = runtime
         .start("test-critique", Some("the thing"), None, &Isolation::Shared)
         .expect("run");
@@ -303,7 +284,7 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
     }
 
     // The three views carry the right node, 1-based ordinal, worker (None for
-    // the gate), and a log path under this attempt's dir.
+    // the gate).
     let starts: Vec<&Entry> = log
         .iter()
         .filter(|e| matches!(e, Entry::Start { .. }))
@@ -318,8 +299,6 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
             node,
             number,
             worker,
-            stdout_log,
-            attempt_id,
         } = start
         else {
             unreachable!()
@@ -327,18 +306,6 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
         assert_eq!(node, exp_node);
         assert_eq!(*number, exp_num);
         assert_eq!(worker.as_deref(), exp_worker);
-        assert!(
-            stdout_log.ends_with("stdout.log"),
-            "log path: {stdout_log:?}"
-        );
-        assert_eq!(
-            stdout_log
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str()),
-            Some(attempt_id.as_str()),
-            "the log lives under attempts/<attempt_id>/",
-        );
     }
 }
 
@@ -348,7 +315,7 @@ fn progress_sink_brackets_every_attempt_with_a_correct_view() {
 #[test]
 fn an_out_of_allowlist_proposal_fails_the_run() {
     let root = temp_root("progress-fail");
-    write_graph(&root);
+    write_graph(&root, "test-critique", GRAPH);
 
     let mock = MockWorker::new().on("implement", &["nope"]);
     let mut workers = Workers::new();
@@ -366,14 +333,6 @@ fn an_out_of_allowlist_proposal_fails_the_run() {
 struct PanicWorker;
 
 impl hex_worker::Worker for PanicWorker {
-    fn capabilities(&self) -> hex_worker::CapabilityManifest {
-        hex_worker::CapabilityManifest::default()
-    }
-    /// Stands in for a real adapter, so it must satisfy the same contract a real
-    /// one does — the node it drives declares outcomes.
-    fn captures_result(&self) -> bool {
-        true
-    }
     fn run(&self, _request: &hex_worker::WorkRequest) -> hex_worker::WorkOutcome {
         panic!("worker exploded");
     }
@@ -382,14 +341,14 @@ impl hex_worker::Worker for PanicWorker {
 #[test]
 fn progress_sink_finishes_even_when_the_worker_panics() {
     let root = temp_root("progress-panic");
-    write_graph(&root);
+    write_graph(&root, "test-critique", GRAPH);
 
     let mut workers = Workers::new();
     workers.insert("mock", Box::new(PanicWorker));
 
     let rec = Recorder::default();
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers)
-        .with_progress(Box::new(rec.clone()));
+        .with_progress(Arc::new(rec.clone()));
 
     // The worker panics inside adapter.run; the driver's RAII finish guard must
     // still fire attempt_finished while the run unwinds. (The panic prints a
@@ -420,7 +379,7 @@ fn progress_sink_finishes_even_when_the_worker_panics() {
 #[test]
 fn critique_loop_runs_to_success() {
     let root = temp_root("success");
-    write_graph(&root);
+    write_graph(&root, "test-critique", GRAPH);
 
     // review requests changes once, then approves; implement always emits ready.
     let mock = MockWorker::new()
@@ -455,7 +414,7 @@ fn critique_loop_runs_to_success() {
 #[test]
 fn budget_exhaustion_fails_closed() {
     let root = temp_root("budget");
-    write_graph(&root);
+    write_graph(&root, "test-critique", GRAPH);
 
     // review never approves → the loop churns until a node's visit bound stops it.
     let mock = MockWorker::new()
@@ -486,27 +445,13 @@ fn rejects_unsafe_run_ids() {
 fn tampered_snapshot_is_rejected_on_resume() {
     let root = temp_root("tamper");
     let run_id = "run_tamper";
-    let run_dir = root.join(".hex").join("runs").join(run_id);
-    std::fs::create_dir_all(run_dir.join("attempts")).expect("mkdir");
-    std::fs::write(run_dir.join("graph.yaml"), GRAPH).expect("graph.yaml");
+    write_run(&root, run_id, recorded_prompt(), Vec::new());
     // A sha256 that does not match the graph text must block resume.
-    std::fs::write(run_dir.join("graph.sha256"), "not_the_real_hash").expect("sha");
-    {
-        let mut j = Journal::create(run_dir.join("events.jsonl")).expect("journal");
-        j.append(
-            run_id,
-            None,
-            None,
-            Actor::runtime(),
-            EventBody::RunCreated {
-                graph_hash: "not_the_real_hash".to_owned(),
-                inputs: recorded_prompt(),
-                defaults: Default::default(),
-                checks: Default::default(),
-            },
-        )
-        .unwrap();
-    }
+    std::fs::write(
+        root.join(".hex/runs").join(run_id).join("graph.sha256"),
+        "not_the_real_hash",
+    )
+    .expect("sha");
     let mut workers = Workers::new();
     workers.insert("mock", Box::new(MockWorker::new()));
     let runtime = Runtime::with_workers(root, Config::builtin(), workers);
@@ -514,57 +459,55 @@ fn tampered_snapshot_is_rejected_on_resume() {
     assert!(err.to_string().contains("sha256") || err.to_string().contains("snapshot"));
 }
 
-/// Hand-build a run whose journal ends mid-attempt (a crash after
-/// `attempt_started`, before any terminal event for `implement`).
-fn write_crashed_run(root: &std::path::Path, run_id: &str) {
-    write_crashed_run_with_inputs(root, run_id, recorded_prompt());
-}
+/// A journal event to hand-write: node, attempt, body.
+type Ev = (Option<&'static str>, Option<&'static str>, EventBody);
 
-fn write_crashed_run_with_inputs(
-    root: &std::path::Path,
-    run_id: &str,
-    inputs: BTreeMap<String, String>,
-) {
+/// Hand-build a run of `GRAPH` with a valid snapshot: `RunCreated` carrying
+/// `inputs`, then `extra` in order.
+fn write_run(root: &Path, run_id: &str, inputs: BTreeMap<String, String>, extra: Vec<Ev>) {
     let run_dir = root.join(".hex").join("runs").join(run_id);
     std::fs::create_dir_all(run_dir.join("attempts")).expect("mkdir run");
     std::fs::write(run_dir.join("graph.yaml"), GRAPH).expect("graph.yaml");
     let hash = hex_runtime::driver::graph_hash(GRAPH);
     std::fs::write(run_dir.join("graph.sha256"), &hash).expect("graph.sha256");
     let mut j = Journal::create(run_dir.join("events.jsonl")).expect("journal");
-    j.append(
-        run_id,
-        None,
-        None,
-        Actor::runtime(),
-        EventBody::RunCreated {
-            graph_hash: hash,
-            inputs,
-            defaults: Default::default(),
-            checks: Default::default(),
-        },
-    )
-    .unwrap();
-    j.append(run_id, None, None, Actor::runtime(), EventBody::RunStarted)
-        .unwrap();
-    j.append(
-        run_id,
-        Some("implement"),
-        Some("att_1"),
-        Actor::runtime(),
-        EventBody::AttemptStarted {
-            idempotency_key: "implement#1".to_owned(),
-            worker: Some("mock".to_owned()),
-        },
-    )
-    .unwrap();
-    // journal dropped here — the run "crashed" mid-attempt.
+    let created = EventBody::RunCreated {
+        graph_hash: hash,
+        inputs,
+        defaults: Default::default(),
+        checks: Default::default(),
+    };
+    for (node, attempt, body) in std::iter::once((None, None, created)).chain(extra) {
+        j.append(run_id, node, attempt, Actor::runtime(), body)
+            .expect("append");
+    }
+}
+
+/// A run that crashed mid-attempt: `attempt_started` for `implement`, and no
+/// terminal event after it.
+fn crashed() -> Vec<Ev> {
+    vec![
+        (None, None, EventBody::RunStarted),
+        (
+            Some("implement"),
+            Some("att_1"),
+            EventBody::AttemptStarted {
+                idempotency_key: "implement#1".to_owned(),
+                worker: Some("mock".to_owned()),
+            },
+        ),
+    ]
+}
+
+fn write_crashed_run(root: &Path, run_id: &str) {
+    write_run(root, run_id, recorded_prompt(), crashed());
 }
 
 #[test]
 fn resume_rejects_a_missing_recorded_prompt() {
     let root = temp_root("missing-prompt");
     let run_id = "run_missing_prompt";
-    write_crashed_run_with_inputs(&root, run_id, BTreeMap::new());
+    write_run(&root, run_id, BTreeMap::new(), crashed());
 
     let err = finishing_runtime(root).resume(run_id).unwrap_err();
     assert!(err.to_string().contains("missing the prompt"), "{err}");
@@ -613,51 +556,16 @@ fn crash_right_after_attempt_failed_does_not_rerun() {
     // there is no window in which the failed node looks re-runnable.
     let root = temp_root("failcrash");
     let run_id = "run_failcrash";
-    let run_dir = root.join(".hex").join("runs").join(run_id);
-    std::fs::create_dir_all(run_dir.join("attempts")).expect("mkdir");
-    std::fs::write(run_dir.join("graph.yaml"), GRAPH).expect("graph.yaml");
-    let hash = hex_runtime::driver::graph_hash(GRAPH);
-    std::fs::write(run_dir.join("graph.sha256"), &hash).expect("sha");
-    {
-        let mut j = Journal::create(run_dir.join("events.jsonl")).expect("journal");
-        j.append(
-            run_id,
-            None,
-            None,
-            Actor::runtime(),
-            EventBody::RunCreated {
-                graph_hash: hash,
-                inputs: recorded_prompt(),
-                defaults: Default::default(),
-                checks: Default::default(),
-            },
-        )
-        .unwrap();
-        j.append(run_id, None, None, Actor::runtime(), EventBody::RunStarted)
-            .unwrap();
-        j.append(
-            run_id,
-            Some("implement"),
-            Some("att_1"),
-            Actor::runtime(),
-            EventBody::AttemptStarted {
-                idempotency_key: "implement#1".to_owned(),
-                worker: Some("mock".to_owned()),
-            },
-        )
-        .unwrap();
-        j.append(
-            run_id,
-            Some("implement"),
-            Some("att_1"),
-            Actor::runtime(),
-            EventBody::AttemptFailed {
-                reason: "boom".to_owned(),
-                disposition: Disposition::Failed,
-            },
-        )
-        .unwrap();
-    }
+    let mut events = crashed();
+    events.push((
+        Some("implement"),
+        Some("att_1"),
+        EventBody::AttemptFailed {
+            reason: "boom".to_owned(),
+            disposition: Disposition::Failed,
+        },
+    ));
+    write_run(&root, run_id, recorded_prompt(), events);
 
     // A runtime whose mock *would* emit if the node were re-run.
     let root_for_read = root.clone();
@@ -695,40 +603,22 @@ fn lifecycle_invalid_journal_is_rejected() {
     // be rejected before folding, not silently ignored.
     let root = temp_root("badlife");
     let run_id = "run_badlife";
-    let run_dir = root.join(".hex").join("runs").join(run_id);
-    std::fs::create_dir_all(run_dir.join("attempts")).expect("mkdir");
-    std::fs::write(run_dir.join("graph.yaml"), GRAPH).expect("graph.yaml");
-    let hash = hex_runtime::driver::graph_hash(GRAPH);
-    std::fs::write(run_dir.join("graph.sha256"), &hash).expect("sha");
-    {
-        let mut j = Journal::create(run_dir.join("events.jsonl")).expect("journal");
-        j.append(
-            run_id,
-            None,
-            None,
-            Actor::runtime(),
-            EventBody::RunCreated {
-                graph_hash: hash,
-                inputs: recorded_prompt(),
-                defaults: Default::default(),
-                checks: Default::default(),
-            },
-        )
-        .unwrap();
-        j.append(run_id, None, None, Actor::runtime(), EventBody::RunStarted)
-            .unwrap();
-        // No attempt_started — this signal is impossible.
-        j.append(
-            run_id,
-            Some("implement"),
-            Some("att_1"),
-            Actor::runtime(),
-            EventBody::Signal {
-                name: "ready".to_owned(),
-            },
-        )
-        .unwrap();
-    }
+    write_run(
+        &root,
+        run_id,
+        recorded_prompt(),
+        vec![
+            (None, None, EventBody::RunStarted),
+            // No attempt_started — this signal is impossible.
+            (
+                Some("implement"),
+                Some("att_1"),
+                EventBody::Signal {
+                    name: "ready".to_owned(),
+                },
+            ),
+        ],
+    );
     let runtime = Runtime::with_workers(root, Config::builtin(), Workers::new());
     let err = runtime.status(run_id).unwrap_err();
     assert!(err.to_string().contains("journal is invalid"), "{err}");
@@ -757,9 +647,7 @@ accept:
   require: []
 "#;
     let root = temp_root("timeout");
-    let dir = root.join(".hex").join("graphs");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join("timeout.yaml"), TIMEOUT_GRAPH).expect("write");
+    write_graph(&root, "timeout", TIMEOUT_GRAPH);
 
     let mock = MockWorker::new().on("implement", &["ready"]);
     let mut workers = Workers::new();
@@ -806,9 +694,7 @@ accept:
 
 fn check_runtime(tag: &str, check: Option<Vec<String>>) -> (Runtime, PathBuf) {
     let root = temp_root(tag);
-    let dir = root.join(".hex").join("graphs");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join("cg.yaml"), CHECK_GRAPH).expect("write");
+    write_graph(&root, "cg", CHECK_GRAPH);
     let mut config = Config::builtin();
     if let Some(argv) = check {
         config.checks.insert("test".to_owned(), argv);
@@ -873,7 +759,7 @@ fn a_gate_failing_with_identical_output_twice_ends_the_run() {
         "a configured check must not report itself as skipped"
     );
     // And the operator is told why the loop was cut short — the reason rides
-    // the terminal AttemptFailed, which `Payoff` surfaces as `why:`.
+    // the terminal AttemptFailed.
     assert!(
         events.iter().any(|e| matches!(
             &e.body,
@@ -881,6 +767,13 @@ fn a_gate_failing_with_identical_output_twice_ends_the_run() {
                 if reason.contains("failed with identical output twice")
         )),
         "the stall must explain itself: {events:#?}"
+    );
+    // `status` carries the same reason, so no client has to scan the journal.
+    let why = runtime.status(&report.run_id).expect("status").why;
+    assert!(
+        why.as_deref()
+            .is_some_and(|w| w.contains("failed with identical output twice")),
+        "{why:?}"
     );
 }
 
@@ -917,9 +810,7 @@ fn a_check_that_cannot_start_is_not_a_failed_verdict() {
 #[test]
 fn preflight_refuses_a_missing_agent_cli_before_creating_a_run() {
     let root = temp_root("preflight");
-    let dir = root.join(".hex").join("graphs");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join("cg.yaml"), CHECK_GRAPH).expect("write");
+    write_graph(&root, "cg", CHECK_GRAPH);
 
     let mut workers = Workers::new();
     workers.insert(
@@ -973,9 +864,7 @@ nodes:
 accept: { require: [] }
 "#;
     let root = temp_root("unknownedge");
-    let dir = root.join(".hex").join("graphs");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join("ue.yaml"), UNKNOWN_GRAPH).expect("write");
+    write_graph(&root, "ue", UNKNOWN_GRAPH);
     let mut workers = Workers::new();
     workers.insert("mock", Box::new(MockWorker::new().on("work", &["sneaky"])));
     let runtime = Runtime::with_workers(root, Config::builtin(), workers);

@@ -11,48 +11,18 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{HexError, Result};
 
-/// The built-in workflow library, embedded so a fresh checkout can run them.
-const CRITIQUE_LOOP: &str = include_str!("presets/critique-loop.yaml");
-const CHECKLIST: &str = include_str!("presets/checklist.yaml");
-const IMPLEMENT_UNTIL_GREEN: &str = include_str!("presets/implement-until-green.yaml");
-const TDD: &str = include_str!("presets/tdd.yaml");
-const REVIEW: &str = include_str!("presets/review.yaml");
-const AUTORESEARCH: &str = include_str!("presets/autoresearch.yaml");
-
-/// One graph shipped in the binary.
-pub struct Builtin {
-    /// The preset's name, as `hex run <name>` takes it.
-    pub name: &'static str,
-    /// Its embedded YAML source.
-    pub source: &'static str,
-}
-
-/// The graphs shipped in the binary, in listing order.
-pub const BUILTINS: &[Builtin] = &[
-    Builtin {
-        name: "critique-loop",
-        source: CRITIQUE_LOOP,
-    },
-    Builtin {
-        name: "checklist",
-        source: CHECKLIST,
-    },
-    Builtin {
-        name: "implement-until-green",
-        source: IMPLEMENT_UNTIL_GREEN,
-    },
-    Builtin {
-        name: "tdd",
-        source: TDD,
-    },
-    Builtin {
-        name: "review",
-        source: REVIEW,
-    },
-    Builtin {
-        name: "autoresearch",
-        source: AUTORESEARCH,
-    },
+/// The graphs shipped in the binary as `(name, source)`, in listing order —
+/// embedded so a fresh checkout can run them.
+pub const BUILTINS: &[(&str, &str)] = &[
+    ("critique-loop", include_str!("presets/critique-loop.yaml")),
+    ("checklist", include_str!("presets/checklist.yaml")),
+    (
+        "implement-until-green",
+        include_str!("presets/implement-until-green.yaml"),
+    ),
+    ("tdd", include_str!("presets/tdd.yaml")),
+    ("review", include_str!("presets/review.yaml")),
+    ("autoresearch", include_str!("presets/autoresearch.yaml")),
 ];
 
 /// A resolved graph source plus a label describing where it came from.
@@ -65,7 +35,7 @@ pub struct Resolved {
 }
 
 /// A graph available to run, and where it resolves from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Entry {
     /// The name to pass to `hex run`.
     pub name: String,
@@ -135,8 +105,10 @@ pub fn resolve(reference: &str, project_root: &Path) -> Result<Resolved> {
     )))
 }
 
-/// Where a graph came from, in precedence order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Where a graph came from, in precedence order. Serializes as its
+/// [`label`](Self::label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Layer {
     /// `.hex/graphs/` — wins.
     Project,
@@ -161,7 +133,10 @@ impl Layer {
 /// The embedded source of the built-in named `name` — looked up in [`BUILTINS`]
 /// so shipping a preset means adding one table entry, not two.
 fn builtin(name: &str) -> Option<&'static str> {
-    BUILTINS.iter().find(|b| b.name == name).map(|b| b.source)
+    BUILTINS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, source)| *source)
 }
 
 /// List every runnable graph across the three layers, deduped by name with the
@@ -175,7 +150,7 @@ pub fn list(project_root: &Path) -> Vec<Entry> {
     // Track every layer that defines a name, so the winner can say whether it is
     // hiding something.
     let mut layers: BTreeMap<String, Vec<Layer>> = BTreeMap::new();
-    for name in BUILTINS.iter().map(|b| b.name) {
+    for (name, _) in BUILTINS {
         found.insert((*name).to_owned(), "built-in".to_owned());
         layers
             .entry((*name).to_owned())
@@ -241,9 +216,8 @@ fn collect_yaml(dir: &Path, found: &mut std::collections::BTreeMap<String, Strin
 }
 
 fn user_graphs_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
     Some(
-        PathBuf::from(home)
+        crate::local_log::home_dir()?
             .join(".config")
             .join("hex")
             .join("graphs"),

@@ -1,7 +1,7 @@
 # Worktree isolation (thin slice)
 
 - **Status:** designed + implemented 2026-07-21 (thin slice; `hex-runtime/src/worktree.rs`).
-- **Scope:** Phase-2 run isolation, the first slice. Relates to AGENTS.md gotcha 8,
+- **Scope:** Phase-2 run isolation, the first slice. Relates to AGENTS.md gotcha 12,
   README "Workspace isolation", TODO.md Phase-2 isolation items.
 - **One line:** opt into a per-run git worktree (from a **pool** of reusable slots
   keyed by an advisory lock) so agents work on a throwaway branch without touching
@@ -44,12 +44,12 @@ isolation axis; a graph-YAML `isolation:` default field.
 
 ## CLI surface
 
-Run-config flags (off the prompt channel, per gotcha 4b):
+Run-config flags (off the prompt channel, per gotcha 5):
 
 - `--worktree [<base-branch>]` — enable worktree isolation. Base = `<base-branch>`
   if given, else current `HEAD`. hex cuts a new branch `hex/<run-id>` **from** that
   base.
-- `--no-worktree` — force `shared` (overrides any future configured default).
+- `--no-worktree` — force `shared` (overrides any future configured default). *(Deleted 2026-09-29: it did nothing, since shared is the default.)*
 - Neither flag → `shared` (default; today's behavior, agent runs in project root).
 - `--worktree` and `--no-worktree` are mutually exclusive (clap `conflicts_with`).
 - `--worktree-init "<argv…>"` — optional **warmup command** run inside a freshly

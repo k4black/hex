@@ -1,13 +1,13 @@
 version: 1
 name: self-review
-description: "Review the working-tree diff with codex, gated on fmt+clippy+test in parallel"
+description: "Review the working-tree diff with the reviewer role, gated on fmt+clippy+test in parallel"
 example: "review the roles/config pass for correctness and invariant violations"
 
 # hex reviewing its own changes. Review-only: no implementer, nothing is edited —
 # this is the shape you run before committing.
 #
 # It deliberately exercises the parts of hex most likely to be wrong, so a green
-# run is evidence the tool works and not just that codex was agreeable:
+# run is evidence the tool works and not just that the reviewer was agreeable:
 #   - `roles:` resolution + a role's `prompt_append` reaching the agent
 #   - a parallel `command` node running three project checks at once
 #   - `accept.require` over BOTH a model verdict and deterministic evidence
@@ -22,7 +22,7 @@ defaults:
   budget:
     elapsed: 90m
     # A real review of a large diff at high reasoning effort takes a while: 15m
-    # killed codex mid-review on a ~5k-line change. Bound it, but not tightly.
+    # killed the reviewer mid-review on a ~5k-line change. Bound it, but not tightly.
     attempt: 45m
 
 entry: verify

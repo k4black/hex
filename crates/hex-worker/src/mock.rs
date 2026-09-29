@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
-use crate::{CapabilityManifest, WorkOutcome, WorkRequest, Worker};
+use crate::{WorkOutcome, WorkRequest, Worker};
 
 /// A worker that produces prescribed verdicts for tests.
 #[derive(Debug, Default)]
@@ -36,15 +36,6 @@ impl MockWorker {
 }
 
 impl Worker for MockWorker {
-    fn capabilities(&self) -> CapabilityManifest {
-        CapabilityManifest::default()
-    }
-
-    /// The mock synthesizes a final message, so it can carry a verdict.
-    fn captures_result(&self) -> bool {
-        true
-    }
-
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         let next = self
             .scripts
@@ -65,24 +56,9 @@ impl Worker for MockWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn request(node: &str) -> WorkRequest {
-        WorkRequest {
-            run_id: "run_0".to_owned(),
-            node_id: node.to_owned(),
-            attempt_id: "att_1".to_owned(),
-            prompt: String::new(),
-            workdir: PathBuf::from("."),
-            attempt_dir: PathBuf::from("."),
-            deadline_ms: None,
-            read_only: false,
-            extra_writable_dir: None,
-            resume_session: None,
-            graph: "t".to_owned(),
-            project_root: PathBuf::from("."),
-            worktree_branch: None,
-        }
+        crate::test_request(std::path::Path::new("."), node)
     }
 
     #[test]

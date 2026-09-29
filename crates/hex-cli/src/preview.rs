@@ -3,8 +3,9 @@
 //! (node · worker · attempt N/budget · spinner elapsed · countdown).
 //!
 //! Rendering runs on a background thread so the driver/worker are never touched
-//! — the preview is a pure consumer of the `attempts/<id>/{stdout,stderr}.log`
-//! files the worker already writes. On a non-TTY (or with `--no-preview` /
+//! — the preview is a pure consumer of the attempt's streams, read through
+//! [`hex_runtime::AttemptStreams`] (command step dirs included), so it knows
+//! nothing of the on-disk layout. On a non-TTY (or with `--no-preview` /
 //! `--json`) it degrades to the plain line-streaming used before this feature.
 //!
 //! Robustness: the render thread's terminal is wrapped in an RAII guard that
@@ -14,15 +15,13 @@
 //! channel has closed, so a line is never silently lost.
 
 use std::collections::VecDeque;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::io::Write;
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use hex_runtime::{AttemptView, Event, NodeKind, ProgressSink};
+use hex_runtime::{AttemptView, Event, ProgressSink, StreamCursor};
 use ratatui::Frame;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Position;
@@ -42,9 +41,6 @@ const MAX_PENDING: usize = 8 * 1024;
 /// Cap on a stored/rendered line's bytes — a single enormous newline-terminated
 /// line is truncated (with `…`) rather than retained whole in the ring.
 const MAX_LINE: usize = 2 * 1024;
-/// Cap on bytes read from one source per poll, so a large delta between polls
-/// can't allocate an unbounded transient buffer; the rest is read next tick.
-const MAX_READ: u64 = 64 * 1024;
 /// Braille spinner frames.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -91,49 +87,29 @@ impl LivePreview {
     /// render thread's cursor movements and desync the inline viewport's
     /// position bookkeeping for the rest of the run.
     pub fn notice(&self, line: &str) {
-        let guard = self.active.lock().expect("preview lock");
-        if let Some(a) = guard.as_ref()
-            && a.tx.send(Cmd::Line(line.to_owned())).is_ok()
-        {
-            return;
+        if !self.forward(line) {
+            let _ = writeln!(std::io::stderr(), "{line}");
         }
-        drop(guard);
-        let _ = writeln!(std::io::stderr(), "{line}");
     }
-}
 
-/// The preview shared between the runtime (which owns its sink as a `Box`) and
-/// the interrupt handler (which must print through the same footer channel):
-/// both hold one `Arc`, and this newtype gives the `Box` side its
-/// [`ProgressSink`].
-pub struct SharedPreview(pub std::sync::Arc<LivePreview>);
-
-impl ProgressSink for SharedPreview {
-    fn event(&self, e: &Event) {
-        self.0.event(e);
-    }
-    fn attempt_started(&self, v: &AttemptView) {
-        self.0.attempt_started(v);
-    }
-    fn attempt_finished(&self) {
-        self.0.attempt_finished();
+    /// Send `line` to the live footer to print above the pane. `false` when
+    /// there is no footer, or its thread has gone, so the caller writes it
+    /// itself — a line is never dropped.
+    fn forward(&self, line: &str) -> bool {
+        self.active
+            .lock()
+            .expect("preview lock")
+            .as_ref()
+            .is_some_and(|a| a.tx.send(Cmd::Line(line.to_owned())).is_ok())
     }
 }
 
 impl ProgressSink for LivePreview {
     fn event(&self, e: &Event) {
         let line = crate::event_line(e);
-        // While a footer owns stderr, route the line through it so it prints
-        // above the pane. If there's no footer, or its thread has gone, fall
-        // back to a plain write — a line is never dropped.
-        let guard = self.active.lock().expect("preview lock");
-        if let Some(a) = guard.as_ref()
-            && a.tx.send(Cmd::Line(line.clone())).is_ok()
-        {
-            return;
+        if !self.forward(&line) {
+            Self::plain(&line);
         }
-        drop(guard);
-        Self::plain(&line);
     }
 
     fn attempt_started(&self, v: &AttemptView) {
@@ -141,7 +117,7 @@ impl ProgressSink for LivePreview {
             return; // plain mode: never show a footer
         }
         let (tx, rx) = mpsc::channel();
-        let view = OwnedView::from(v);
+        let view = v.clone();
         // Fallible spawn: if the OS can't give us a thread, stay in plain mode
         // rather than panicking.
         match std::thread::Builder::new()
@@ -171,35 +147,6 @@ impl Drop for LivePreview {
         if let Some(a) = self.active.get_mut().ok().and_then(Option::take) {
             let _ = a.tx.send(Cmd::Stop);
             let _ = a.handle.join();
-        }
-    }
-}
-
-/// The subset of [`AttemptView`] the render thread needs, owned so it can move
-/// across the thread boundary. Elapsed time is measured monotonically from the
-/// thread's own start rather than the view's wall-clock stamp.
-struct OwnedView {
-    progress: Vec<hex_runtime::NodeProgress>,
-    node_id: String,
-    kind: NodeKind,
-    worker: Option<String>,
-    attempt_number: u32,
-    deadline_ms: Option<u64>,
-    stdout_log: PathBuf,
-    stderr_log: PathBuf,
-}
-
-impl From<&AttemptView> for OwnedView {
-    fn from(v: &AttemptView) -> Self {
-        Self {
-            progress: v.progress.clone(),
-            node_id: v.node_id.clone(),
-            kind: v.kind,
-            worker: v.worker.clone(),
-            attempt_number: v.attempt_number,
-            deadline_ms: v.deadline_ms,
-            stdout_log: v.stdout_log.clone(),
-            stderr_log: v.stderr_log.clone(),
         }
     }
 }
@@ -236,7 +183,7 @@ impl Drop for TermGuard {
 /// Tail the logs and repaint until told to stop. If the inline terminal can't
 /// be set up, fall back to printing forwarded lines plainly so no event line is
 /// ever dropped.
-fn render_loop(view: &OwnedView, rx: &Receiver<Cmd>) {
+fn render_loop(view: &AttemptView, rx: &Receiver<Cmd>) {
     let height = u16::try_from(TAIL_LINES).unwrap_or(8) + 2; // + top/bottom border
     let backend = CrosstermBackend::new(std::io::stderr());
     let term = Terminal::with_options(
@@ -255,13 +202,8 @@ fn render_loop(view: &OwnedView, rx: &Receiver<Cmd>) {
         width: 80,
     };
 
-    let mut tail = Tail::new(
-        vec![
-            (view.stdout_log.clone(), false),
-            (view.stderr_log.clone(), true),
-        ],
-        TAIL_LINES,
-    );
+    let mut tail = Tail::new(TAIL_LINES);
+    let mut cursor = StreamCursor::default();
     let start = Instant::now();
     let mut ticks = 0usize;
 
@@ -281,7 +223,11 @@ fn render_loop(view: &OwnedView, rx: &Receiver<Cmd>) {
             Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
-        tail.poll();
+        // ponytail: reads the whole delta since the last tick; a writer
+        // flooding faster than the 100ms tick grows one transient buffer.
+        for chunk in view.streams.read(&mut cursor).unwrap_or_default() {
+            tail.push(&chunk.label, &chunk.text);
+        }
         ticks = ticks.wrapping_add(1);
         let elapsed = start.elapsed();
         // Capture the viewport origin *inside* the closure: `Frame::area()` is
@@ -315,7 +261,7 @@ fn drain_plain(rx: &Receiver<Cmd>) {
 /// lines inside (stderr dimmed), clipped to the pane height.
 fn render_footer(
     frame: &mut Frame,
-    view: &OwnedView,
+    view: &AttemptView,
     tail: &Tail,
     elapsed: Duration,
     ticks: usize,
@@ -342,7 +288,7 @@ fn render_footer(
 }
 
 /// The one-line status: `node · worker · attempt N · ⣟ M:SS · M:SS left`.
-fn status_line(view: &OwnedView, elapsed: Duration, ticks: usize) -> String {
+fn status_line(view: &AttemptView, elapsed: Duration, ticks: usize) -> String {
     let spin = SPINNER[ticks % SPINNER.len()];
     // Agent nodes show their worker; a gate/command shows its kind, not "gate".
     let actor = view.worker.as_deref().unwrap_or_else(|| view.kind.as_str());
@@ -375,7 +321,7 @@ fn status_line(view: &OwnedView, elapsed: Duration, ticks: usize) -> String {
 /// succeeded (the strip above is drawn while a failing gate loops), so the only
 /// hierarchy here is weight — bold for where the run is, dim for where it has
 /// not been.
-fn progress_line(view: &OwnedView, width: u16) -> Line<'static> {
+fn progress_line(view: &AttemptView, width: u16) -> Line<'static> {
     use hex_runtime::NodeState;
     let cells: Vec<(String, Style)> = view
         .progress
@@ -454,93 +400,59 @@ fn fmt_mmss(d: Duration) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
-/// A rolling tail of a run's log files. It keeps the last `cap` *complete* lines
-/// in a ring and, per source, the current unterminated line (`pending`) which is
+/// A rolling tail of an attempt's streams. It keeps the last `cap` *complete*
+/// lines in a ring and, per stream, the current unterminated line (`pending`),
 /// shown as a provisional trailing line — so a live token stream is visible
 /// immediately, not withheld until its newline.
 ///
-/// The two files (stdout/stderr) carry no cross-stream ordering metadata, so
-/// interleaving is best-effort: lines within one stream are in exact order, but
-/// across streams they appear in the tail's own poll order (stdout before
-/// stderr within a tick) — unspecified relative to real time. stderr is dimmed
-/// to keep the two distinguishable. Each attempt's logs are created once at
-/// spawn and only appended, so a source only grows.
+/// The streams carry no cross-stream ordering metadata, so interleaving is
+/// best-effort: lines within one stream are in exact order, across streams they
+/// appear in read order. stderr is dimmed to keep the two distinguishable.
 struct Tail {
-    sources: Vec<Source>,
     ring: VecDeque<(String, bool)>, // (line, is_stderr)
+    /// Per stream label, its unterminated line, in first-seen order.
+    pending: Vec<(String, String)>,
     cap: usize,
 }
 
-struct Source {
-    path: PathBuf,
-    is_err: bool,
-    offset: u64,
-    pending: Vec<u8>,
-}
-
 impl Tail {
-    fn new(paths: Vec<(PathBuf, bool)>, cap: usize) -> Self {
-        let sources = paths
-            .into_iter()
-            .map(|(path, is_err)| Source {
-                path,
-                is_err,
-                offset: 0,
-                pending: Vec::new(),
-            })
-            .collect();
+    fn new(cap: usize) -> Self {
         Self {
-            sources,
             ring: VecDeque::new(),
+            pending: Vec::new(),
             cap,
         }
     }
 
-    /// Read bytes appended since the last poll, push newly *completed* lines onto
-    /// the ring, and keep the trailing partial in `pending`. Byte-based so a
-    /// multi-byte char split across two reads never panics.
-    fn poll(&mut self) {
-        for src in &mut self.sources {
-            let Ok(mut f) = File::open(&src.path) else {
-                continue;
-            };
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            if len <= src.offset {
-                continue;
+    /// Append one chunk of the stream `label`: push newly *completed* lines onto
+    /// the ring and keep the trailing partial in `pending`.
+    fn push(&mut self, label: &str, text: &str) {
+        let is_err = is_stderr(label);
+        let i = self
+            .pending
+            .iter()
+            .position(|(l, _)| l == label)
+            .unwrap_or_else(|| {
+                self.pending.push((label.to_owned(), String::new()));
+                self.pending.len() - 1
+            });
+        let pending = &mut self.pending[i].1;
+        pending.push_str(text);
+        while let Some(nl) = pending.find('\n') {
+            let line: String = pending.drain(..=nl).collect();
+            let line = line.trim_end_matches(['\n', '\r']).to_owned();
+            self.ring.push_back((cap_line(line), is_err));
+            while self.ring.len() > self.cap {
+                self.ring.pop_front();
             }
-            // If we've fallen more than a read-window behind, jump to the newest
-            // window: a preview shows the *tail*, so skip stale middle rather
-            // than reading the oldest bytes and lagging further each tick. The
-            // stale partial is dropped (a fresh partial starts after the skip).
-            if len - src.offset > MAX_READ {
-                src.offset = len - MAX_READ;
-                src.pending.clear();
+        }
+        // Bound a newline-less partial: keep only its last MAX_PENDING bytes.
+        if pending.len() > MAX_PENDING {
+            let mut cut = pending.len() - MAX_PENDING;
+            while !pending.is_char_boundary(cut) {
+                cut += 1;
             }
-            if f.seek(SeekFrom::Start(src.offset)).is_err() {
-                continue;
-            }
-            let want = len - src.offset; // now <= MAX_READ
-            let mut buf = Vec::new();
-            if f.take(want).read_to_end(&mut buf).is_err() {
-                continue;
-            }
-            src.offset += u64::try_from(buf.len()).unwrap_or(0);
-            src.pending.extend_from_slice(&buf);
-            while let Some(nl) = src.pending.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = src.pending.drain(..=nl).collect();
-                let text = String::from_utf8_lossy(&line)
-                    .trim_end_matches(['\n', '\r'])
-                    .to_string();
-                self.ring.push_back((cap_line(text), src.is_err));
-                while self.ring.len() > self.cap {
-                    self.ring.pop_front();
-                }
-            }
-            // Bound a newline-less partial: keep only its last MAX_PENDING bytes.
-            if src.pending.len() > MAX_PENDING {
-                let drop = src.pending.len() - MAX_PENDING;
-                src.pending.drain(..drop);
-            }
+            pending.drain(..cut);
         }
     }
 
@@ -551,22 +463,23 @@ impl Tail {
         self.ring.iter().map(|(t, e)| (t.as_str(), *e))
     }
 
-    /// The lines to render: the ring plus each source's in-progress partial
+    /// The lines to render: the ring plus each stream's in-progress partial
     /// line, so streaming output is visible before its newline arrives.
     fn display(&self) -> Vec<(String, bool)> {
         let mut out: Vec<(String, bool)> = self.ring.iter().map(|(t, e)| (t.clone(), *e)).collect();
-        for src in &self.sources {
-            if !src.pending.is_empty() {
-                let text = String::from_utf8_lossy(&src.pending)
-                    .trim_end_matches(['\n', '\r'])
-                    .to_string();
-                if !text.is_empty() {
-                    out.push((cap_line(text), src.is_err));
-                }
+        for (label, pending) in &self.pending {
+            let text = pending.trim_end_matches('\r');
+            if !text.is_empty() {
+                out.push((cap_line(text.to_owned()), is_stderr(label)));
             }
         }
         out
     }
+}
+
+/// Whether a stream label (`stderr`, `3-test/stderr`) names a stderr stream.
+fn is_stderr(label: &str) -> bool {
+    label.ends_with("stderr")
 }
 
 /// Truncate a line to [`MAX_LINE`] bytes (at a char boundary) with a `…` marker,
@@ -588,18 +501,19 @@ fn cap_line(mut s: String) -> String {
 mod tests {
 
     use super::*;
-    use crate::test_support::unique;
+    use hex_runtime::NodeKind;
 
-    fn view(worker: Option<&str>, kind: NodeKind, deadline_ms: Option<u64>) -> OwnedView {
-        OwnedView {
+    fn view(worker: Option<&str>, kind: NodeKind, deadline_ms: Option<u64>) -> AttemptView {
+        AttemptView {
             progress: Vec::new(),
             node_id: "build".to_owned(),
             kind,
+            attempt_id: "att_1".to_owned(),
             worker: worker.map(str::to_owned),
             attempt_number: 2,
             deadline_ms,
-            stdout_log: PathBuf::new(),
-            stderr_log: PathBuf::new(),
+            started_at_ms: 0,
+            streams: hex_runtime::AttemptStreams::default(),
         }
     }
 
@@ -611,7 +525,7 @@ mod tests {
         assert_eq!(fmt_mmss(Duration::from_secs(3600)), "60:00");
     }
 
-    fn progress(nodes: &[(&str, hex_runtime::NodeState, u32)]) -> OwnedView {
+    fn progress(nodes: &[(&str, hex_runtime::NodeState, u32)]) -> AttemptView {
         let mut v = view(Some("codex"), NodeKind::Agent, None);
         v.progress = nodes
             .iter()
@@ -703,37 +617,13 @@ mod tests {
         assert!(!c.contains("left"), "no countdown without a deadline: {c}");
     }
 
-    /// Append `bytes` to `path`, like an agent's stdout growing.
-    fn append(path: &std::path::Path, bytes: &[u8]) {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .unwrap();
-        f.write_all(bytes).unwrap();
-    }
-
-    fn tmp(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hex-tail-{tag}-{}-{}",
-            std::process::id(),
-            unique()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("log")
-    }
-
     #[test]
     fn tail_ring_holds_complete_lines_across_both_streams() {
-        let out = tmp("merge-out");
-        let err = tmp("merge-err");
-        let mut tail = Tail::new(vec![(out.clone(), false), (err.clone(), true)], 8);
-
-        append(&out, b"reading\nediting\n");
-        append(&err, b"warning: slow\n");
+        let mut tail = Tail::new(8);
+        tail.push("stdout", "reading\nediting\n");
+        tail.push("stderr", "warning: slow\n");
         // A partial line (no newline) is NOT a complete ring line yet.
-        append(&out, b"compil");
-        tail.poll();
+        tail.push("stdout", "compil");
         let ring: Vec<_> = tail.lines().collect();
         assert_eq!(
             ring,
@@ -745,28 +635,23 @@ mod tests {
         );
 
         // Completing the partial moves it into the ring.
-        append(&out, b"ing\n");
-        tail.poll();
+        tail.push("stdout", "ing\n");
         assert_eq!(tail.lines().last(), Some(("compiling", false)));
     }
 
     #[test]
     fn tail_display_shows_the_in_progress_partial_line() {
-        let out = tmp("partial");
-        let mut tail = Tail::new(vec![(out.clone(), false)], 8);
+        let mut tail = Tail::new(8);
         // A live token stream with no newline yet must still be visible.
-        append(&out, b"thinking");
-        tail.poll();
+        tail.push("stdout", "thinking");
         assert_eq!(tail.lines().count(), 0, "no complete line in the ring");
         assert_eq!(tail.display(), vec![("thinking".to_owned(), false)]);
     }
 
     #[test]
     fn tail_bounds_a_newlineless_flood() {
-        let out = tmp("flood");
-        let mut tail = Tail::new(vec![(out.clone(), false)], 8);
-        append(&out, &vec![b'x'; 20_000]); // 20 KiB, no newline
-        tail.poll();
+        let mut tail = Tail::new(8);
+        tail.push("stdout", &"x".repeat(20_000)); // 20 KiB, no newline
         let partial = &tail.display()[0].0;
         assert!(
             partial.len() <= MAX_PENDING,
@@ -777,13 +662,9 @@ mod tests {
 
     #[test]
     fn tail_caps_an_enormous_complete_line() {
-        let out = tmp("bigline");
-        let mut tail = Tail::new(vec![(out.clone(), false)], 8);
+        let mut tail = Tail::new(8);
         // A newline-terminated 50 KiB line must not be retained whole.
-        let mut big = vec![b'x'; 50_000];
-        big.push(b'\n');
-        append(&out, &big);
-        tail.poll();
+        tail.push("stdout", &format!("{}\n", "x".repeat(50_000)));
         let (text, _) = tail.lines().last().unwrap();
         assert!(
             text.len() <= MAX_LINE + '…'.len_utf8(),
@@ -794,41 +675,19 @@ mod tests {
     }
 
     #[test]
-    fn tail_jumps_to_the_newest_window_when_more_than_a_read_behind() {
-        let out = tmp("behind");
-        let mut tail = Tail::new(vec![(out.clone(), false)], 8);
-        // A backlog larger than MAX_READ, ending in a sentinel line. One poll
-        // must reach the newest output rather than reading a stale oldest chunk.
-        let mut flood = vec![b'x'; MAX_READ as usize + 50_000];
-        flood.extend_from_slice(b"\nSENTINEL\n");
-        append(&out, &flood);
-        tail.poll();
-        assert!(
-            tail.lines().any(|(t, _)| t == "SENTINEL"),
-            "the newest line is visible after a single poll",
-        );
-    }
-
-    #[test]
     fn tail_keeps_only_the_last_cap_lines() {
-        let out = tmp("cap");
-        let mut tail = Tail::new(vec![(out.clone(), false)], 2);
-        append(&out, b"a\nb\nc\nd\n");
-        tail.poll();
+        let mut tail = Tail::new(2);
+        tail.push("stdout", "a\nb\nc\nd\n");
         let seen: Vec<_> = tail.lines().collect();
         assert_eq!(seen, vec![("c", false), ("d", false)]);
     }
 
+    /// A `command` node's step streams are labelled by step; stderr is still
+    /// told apart by its name.
     #[test]
-    fn tail_survives_a_multibyte_char_split_across_reads() {
-        let out = tmp("utf8");
-        let mut tail = Tail::new(vec![(out.clone(), false)], 8);
-        // 'é' is 0xC3 0xA9; deliver the two bytes in separate polls.
-        append(&out, &[0xC3]);
-        tail.poll();
-        assert_eq!(tail.lines().count(), 0, "no complete line yet");
-        append(&out, &[0xA9, b'\n']);
-        tail.poll();
-        assert_eq!(tail.lines().last(), Some(("é", false)));
+    fn tail_dims_a_step_s_stderr() {
+        let mut tail = Tail::new(8);
+        tail.push("1-test/stderr", "boom\n");
+        assert_eq!(tail.lines().last(), Some(("boom", true)));
     }
 }

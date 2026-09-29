@@ -199,8 +199,11 @@ impl WorkOutcome {
 
 /// The common contract every worker adapter implements.
 pub trait Worker {
-    /// The capability manifest this worker advertises to the graph validator.
-    fn capabilities(&self) -> CapabilityManifest;
+    /// The capabilities this worker advertises to the graph validator. A fresh
+    /// session per attempt is the baseline and needs none.
+    fn capabilities(&self) -> &'static [Capability] {
+        &[]
+    }
 
     /// The executable this worker spawns, for preflight (`hex doctor`) — so a
     /// missing or unauthenticated agent CLI is reported *before* a run is
@@ -224,7 +227,7 @@ pub trait Worker {
     /// nothing — see `check_workers`. The kernel cannot make this check, because
     /// only the runtime may see a worker.
     fn captures_result(&self) -> bool {
-        false
+        true
     }
 
     /// Run one attempt to completion and report the outcome. Effectful (this
@@ -237,27 +240,23 @@ pub trait Worker {
 /// and parses it back; a node's graph never spells it.
 pub const VERDICT_PREFIX: &str = "VERDICT:";
 
-/// The set of [`Capability`] entries one worker advertises. The graph
-/// validator rejects a graph whose nodes demand capabilities the assigned
-/// worker does not declare.
-#[derive(Debug, Clone, Default)]
-pub struct CapabilityManifest {
-    /// Capabilities this worker supports.
-    pub capabilities: Vec<Capability>,
-}
-
-impl CapabilityManifest {
-    /// Build a manifest from a list of capabilities.
-    #[must_use]
-    pub fn from(capabilities: &[Capability]) -> Self {
-        Self {
-            capabilities: capabilities.to_vec(),
-        }
-    }
-
-    /// Whether the manifest declares `capability`.
-    #[must_use]
-    pub fn supports(&self, capability: Capability) -> bool {
-        self.capabilities.contains(&capability)
+/// A [`WorkRequest`] for tests: node `node`, prompt `hello`, every directory
+/// `dir`, no deadline.
+#[cfg(test)]
+fn test_request(dir: &std::path::Path, node: &str) -> WorkRequest {
+    WorkRequest {
+        run_id: "run_0".to_owned(),
+        node_id: node.to_owned(),
+        attempt_id: "att_1".to_owned(),
+        prompt: "hello".to_owned(),
+        workdir: dir.to_path_buf(),
+        attempt_dir: dir.to_path_buf(),
+        deadline_ms: None,
+        read_only: false,
+        extra_writable_dir: None,
+        resume_session: None,
+        graph: "t".to_owned(),
+        project_root: dir.to_path_buf(),
+        worktree_branch: None,
     }
 }

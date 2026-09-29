@@ -2,13 +2,12 @@
 
 **A thin, deterministic control plane for agentic loops and graphs.**
 
-* `hex` runs a graph of nodes, each of which is either an agent, a command or desition point.
-* Each graph -- is a single YAML file, with a single entry node and a single terminal node.
-* Human and agent -native format, can be used from a shell or from a driving agent.
-* Call Claude Code, Codex, Pi, opencode workers, records every step and steer. 
+* `hex` runs a graph of nodes. A node is one of four kinds: `agent`, `command`, `human` or `terminal`.
+* A graph is one YAML file with one entry node and at least one reachable `terminal: succeeded`. A graph may have several terminals.
+* Humans and agents drive it the same way, from a shell or from a driving agent.
+* It calls Claude Code, Codex, Pi and opencode as workers, and journals every step and steer.
 
 ```sh
-brew install hex-cli  # (TODO)
 hex run critique-loop -p "Investigate problem with blocked google auth, fix bug and the flaky auth test"
 ```
 
@@ -33,7 +32,7 @@ version: 1
 name: implement-until-green
 
 defaults:
-  worker: codex
+  role: implementer
   budget: { elapsed: 30m, attempt: 10m }
 
 entry: implement
@@ -72,14 +71,14 @@ so a downstream prompt can reference `{{clarify.result}}` like an agent's.
 
 ## How it works
 
-The kernel is three pure functions -- `reduce(state, event, graph)`,
-`schedule(graph, state) -> Decision`, `accept(graph, state)`. `schedule`
-returns **effect intents** (`StartAttempt`, `RunCommand`, `RequestHuman`,
+The kernel is two pure functions: `reduce(graph, state, event)` and
+`schedule(graph, state, now_ms) -> Vec<Effect>`. `schedule` checks acceptance
+and returns **effect intents** (`StartAttempt`, `RunCommand`, `RequestHuman`,
 `RecordTerminal`) and never performs them. The runtime replays the journal,
 asks `schedule` what to do, writes the intent *before* acting, executes it,
 appends the result, and loops. Routing spends no tokens; `replay(journal)`
 always reproduces the projection. Crates depend strictly inward
-(`proto ← kernel ← runtime ← cli`); the full table and the non-negotiable
+(`proto ← kernel, worker ← runtime ← cli`); the full table and the non-negotiable
 rules are in [`AGENTS.md`](AGENTS.md).
 
 **Four node kinds:** `agent` · `command` · `human` · `terminal`. Roles
@@ -123,7 +122,7 @@ Layered config, deep-merged per key, project wins: built-in
 through the same loader) → `~/.config/hex/config.yaml` → `.hex/config.yaml`.
 
 ```yaml
-# Workers are CLI adapters -- internal plumbing. A graph never names one.
+# Workers are CLI adapters -- internal plumbing. A graph names a role.
 workers:
   codex:  { kind: codex }       # kinds: codex | claude | pi | opencode | command
   claude: { kind: claude }
@@ -187,7 +186,7 @@ path.
 
 `hex run <graph> --worktree [<base>]` runs the whole run in a fresh git
 worktree on branch `hex/<run-id>`, so agents work without touching your main
-copy; `--no-worktree` (default) uses the project root. Worktrees are a
+copy; without it (the default) a run uses the project root. Worktrees are a
 reusable pool under `.hex/worktrees/` so built deps stay warm;
 `--worktree-init "<argv>"` primes a fresh slot. **No auto-merge** -- hex asks
 the agent to commit and leaves the branch for you to integrate.
@@ -275,7 +274,7 @@ Every verb takes `--json` where a machine form exists.
 hex init                 scaffold `.hex/` + a starter config in this repo
 hex list                 list runnable graphs (project > user > built-in)
 hex doctor               are the configured workers and checks usable?
-hex validate <graph>     schema, references, bounded cycles, a reachable success
+hex validate <graph>     schema, references, a reachable success
 hex graph <graph>        render a graph [--format text|source]
 hex run [<graph>]        start a NEW run and block until it ends [--worktree]
                          [--name] [--no-preview]
@@ -306,24 +305,11 @@ project root and worktree branch when it runs inside an attempt.
 
 ## Status
 
-Phase 1 works and is dogfooded on this repo. The critique loop runs end-to-end
-on real agent CLIs, records to a JSONL journal, enforces run and per-attempt
-budgets, resumes a killed run, and reports why it stopped, what it produced and
-what it cost.
-
-- Operability: `checks:`, `hex doctor` + start-time preflight, disposition exit
-  codes, terminal reasons in the journal.
-- Roles & gating: layered config, multi-step `command` nodes, per-node visit
-  budgets, `accept.on_unmet` rerouting, undeclared checks refused at compile time.
-- Control: file inbox (`pause`/`cancel`/`steer`/`respond`), `human` nodes,
-  Ctrl-C pause, `hex runs`/`wait`, live preview.
-- Spend: usage journaled per attempt in micro-USD, per-token-category table,
-  honest lower bounds, `budget.output_tokens`.
-- Simplification, 2026-09-13
-  ([design](docs/design/2026-09-13-simplification.md)): `hex emit` replaced by
-  the `VERDICT:` line; `--detach`, `hex dash`, `hex watch`, the diagram exports,
-  the `hex-mcp`/`hex-dashboard` stubs and four never-run presets deleted;
-  `hex stats`, `hex prune` and stall detection added.
+Phase 1 works and is dogfooded on this repo: the critique loop runs end-to-end
+on real agent CLIs, journals every step, enforces budgets, resumes a killed
+run, and reports why it stopped and what it cost. The
+[simplification design](docs/design/2026-09-13-simplification.md) records what
+was deleted and why. [`TODO.md`](TODO.md) is the forward list.
 
 **Known broken.** An unexplained fs4/flock flake: a just-released lock still
 reads as busy, on both worktree-slot and run locks. Its user-visible symptom

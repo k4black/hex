@@ -8,9 +8,9 @@
 //!
 //! The validator does **not** consume this: with every non-terminal node
 //! visit-bounded by the loader there is no cycle analysis left to run, and a
-//! rendering classifier could not express one anyway. Both this module and the
-//! validator walk the same single source, [`Graph::implicit_reroutes`], so they
-//! cannot disagree about which transitions are implicit (gotcha 26).
+//! rendering classifier could not express one anyway. This module and
+//! `schedule` read the same single source, [`Graph::implicit_reroutes`], so they
+//! cannot disagree about which transitions are implicit (gotcha 21).
 
 use std::collections::BTreeMap;
 
@@ -69,8 +69,6 @@ pub struct Topology {
     /// Node ids in render order: entry first, then by distance from it, with
     /// terminals last within their rank and authored order breaking ties.
     pub order: Vec<String>,
-    /// Distance from the entry along forward transitions.
-    pub rank: BTreeMap<String, u32>,
     /// Every transition, classified.
     pub transitions: Vec<Transition>,
     /// Nodes the entry cannot reach. Validation rejects these
@@ -133,7 +131,6 @@ impl Topology {
 
         Self {
             order,
-            rank,
             transitions: walk.transitions,
             unreachable,
             cycles,

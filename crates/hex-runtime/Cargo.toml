@@ -25,12 +25,7 @@ which = { workspace = true }
 jiff = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
 tempfile = { workspace = true }
-
-[[bench]]
-name = "scheduler"
-harness = false
 
 [lints]
 workspace = true

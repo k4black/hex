@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use hex_proto::{Capability, ModelUsage};
 
-use crate::{AttemptReport, CapabilityManifest, WorkOutcome, WorkRequest, Worker};
+use crate::{AttemptReport, WorkOutcome, WorkRequest, Worker};
 
 /// The env var (and `{result}` argv token) naming the file a worker writes its
 /// final message to, for capture into `{{node.result}}`.
@@ -65,9 +65,7 @@ const MAX_PARTIAL_BYTES: u64 = 8 * 1024;
 /// What an adapter that can honour `context: continue` and report its spend
 /// declares. Everything else (a fresh session per attempt) is the baseline and
 /// needs no capability.
-fn resumable() -> CapabilityManifest {
-    CapabilityManifest::from(&[Capability::SessionResume, Capability::CostReporting])
-}
+const RESUMABLE: &[Capability] = &[Capability::SessionResume, Capability::CostReporting];
 
 /// Where an adapter's session id and usage come from. Deliberately separate from
 /// [`ResultCapture`]: a `CommandWorker` may well capture its result from a file
@@ -172,11 +170,8 @@ impl Worker for CodexWorker {
     fn auth_probe(&self) -> Option<Vec<String>> {
         Some(strs(&["codex", "login", "status"]))
     }
-    fn captures_result(&self) -> bool {
-        true
-    }
-    fn capabilities(&self) -> CapabilityManifest {
-        resumable()
+    fn capabilities(&self) -> &'static [Capability] {
+        RESUMABLE
     }
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         run_agent(
@@ -282,11 +277,8 @@ impl Worker for ClaudeWorker {
     fn auth_probe(&self) -> Option<Vec<String>> {
         Some(strs(&["claude", "auth", "status"]))
     }
-    fn captures_result(&self) -> bool {
-        true
-    }
-    fn capabilities(&self) -> CapabilityManifest {
-        resumable()
+    fn capabilities(&self) -> &'static [Capability] {
+        RESUMABLE
     }
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         run_agent(
@@ -335,12 +327,6 @@ impl Worker for OpencodeWorker {
         // Local credential listing only — opencode has no per-provider check.
         Some(strs(&["opencode", "auth", "list"]))
     }
-    fn captures_result(&self) -> bool {
-        true
-    }
-    fn capabilities(&self) -> CapabilityManifest {
-        CapabilityManifest::default()
-    }
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         run_agent(
             "opencode",
@@ -374,12 +360,9 @@ impl PiWorker {
     /// state so that `context: continue` works across attempts and resumes.
     /// `resume` adds `--continue` to pick up the existing session in that dir.
     #[must_use]
-    pub fn command(&self, session_dir: Option<&Path>, resume: bool) -> Vec<String> {
-        let mut argv = strs(&["pi", "-p", "{prompt}", "--mode", "json"]);
-        if let Some(dir) = session_dir {
-            argv.push("--session-dir".to_owned());
-            argv.push(dir.to_string_lossy().into_owned());
-        }
+    pub fn command(&self, session_dir: &Path, resume: bool) -> Vec<String> {
+        let mut argv = strs(&["pi", "-p", "{prompt}", "--mode", "json", "--session-dir"]);
+        argv.push(session_dir.to_string_lossy().into_owned());
         if resume {
             argv.push("--continue".to_owned());
         }
@@ -396,16 +379,13 @@ impl Worker for PiWorker {
     fn auth_probe(&self) -> Option<Vec<String>> {
         // Per model on purpose: `pi auth check --model openrouter/x/y` verifies
         // the provider the configured model resolves to, so it also catches the
-        // bare-model ambiguity trap (gotcha 48) — it prints `not_ready`. With no
+        // bare-model ambiguity trap (gotcha 8) — it prints `not_ready`. With no
         // model configured there is no provider to name, so nothing to probe.
         let model = self.model.as_deref()?;
         Some(strs(&["pi", "auth", "check", "--model", model]))
     }
-    fn captures_result(&self) -> bool {
-        true
-    }
-    fn capabilities(&self) -> CapabilityManifest {
-        resumable()
+    fn capabilities(&self) -> &'static [Capability] {
+        RESUMABLE
     }
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         let session_dir = request
@@ -417,7 +397,7 @@ impl Worker for PiWorker {
             .join(&request.node_id);
         run_agent(
             "pi",
-            &self.command(Some(&session_dir), request.resume_session.is_some()),
+            &self.command(&session_dir, request.resume_session.is_some()),
             Some(ResultCapture::PiJsonl),
             Some(UsageSource::PiJsonl),
             self.model.as_deref(),
@@ -434,8 +414,6 @@ pub struct CommandWorker {
     pub name: String,
     /// Argv template, executed directly — never a shell string.
     pub command: Vec<String>,
-    /// Advertised capabilities.
-    pub capabilities: CapabilityManifest,
     /// How to capture the worker's final message, if at all.
     pub result_capture: Option<ResultCapture>,
 }
@@ -446,7 +424,6 @@ impl CommandWorker {
         Self {
             name: name.into(),
             command,
-            capabilities: CapabilityManifest::default(),
             result_capture: None,
         }
     }
@@ -468,9 +445,6 @@ impl Worker for CommandWorker {
     /// to it could never produce a verdict.
     fn captures_result(&self) -> bool {
         self.result_capture.is_some()
-    }
-    fn capabilities(&self) -> CapabilityManifest {
-        self.capabilities.clone()
     }
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         run_agent(
@@ -547,7 +521,7 @@ fn run_agent(
             request.worktree_branch.as_deref().unwrap_or(""),
         )
         // The program actually spawned, so `hex feedback` records the real agent
-        // (matches `AttemptReported.agent`, gotcha 39).
+        // (matches `AttemptReported.agent`, gotcha 38).
         .env("HEX_AGENT", &command[0])
         .env(RESULT_FILE_ENV, &result_file)
         .stdin(if uses_placeholder {
@@ -632,13 +606,9 @@ fn run_agent(
     // allowed outcomes — and therefore whether a missing verdict is an error
     // (multi-outcome) or implicit completion (single-outcome) — so it receives
     // the **uncapped** final message and decides. See `WorkOutcome`.
-    WorkOutcome {
-        result,
-        error: None,
-        timed_out: false,
-        interrupted: false,
-        report: report.filter(|r| !r.is_empty()),
-    }
+    WorkOutcome::default()
+        .with_result(result)
+        .with_report(report)
 }
 
 /// `.result` from a claude result object, failing closed on `.is_error`.
@@ -692,30 +662,13 @@ fn read_report(source: UsageSource, attempt_dir: &Path, model_hint: Option<&str>
 /// Line-by-line rather than whole-file, because a killed attempt leaves a
 /// half-written final line and the earlier lines are still perfectly good facts.
 fn codex_report(path: &Path, model_hint: Option<&str>) -> AttemptReport {
-    let Ok(file) = File::open(path) else {
-        return AttemptReport::default();
-    };
     let mut report = AttemptReport::default();
     let mut usage = ModelUsage {
         model: model_hint.unwrap_or("codex").to_owned(),
         ..ModelUsage::default()
     };
     let mut saw_usage = false;
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = Vec::new();
-    let cap = usize::try_from(MAX_STREAM_BYTES).unwrap_or(usize::MAX);
-    loop {
-        line.clear();
-        match read_line_bounded(&mut reader, &mut line, cap) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let Ok(text) = std::str::from_utf8(&line) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
-            continue; // a torn tail line, or prose on a non-`--json` run
-        };
+    for v in jsonl(path, MAX_STREAM_BYTES).filter_map(Result::ok) {
         match v.get("type").and_then(serde_json::Value::as_str) {
             Some("thread.started") => {
                 report.session_id = v
@@ -808,12 +761,6 @@ fn claude_report(path: &Path) -> AttemptReport {
 /// name from the last one. Line-by-line so a killed attempt's torn tail does
 /// not lose the facts already written.
 fn pi_report(path: &Path, model_hint: Option<&str>) -> AttemptReport {
-    let Ok(file) = File::open(path) else {
-        return AttemptReport::default();
-    };
-    let cap = usize::try_from(MAX_STREAM_BYTES).unwrap_or(usize::MAX);
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = Vec::new();
     let mut usage = ModelUsage {
         model: model_hint.unwrap_or("pi").to_owned(),
         ..ModelUsage::default()
@@ -821,18 +768,7 @@ fn pi_report(path: &Path, model_hint: Option<&str>) -> AttemptReport {
     let mut saw_usage = false;
     let mut total_cost: f64 = 0.0;
     let mut model_name: Option<String> = None;
-    loop {
-        line.clear();
-        match read_line_bounded(&mut reader, &mut line, cap) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let Ok(text) = std::str::from_utf8(&line) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
-            continue;
-        };
+    for v in jsonl(path, MAX_STREAM_BYTES).filter_map(Result::ok) {
         if v.get("type").and_then(serde_json::Value::as_str) != Some("message_end") {
             continue;
         }
@@ -891,28 +827,10 @@ fn pi_report(path: &Path, model_hint: Option<&str>) -> AttemptReport {
 /// `content` items of `type == "text"`. Falls back to `message_update`
 /// `textEnd` content if no full `messageEnd` is found (truncated stream).
 fn pi_result(path: &Path, max: u64) -> Result<Option<String>, String> {
-    let file = File::open(path).map_err(|e| format!("cannot read agent output: {e}"))?;
-    let mut reader = std::io::BufReader::new(file);
-    let cap = usize::try_from(max).unwrap_or(usize::MAX);
-    let mut line = Vec::new();
     let mut last_text: Option<String> = None;
     let mut fallback_text: Option<String> = None;
-    loop {
-        line.clear();
-        let n = read_line_bounded(&mut reader, &mut line, cap)
-            .map_err(|e| format!("cannot read agent output: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        if line.len() >= cap && !line.ends_with(b"\n") {
-            return Err(format!("agent output line exceeds {max} bytes"));
-        }
-        let Ok(text) = std::str::from_utf8(&line) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
-            continue;
-        };
+    for v in jsonl(path, max) {
+        let v = v?;
         // Fallback: text_end in a message_update carries the full text.
         if let Some(event) = v.get("assistantMessageEvent")
             && event.get("type").and_then(serde_json::Value::as_str) == Some("text_end")
@@ -1068,10 +986,8 @@ fn read_capped(path: &Path, max: u64) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// The `part.text` of a single JSONL line if it is a `type == "text"` event.
-/// Non-JSON / non-text lines yield `None` and are skipped by the caller.
-fn text_part(line: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+/// The `part.text` of a JSONL event if it is a `type == "text"` event.
+fn text_part(v: &serde_json::Value) -> Option<String> {
     if v.get("type").and_then(serde_json::Value::as_str) != Some("text") {
         return None;
     }
@@ -1086,43 +1002,56 @@ fn text_part(line: &str) -> Option<String> {
 /// bounded to one line plus the retained text; a single line exceeding `max`
 /// bytes fails closed rather than silently returning a stale earlier text.
 fn last_jsonl_text_file(path: &Path, max: u64) -> Result<Option<String>, String> {
-    let file = File::open(path).map_err(|e| format!("cannot read agent output: {e}"))?;
-    let mut reader = std::io::BufReader::new(file);
-    let cap = usize::try_from(max).unwrap_or(usize::MAX);
     let mut last = None;
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        let n = read_line_bounded(&mut reader, &mut line, cap)
-            .map_err(|e| format!("cannot read agent output: {e}"))?;
-        if n == 0 {
-            break; // EOF
-        }
-        // Filled the cap without a terminating newline → the line is over-long.
-        if line.len() >= cap && !line.ends_with(b"\n") {
-            return Err(format!("agent output line exceeds {max} bytes"));
-        }
-        // A line that isn't valid UTF-8 is not our JSON event — skip it.
-        let Ok(text) = std::str::from_utf8(&line) else {
-            continue;
-        };
-        if let Some(t) = text_part(text) {
+    for v in jsonl(path, max) {
+        if let Some(t) = text_part(&v?) {
             last = Some(t);
         }
     }
     Ok(last)
 }
 
-/// Append one newline-terminated line (or the trailing unterminated remainder)
-/// from `reader` into `buf`, reading at most `cap` bytes so a single pathological
-/// line can't exhaust memory. Returns bytes read (`0` = EOF).
-fn read_line_bounded<R: std::io::BufRead>(
-    reader: &mut R,
-    buf: &mut Vec<u8>,
-    cap: usize,
-) -> std::io::Result<usize> {
+/// The JSON events of a JSONL file, read line by line with at most `max` bytes
+/// per read so a single pathological line can't exhaust memory. A line that is
+/// not UTF-8 JSON (a killed attempt's torn tail, prose) is skipped. `Err` for an
+/// unopenable file or a read error (both end the stream), and for a line that
+/// fills `max` without a newline (the stream goes on with its remainder). The
+/// usage parsers drop the `Err`s — usage is an observation, not evidence; the
+/// result parsers fail closed on them.
+fn jsonl(path: &Path, max: u64) -> impl Iterator<Item = Result<serde_json::Value, String>> {
     use std::io::{BufRead as _, Read as _};
-    reader.take(cap as u64).read_until(b'\n', buf)
+    let cap = usize::try_from(max).unwrap_or(usize::MAX);
+    let (mut reader, mut failed) = match File::open(path) {
+        Ok(f) => (Some(std::io::BufReader::new(f)), None),
+        Err(e) => (None, Some(format!("cannot read agent output: {e}"))),
+    };
+    let mut line = Vec::new();
+    std::iter::from_fn(move || {
+        loop {
+            let Some(r) = reader.as_mut() else {
+                return failed.take().map(Err);
+            };
+            line.clear();
+            match r.take(max).read_until(b'\n', &mut line) {
+                Ok(0) => reader = None,
+                Err(e) => {
+                    reader = None;
+                    failed = Some(format!("cannot read agent output: {e}"));
+                }
+                Ok(_) if line.len() >= cap && !line.ends_with(b"\n") => {
+                    return Some(Err(format!("agent output line exceeds {max} bytes")));
+                }
+                Ok(_) => {
+                    if let Some(v) = std::str::from_utf8(&line)
+                        .ok()
+                        .and_then(|t| serde_json::from_str(t.trim()).ok())
+                    {
+                        return Some(Ok(v));
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// Build a [`ProcCommand`] for `argv` in `cwd`, capturing stdout/stderr to
@@ -1242,30 +1171,8 @@ pub fn wait_bounded(
 
 #[cfg(test)]
 mod tests {
-
-    /// A per-call unique suffix for temp dirs. PIDs are recycled, so a name keyed
-    /// on the PID alone can collide with a *previous* test run's leftovers and
-    /// read stale files (these tests assert exact log contents).
-    fn unique() -> u64 {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64)
-            .wrapping_add(N.fetch_add(1, Ordering::Relaxed))
-    }
     use super::*;
     use std::path::PathBuf;
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hex-agent-test-{tag}-{}-{}",
-            std::process::id(),
-            unique()
-        ));
-        fs::create_dir_all(&dir).expect("mkdir");
-        dir
-    }
 
     /// Captured from a live CLI run, not hand-written: a parser invented against
     /// a guessed shape passes its tests while disagreeing with the agent. The
@@ -1315,7 +1222,8 @@ mod tests {
     /// facts already written are still facts.
     #[test]
     fn a_torn_jsonl_tail_still_yields_the_earlier_facts() {
-        let dir = temp_dir("torn");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         let whole = fs::read_to_string(fixture("codex-exec-json.jsonl")).expect("fixture");
         let torn = &whole[..whole.len() - 40];
         let path = dir.join("stdout.log");
@@ -1346,14 +1254,15 @@ mod tests {
     /// must read as "nothing reported" rather than as an error.
     #[test]
     fn a_truncated_claude_stream_reports_nothing() {
-        let dir = temp_dir("claude-torn");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         let whole = fs::read_to_string(fixture("claude-stream-json.jsonl")).expect("fixture");
         let torn: String = whole.lines().take(3).collect::<Vec<_>>().join("\n");
         let path = dir.join("stdout.log");
         fs::write(&path, torn).expect("write");
         assert!(claude_report(&path).is_empty());
         assert_eq!(
-            capture_result(Some(ResultCapture::JsonlResult), &dir, &path).expect("no error"),
+            capture_result(Some(ResultCapture::JsonlResult), dir, &path).expect("no error"),
             None
         );
     }
@@ -1392,7 +1301,8 @@ mod tests {
 
     #[test]
     fn usage_from_a_missing_stream_is_silence_not_a_failure() {
-        let dir = temp_dir("no-stream");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         assert!(codex_report(&dir.join("absent.log"), None).is_empty());
         assert!(claude_report(&dir.join("absent.log")).is_empty());
     }
@@ -1400,11 +1310,12 @@ mod tests {
     /// The head of a 1.8 MB reasoning log says nothing; the end is the review.
     #[test]
     fn a_partial_result_keeps_the_tail_and_says_it_is_partial() {
-        let dir = temp_dir("partial");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         let filler = "x".repeat(usize::try_from(MAX_PARTIAL_BYTES).expect("fits") * 2);
         fs::write(dir.join("stderr.log"), format!("{filler}\nTHE VERDICT")).expect("write");
         fs::write(dir.join("stdout.log"), "").expect("write");
-        let partial = partial_from_logs(&dir, "the attempt exceeded its time budget")
+        let partial = partial_from_logs(dir, "the attempt exceeded its time budget")
             .expect("something was written");
         assert!(partial.starts_with("[partial output —"), "{partial}");
         assert!(partial.contains("THE VERDICT"), "kept the tail");
@@ -1420,8 +1331,9 @@ mod tests {
 
     #[test]
     fn nothing_written_yields_no_partial() {
-        let dir = temp_dir("empty-partial");
-        assert!(partial_from_logs(&dir, "whatever").is_none());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        assert!(partial_from_logs(dir, "whatever").is_none());
     }
 
     /// A timeout used to leave the agent's children running: `child.kill()`
@@ -1433,7 +1345,8 @@ mod tests {
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
 
-        let dir = temp_dir("group-kill");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         let pidfile = dir.join("grandchild.pid");
         // The grandchild outlives its parent's foreground work on purpose.
         let argv = vec![
@@ -1441,7 +1354,7 @@ mod tests {
             "-c".to_owned(),
             format!("sleep 30 & echo $! > {}; wait", pidfile.display()),
         ];
-        let mut cmd = logged_command(&argv, &dir, &dir).expect("prepare");
+        let mut cmd = logged_command(&argv, dir, dir).expect("prepare");
         let mut child = cmd.spawn().expect("spawn");
 
         // Let the shell record the grandchild before the deadline fires.
@@ -1479,61 +1392,53 @@ mod tests {
     }
 
     fn request(dir: &std::path::Path) -> WorkRequest {
-        WorkRequest {
-            run_id: "run_0".to_owned(),
-            node_id: "implement".to_owned(),
-            attempt_id: "att_1".to_owned(),
-            prompt: "hello".to_owned(),
-            workdir: dir.to_path_buf(),
-            attempt_dir: dir.to_path_buf(),
-            deadline_ms: None,
-            read_only: false,
-            extra_writable_dir: None,
-            resume_session: None,
-            graph: "t".to_owned(),
-            project_root: dir.to_path_buf(),
-            worktree_branch: None,
-        }
+        crate::test_request(dir, "implement")
     }
 
     /// The worker's job is to hand the runtime the agent's final message; it is
-    /// the runtime that reads a verdict out of it. A `result: text` worker that
-    /// prints its verdict last therefore has that line in the captured result.
+    /// the runtime that reads a verdict out of it. So whichever capture mode a
+    /// worker uses, a message it wrote — verdict line included — is the result.
     #[test]
-    fn a_verdict_printed_last_reaches_the_captured_result() {
-        let dir = temp_dir("verdict-text");
-        let worker = CommandWorker::new(
-            "fake",
-            strs(&["sh", "-c", "echo 'the answer'; echo 'VERDICT: ready'"]),
-        )
-        .with_result_capture(Some(ResultCapture::Text));
-        let outcome = worker.run(&request(&dir));
-        assert_eq!(outcome.error, None);
-        let result = outcome.result.expect("captured stdout tail");
-        assert!(result.contains("VERDICT: ready"), "{result}");
+    fn the_final_message_is_captured_per_mode() {
+        let cases = [
+            (
+                "text: a verdict printed last",
+                ResultCapture::Text,
+                "echo 'the answer'; echo 'VERDICT: ready'",
+                "the answer\nVERDICT: ready",
+            ),
+            (
+                "file: a plain result",
+                ResultCapture::File,
+                "printf 'the plan' > \"$HEX_RESULT_FILE\"",
+                "the plan",
+            ),
+            (
+                "file: a result and a verdict together",
+                ResultCapture::File,
+                "printf 'summary\\nVERDICT: approved' > \"$HEX_RESULT_FILE\"",
+                "summary\nVERDICT: approved",
+            ),
+        ];
+        for (name, mode, script, want) in cases {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let outcome = CommandWorker::new("fake", strs(&["sh", "-c", script]))
+                .with_result_capture(Some(mode))
+                .run(&request(tmp.path()));
+            assert_eq!(outcome.error, None, "{name}");
+            assert_eq!(outcome.result.as_deref(), Some(want), "{name}");
+        }
     }
 
     #[test]
     fn a_clean_exit_with_no_message_reports_no_result() {
-        let dir = temp_dir("silent");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         // A clean exit with no capture is not an error — the runtime decides
         // whether a missing verdict is implicit completion or a failed attempt.
         let worker = CommandWorker::new("fake", strs(&["true"]));
-        let outcome = worker.run(&request(&dir));
+        let outcome = worker.run(&request(dir));
         assert_eq!(outcome.result, None);
-        assert_eq!(outcome.error, None);
-    }
-
-    #[test]
-    fn captures_the_final_result_from_the_result_file() {
-        let dir = temp_dir("result-file");
-        let worker = CommandWorker::new(
-            "fake",
-            strs(&["sh", "-c", "printf 'the plan' > \"$HEX_RESULT_FILE\""]),
-        )
-        .with_result_capture(Some(ResultCapture::File));
-        let outcome = worker.run(&request(&dir));
-        assert_eq!(outcome.result.as_deref(), Some("the plan"));
         assert_eq!(outcome.error, None);
     }
 
@@ -1541,7 +1446,8 @@ mod tests {
     fn injects_graph_agent_and_project_root_into_the_child_env() {
         // `hex feedback` reads these from the environment to record which
         // workflow/agent/project a run was under; they must reach the child.
-        let dir = temp_dir("feedback-env");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         let worker = CommandWorker::new(
             "fake",
             strs(&[
@@ -1551,7 +1457,7 @@ mod tests {
             ]),
         )
         .with_result_capture(Some(ResultCapture::File));
-        let outcome = worker.run(&request(&dir));
+        let outcome = worker.run(&request(dir));
         let got = outcome.result.expect("captured env");
         let parts: Vec<&str> = got.split('|').collect();
         assert_eq!(parts[0], "t", "HEX_GRAPH is the graph name");
@@ -1566,50 +1472,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_result_and_a_verdict_are_captured_together() {
-        let dir = temp_dir("result-signal");
-        let worker = CommandWorker::new(
-            "fake",
-            strs(&[
-                "sh",
-                "-c",
-                "printf 'summary\\nVERDICT: approved' > \"$HEX_RESULT_FILE\"",
-            ]),
-        )
-        .with_result_capture(Some(ResultCapture::File));
-        let outcome = worker.run(&request(&dir));
-        let result = outcome.result.expect("captured");
-        assert!(result.contains("summary"), "{result}");
-        assert!(result.contains("VERDICT: approved"), "{result}");
-    }
-
-    #[test]
-    fn deadline_kills_a_slow_child() {
-        let dir = temp_dir("deadline");
-        let worker = CommandWorker::new("fake", strs(&["sh", "-c", "sleep 30"]));
-        let mut req = request(&dir);
-        req.deadline_ms = Some(100);
-        let start = std::time::Instant::now();
-        let outcome = worker.run(&req);
-        assert!(start.elapsed().as_secs() < 5, "must not wait for the child");
-        assert!(outcome.error.unwrap().contains("time budget"));
-    }
-
     /// The failure this whole path exists for: an attempt that did real work and
     /// then blew its deadline used to be recorded as producing nothing, so a
     /// finished review sat unreachable in a 1.8 MB log.
     #[test]
     fn a_timed_out_attempt_keeps_what_the_agent_already_wrote() {
-        let dir = temp_dir("partial-timeout");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         let worker = CommandWorker::new(
             "fake",
             strs(&["sh", "-c", "echo THE REVIEW IS DONE >&2; sleep 30"]),
         );
-        let mut req = request(&dir);
+        let mut req = request(dir);
         req.deadline_ms = Some(300);
+        let start = Instant::now();
         let outcome = worker.run(&req);
+        assert!(start.elapsed().as_secs() < 5, "must not wait for the child");
         assert!(outcome.timed_out);
+        assert!(
+            outcome.error.expect("failed").contains("time budget"),
+            "the error names the time budget"
+        );
         let result = outcome.result.expect("the partial output is kept");
         assert!(result.contains("THE REVIEW IS DONE"), "{result}");
         assert!(result.starts_with("[partial output —"), "{result}");
@@ -1619,9 +1502,10 @@ mod tests {
     /// was discarded too.
     #[test]
     fn a_nonzero_exit_keeps_what_the_agent_already_wrote() {
-        let dir = temp_dir("partial-crash");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         let worker = CommandWorker::new("fake", strs(&["sh", "-c", "echo PROGRESS; exit 3"]));
-        let outcome = worker.run(&request(&dir));
+        let outcome = worker.run(&request(dir));
         assert!(outcome.error.expect("failed").contains("exit 3"));
         let result = outcome.result.expect("the partial output is kept");
         assert!(result.contains("PROGRESS"), "{result}");
@@ -1695,14 +1579,14 @@ mod tests {
             Box::new(CodexWorker::default()) as Box<dyn Worker>,
             Box::new(ClaudeWorker::default()),
         ] {
-            assert!(w.capabilities().supports(Capability::SessionResume));
-            assert!(w.capabilities().supports(Capability::CostReporting));
+            assert!(w.capabilities().contains(&Capability::SessionResume));
+            assert!(w.capabilities().contains(&Capability::CostReporting));
         }
         for w in [
             Box::new(OpencodeWorker::default()) as Box<dyn Worker>,
             Box::new(CommandWorker::new("x", strs(&["true"]))),
         ] {
-            assert!(!w.capabilities().supports(Capability::SessionResume));
+            assert!(!w.capabilities().contains(&Capability::SessionResume));
         }
     }
 
@@ -1737,58 +1621,31 @@ mod tests {
 
     #[test]
     fn text_part_extracts_only_text_events() {
-        assert_eq!(
-            text_part("{\"type\":\"text\",\"part\":{\"text\":\"hi\"}}").as_deref(),
-            Some("hi")
-        );
-        assert_eq!(text_part("{\"type\":\"tool_use\",\"part\":{}}"), None);
-        assert_eq!(text_part("not json"), None);
-    }
-
-    #[test]
-    fn jsonl_last_text_file_reads_final_text_after_a_large_prefix() {
-        // A tool-heavy stream places the final answer well past any small cap;
-        // streaming to EOF must still find it (not a stale earlier text).
-        let dir = temp_dir("jsonl-tail");
-        let path = dir.join("stdout.log");
-        let mut stream = String::new();
-        for i in 0..5000 {
-            stream.push_str(&format!(
-                "{{\"type\":\"tool_use\",\"part\":{{\"n\":{i}}}}}\n"
-            ));
-        }
-        stream.push_str("{\"type\":\"text\",\"part\":{\"text\":\"the final answer\"}}\n");
-        assert!(stream.len() > 100_000, "prefix is large: {}", stream.len());
-        std::fs::write(&path, &stream).unwrap();
-        assert_eq!(
-            last_jsonl_text_file(&path, MAX_STREAM_BYTES)
-                .unwrap()
-                .as_deref(),
-            Some("the final answer")
-        );
+        let text = serde_json::json!({"type": "text", "part": {"text": "hi"}});
+        assert_eq!(text_part(&text).as_deref(), Some("hi"));
+        let tool = serde_json::json!({"type": "tool_use", "part": {}});
+        assert_eq!(text_part(&tool), None);
     }
 
     #[test]
     fn capture_result_jsonl_uses_the_full_file_path() {
         // Exercise capture_result end-to-end: the final text lives past a big
         // prefix, so a prefix-only reader would return a stale value.
-        let dir = temp_dir("jsonl-capture");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         let mut stream = String::new();
         stream.push_str("{\"type\":\"text\",\"part\":{\"text\":\"early\"}}\n");
         stream.push_str(&"{\"type\":\"tool_use\",\"part\":{}}\n".repeat(10_000));
         stream.push_str("{\"type\":\"text\",\"part\":{\"text\":\"the real final\"}}\n");
         std::fs::write(dir.join("stdout.log"), &stream).unwrap();
-        let got = capture_result(
-            Some(ResultCapture::JsonlLastText),
-            &dir,
-            &dir.join("unused"),
-        );
+        let got = capture_result(Some(ResultCapture::JsonlLastText), dir, &dir.join("unused"));
         assert_eq!(got.unwrap().as_deref(), Some("the real final"));
     }
 
     #[test]
     fn jsonl_last_text_file_fails_closed_on_an_over_long_line() {
-        let dir = temp_dir("jsonl-overlong");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         let path = dir.join("stdout.log");
         // A single line far exceeding the (tiny) cap must error, not silently
         // return an earlier text.
@@ -1798,7 +1655,8 @@ mod tests {
 
     #[test]
     fn read_capped_is_lossy_and_bounded() {
-        let dir = temp_dir("read-capped");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         let path = dir.join("blob");
         // A multi-byte char right at the cap must not error (lossy decode).
         let mut bytes = vec![b'x'; 15];
@@ -1848,7 +1706,8 @@ mod tests {
     /// events when the final `message_end` is missing.
     #[test]
     fn pi_result_falls_back_to_text_end_when_message_end_is_truncated() {
-        let dir = temp_dir("pi-torn");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
         let whole = fs::read_to_string(fixture("pi-mode-json.jsonl")).expect("fixture");
         // Cut off after the text_end but before the message_end.
         let torn = &whole[..whole.rfind("text_end").unwrap() + 60];

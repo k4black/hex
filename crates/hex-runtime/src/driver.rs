@@ -29,14 +29,15 @@ const RESPOND_POLL_MS: u64 = 250;
 /// A snapshot of an attempt about to run, handed to a [`ProgressSink`] so a
 /// client can render a live preview while the (blocking) attempt executes. All
 /// fields are facts the runtime already knows; the sink only renders them.
+#[derive(Clone)]
 pub struct AttemptView {
     /// The node being attempted.
     pub node_id: String,
-    /// The node's kind (so a `command` isn't rendered as a `gate`).
+    /// The node's kind (`agent` or `command`).
     pub kind: NodeKind,
     /// This attempt's unique id (its output lives under `attempts/<id>/`).
     pub attempt_id: String,
-    /// The worker driving an `agent` node; `None` for a `gate`/`command`.
+    /// The worker driving an `agent` node; `None` for a `command`.
     pub worker: Option<String>,
     /// This attempt's ordinal within the run (1-based, all nodes counted).
     pub attempt_number: u32,
@@ -44,10 +45,8 @@ pub struct AttemptView {
     pub deadline_ms: Option<u64>,
     /// Wall-clock start (Unix epoch ms), for a live elapsed timer.
     pub started_at_ms: u64,
-    /// The file the attempt's stdout streams to, live.
-    pub stdout_log: PathBuf,
-    /// The file the attempt's stderr streams to, live.
-    pub stderr_log: PathBuf,
+    /// The attempt's captured streams, readable live.
+    pub streams: crate::AttemptStreams,
     /// Every node in the graph's reading order, with where it stands.
     ///
     /// A loop is hard to follow from one line of text: "attempt 7 on implement"
@@ -198,6 +197,26 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// Journal a run-level event the runtime itself authors.
+    pub(crate) fn runtime_event(&mut self, body: EventBody) -> Result<()> {
+        self.record(None, None, Actor::runtime(), body)
+    }
+
+    /// End the run: journal `note` (the *why*) if any, then the `RunFinished`
+    /// every run ends with (`check_journal` requires it to agree with any
+    /// disposition an `AttemptFailed` already recorded).
+    fn finish(
+        &mut self,
+        note: Option<String>,
+        actor: Actor,
+        disposition: Disposition,
+    ) -> Result<()> {
+        if let Some(text) = note {
+            self.record(None, None, actor.clone(), EventBody::Note { text })?;
+        }
+        self.record(None, None, actor, EventBody::RunFinished { disposition })
+    }
+
     /// Drive the loop until the run reaches a terminal disposition — or an
     /// operator pauses it, which returns `Ok(None)`. Guarantees that whenever it
     /// returns a disposition, the journal contains a matching terminal event; a
@@ -223,7 +242,7 @@ impl<'a> Session<'a> {
             // (A human wait runs its own copy of this check inside
             // `request_human`, since it blocks without reaching a boundary.)
             if hex_worker::interrupt::requested() && self.state.status != Status::Paused {
-                self.record(None, None, Actor::runtime(), EventBody::RunPaused)?;
+                self.runtime_event(EventBody::RunPaused)?;
                 return Ok(None);
             }
             if self.state.status == Status::Paused {
@@ -245,21 +264,10 @@ impl<'a> Session<'a> {
         if !self.state.is_finished() {
             // Blocked or hit the iteration ceiling: record the halt so the
             // outcome is always in the journal.
-            self.record(
-                None,
-                None,
+            self.finish(
+                Some("run halted without reaching a terminal node".to_owned()),
                 Actor::runtime(),
-                EventBody::Note {
-                    text: "run halted without reaching a terminal node".to_owned(),
-                },
-            )?;
-            self.record(
-                None,
-                None,
-                Actor::runtime(),
-                EventBody::RunFinished {
-                    disposition: Disposition::Failed,
-                },
+                Disposition::Failed,
             )?;
         }
         Ok(Some(
@@ -309,21 +317,10 @@ impl<'a> Session<'a> {
                 // This is what makes `hex cancel` work on a *live* run: the
                 // driver holds the run lock, so no outside process can append a
                 // terminal — but it can ask the holder to.
-                self.record(
-                    None,
-                    None,
+                self.finish(
+                    Some(format!("cancelled by {actor}")),
                     actor.clone(),
-                    EventBody::Note {
-                        text: format!("cancelled by {actor}"),
-                    },
-                )?;
-                self.record(
-                    None,
-                    None,
-                    actor.clone(),
-                    EventBody::RunFinished {
-                        disposition: Disposition::Cancelled,
-                    },
+                    Disposition::Cancelled,
                 )?;
             }
             Command::Pause => self.record(None, None, actor.clone(), EventBody::RunPaused)?,
@@ -397,24 +394,13 @@ impl<'a> Session<'a> {
                 attempt_id,
                 idempotency_key,
             } => self.run_command(&node_id, &attempt_id, &idempotency_key),
-            Effect::RerouteUnmet { to, missing } => self.record(
-                None,
-                None,
-                Actor::runtime(),
-                EventBody::AcceptanceUnmet { missing, to },
-            ),
+            Effect::RerouteUnmet { to, missing } => {
+                self.runtime_event(EventBody::AcceptanceUnmet { missing, to })
+            }
+            // Journal *why* before the outcome, so `budget_exhausted` and a
+            // downgraded `failed` are self-explanatory instead of bare.
             Effect::RecordTerminal { disposition, why } => {
-                // Journal *why* before the outcome, so `budget_exhausted` and a
-                // downgraded `failed` are self-explanatory instead of bare.
-                if let Some(text) = why {
-                    self.record(None, None, Actor::runtime(), EventBody::Note { text })?;
-                }
-                self.record(
-                    None,
-                    None,
-                    Actor::runtime(),
-                    EventBody::RunFinished { disposition },
-                )
+                self.finish(why, Actor::runtime(), disposition)
             }
             Effect::RequestHuman { node_id } => self.request_human(&node_id),
         }
@@ -485,7 +471,7 @@ impl<'a> Session<'a> {
             // and the stale flag then paused the run, or killed the next
             // attempt, for no operator-visible reason.
             if hex_worker::interrupt::requested() {
-                return self.record(None, None, Actor::runtime(), EventBody::RunPaused);
+                return self.runtime_event(EventBody::RunPaused);
             }
             if let Some(limit) = deadline_ms
                 && u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX) >= limit
@@ -513,12 +499,7 @@ impl<'a> Session<'a> {
                 text: format!("`{node_id}`: {reason}"),
             },
         )?;
-        self.record(
-            None,
-            None,
-            Actor::runtime(),
-            EventBody::RunFinished { disposition },
-        )
+        self.finish(None, Actor::runtime(), disposition)
     }
 
     fn start_attempt(&mut self, node_id: &str, attempt_id: &str, idk: &str) -> Result<()> {
@@ -621,7 +602,6 @@ impl<'a> Session<'a> {
                 kind,
                 attempt_id,
                 Some(worker_name.clone()),
-                &attempt_dir,
                 deadline_ms,
             );
             s.attempt_started(&view);
@@ -643,7 +623,7 @@ impl<'a> Session<'a> {
             resume_session,
             graph: self.graph.name.clone(),
             // run_dir is `<root>/.hex/runs/<id>` (the journal stays in the main
-            // `.hex` even under worktree isolation, gotcha 8), so the project
+            // `.hex` even under worktree isolation, gotcha 12), so the project
             // root is three levels up.
             project_root: self
                 .run_dir
@@ -668,7 +648,7 @@ impl<'a> Session<'a> {
             .is_some_and(|r| !r.models.is_empty() || r.cost_micro_usd.is_some());
         let claims_cost = adapter
             .capabilities()
-            .supports(hex_proto::Capability::CostReporting);
+            .contains(&hex_proto::Capability::CostReporting);
         let had_text = result.as_deref().is_some_and(|t| !t.trim().is_empty());
 
         // What the agent spent goes down first, because everything after this can
@@ -849,9 +829,8 @@ impl<'a> Session<'a> {
         let deadline_ms = self.attempt_deadline();
         let sink = self.sink;
         if let Some(s) = sink {
-            // A gate/command has no worker; its command's output still streams.
-            let view =
-                self.attempt_view(node_id, kind, attempt_id, None, &attempt_dir, deadline_ms);
+            // A command has no worker; its steps' output still streams.
+            let view = self.attempt_view(node_id, kind, attempt_id, None, deadline_ms);
             s.attempt_started(&view);
         }
         let _finish = FinishGuard(sink);
@@ -863,8 +842,8 @@ impl<'a> Session<'a> {
             CommandMode::Parallel => run_parallel(&steps, &self.workdir, &attempt_dir, deadline_ms),
         };
         match outcome {
-            Ok(report) => {
-                if report.failed.is_empty() {
+            Ok(failed) => {
+                if failed.is_empty() {
                     // A pass clears the stall record for this gate.
                     self.gate_sigs.remove(node_id);
                     return self.signal(node_id, attempt_id, Actor::runtime(), "passed");
@@ -878,10 +857,10 @@ impl<'a> Session<'a> {
                     EventBody::Note {
                         text: format!(
                             "{} of {} {} step(s) failed: {}",
-                            report.failed.len(),
+                            failed.len(),
                             steps.len(),
                             mode.as_str(),
-                            report.failed.join(", ")
+                            failed.join(", ")
                         ),
                     },
                 )?;
@@ -890,7 +869,7 @@ impl<'a> Session<'a> {
                 // tokens — the bound a pre-existing red check at the branch base
                 // (and a reviewer re-flagging a fixed point) both lacked.
                 let sig = failure_signature(&attempt_dir);
-                if !sig.is_empty() && self.gate_sigs.get(node_id).is_some_and(|prev| *prev == sig) {
+                if self.gate_sigs.get(node_id).is_some_and(|prev| *prev == sig) {
                     return self.fail_attempt(
                         node_id,
                         attempt_id,
@@ -932,7 +911,7 @@ impl<'a> Session<'a> {
             Actor::runtime(),
             EventBody::AttemptInterrupted,
         )?;
-        self.record(None, None, Actor::runtime(), EventBody::RunPaused)
+        self.runtime_event(EventBody::RunPaused)
     }
 
     /// Record a failed attempt as a single *terminal* event carrying its
@@ -959,13 +938,7 @@ impl<'a> Session<'a> {
         // as a *fact* — it is here so every run ends with the same event whatever
         // path it took. Before it, a timed-out run's journal simply stopped, and
         // anything tailing for `run_finished` never saw the run end.
-        // `check_journal` requires the two to agree.
-        self.record(
-            None,
-            None,
-            Actor::runtime(),
-            EventBody::RunFinished { disposition },
-        )
+        self.finish(None, Actor::runtime(), disposition)
     }
 
     fn attempt_dir(&self, attempt_id: &str) -> Result<PathBuf> {
@@ -982,7 +955,6 @@ impl<'a> Session<'a> {
         kind: NodeKind,
         attempt_id: &str,
         worker: Option<String>,
-        attempt_dir: &Path,
         deadline_ms: Option<u64>,
     ) -> AttemptView {
         AttemptView {
@@ -993,8 +965,7 @@ impl<'a> Session<'a> {
             attempt_number: self.state.attempts_total,
             deadline_ms,
             started_at_ms: now_ms(),
-            stdout_log: attempt_dir.join("stdout.log"),
-            stderr_log: attempt_dir.join("stderr.log"),
+            streams: crate::AttemptStreams::of(&self.run_dir, attempt_id),
             progress: self.progress(node_id),
         }
     }
@@ -1037,14 +1008,24 @@ impl ProcFail {
             reason: reason.into(),
         }
     }
+
+    fn timeout(reason: impl Into<String>) -> Self {
+        Self {
+            timed_out: true,
+            ..Self::infra(reason)
+        }
+    }
+
+    fn interrupted() -> Self {
+        Self {
+            interrupted: true,
+            ..Self::infra("command interrupted by the operator (killed)")
+        }
+    }
 }
 
-/// What a command node's steps did: which ones failed, by label.
-struct StepReport {
-    failed: Vec<String>,
-}
-
-/// Run steps in sequence, stopping at the first failure.
+/// Run steps in sequence, stopping at the first failure. `Ok` carries the
+/// labels of the steps that failed (empty when every step passed).
 ///
 /// Stopping early is the point of `ordered`: in a pipeline, a later step is
 /// usually meaningless once an earlier one failed. Use `parallel` when you want
@@ -1054,18 +1035,16 @@ fn run_ordered(
     workdir: &Path,
     attempt_dir: &Path,
     deadline_ms: Option<u64>,
-) -> std::result::Result<StepReport, ProcFail> {
+) -> std::result::Result<Vec<String>, ProcFail> {
     let started = Instant::now();
     for (i, step) in steps.iter().enumerate() {
         let remaining = remaining_deadline(deadline_ms, started)?;
         let dir = step_dir(attempt_dir, i, step)?;
         if !run_process(&step.argv, workdir, &dir, remaining)? {
-            return Ok(StepReport {
-                failed: vec![step.label().to_owned()],
-            });
+            return Ok(vec![step.label().to_owned()]);
         }
     }
-    Ok(StepReport { failed: Vec::new() })
+    Ok(Vec::new())
 }
 
 /// A content signature of a command attempt's captured step output.
@@ -1073,15 +1052,12 @@ fn run_ordered(
 /// Two identical signatures mean the loop reproduced exactly the same evidence.
 /// Output, not just the exit code: a test loop making real progress changes what
 /// the test prints, so `implement-until-green` keeps looping while it is getting
-/// somewhere and stops when it is not.
+/// somewhere and stops when it is not. Only called after a step failed, so at
+/// least one step dir exists to hash.
 fn failure_signature(attempt_dir: &std::path::Path) -> String {
     use sha2::{Digest, Sha256};
-    let dirs = crate::step_dirs(attempt_dir);
-    if dirs.is_empty() {
-        return String::new(); // no step output, no evidence to compare
-    }
     let mut hasher = Sha256::new();
-    for dir in dirs {
+    for dir in crate::step_dirs(attempt_dir) {
         let name = dir
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1107,7 +1083,7 @@ fn run_parallel(
     workdir: &Path,
     attempt_dir: &Path,
     deadline_ms: Option<u64>,
-) -> std::result::Result<StepReport, ProcFail> {
+) -> std::result::Result<Vec<String>, ProcFail> {
     // Pre-create every step dir on this thread so a filesystem error is an
     // infrastructure failure before anything is spawned.
     let dirs = steps
@@ -1141,7 +1117,7 @@ fn run_parallel(
             failed.push(step.label().to_owned());
         }
     }
-    Ok(StepReport { failed })
+    Ok(failed)
 }
 
 /// Per-step output directory, numbered by declared position so logs sort in the
@@ -1173,11 +1149,9 @@ fn remaining_deadline(
     let used = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let left = total.saturating_sub(used);
     if left == 0 {
-        return Err(ProcFail {
-            timed_out: true,
-            interrupted: false,
-            reason: "command steps exceeded the attempt's time budget".to_owned(),
-        });
+        return Err(ProcFail::timeout(
+            "command steps exceeded the attempt's time budget",
+        ));
     }
     Ok(Some(left))
 }
@@ -1211,16 +1185,10 @@ fn run_process(
             Ok(status.success())
         }
         // Same kill, two causes; the flag is what tells them apart.
-        Ok(None) if hex_worker::interrupt::requested() => Err(ProcFail {
-            timed_out: false,
-            interrupted: true,
-            reason: "command interrupted by the operator (killed)".to_owned(),
-        }),
-        Ok(None) => Err(ProcFail {
-            timed_out: true,
-            interrupted: false,
-            reason: "command exceeded its time budget (killed)".to_owned(),
-        }),
+        Ok(None) if hex_worker::interrupt::requested() => Err(ProcFail::interrupted()),
+        Ok(None) => Err(ProcFail::timeout(
+            "command exceeded its time budget (killed)",
+        )),
         Err(e) => Err(ProcFail::infra(format!("command wait failed: {e}"))),
     }
 }
@@ -1450,7 +1418,7 @@ pub fn check_workers(graph: &Graph, workers: &Workers) -> Result<()> {
             if *context == Context::Continue
                 && !adapter
                     .capabilities()
-                    .supports(hex_proto::Capability::SessionResume)
+                    .contains(&hex_proto::Capability::SessionResume)
             {
                 return Err(HexError::new(format!(
                     "node `{}` asks for `context: continue`, but worker `{worker}` cannot resume a \
@@ -1554,28 +1522,44 @@ mod resume_tests {
         }
     }
 
-    /// The bug this exists for: a role registers under its own alias, so the
-    /// alias still matches after the role is rebound to a different agent. Only
-    /// the program can tell codex's thread id apart from claude's.
+    /// One assertion shape: recorded handle + the program about to run in, the
+    /// session to resume out.
     #[test]
-    fn a_session_is_not_resumed_by_a_different_program() {
-        assert_eq!(resumable_id(Some(&handle("codex")), Some("claude")), None);
-    }
-
-    #[test]
-    fn a_session_is_resumed_by_the_program_that_opened_it() {
-        assert_eq!(
-            resumable_id(Some(&handle("codex")), Some("codex")).as_deref(),
-            Some("019fb9a2")
-        );
-    }
-
-    /// A worker that spawns nothing (the mock) has no program to match, so it can
-    /// never inherit somebody else's session.
-    #[test]
-    fn a_worker_with_no_program_resumes_nothing() {
-        assert_eq!(resumable_id(Some(&handle("codex")), None), None);
-        assert_eq!(resumable_id(None, Some("codex")), None);
+    fn resumable_id_cases() {
+        let cases = [
+            // The bug this exists for: a role registers under its own alias, so
+            // the alias still matches after the role is rebound to a different
+            // agent. Only the program can tell codex's thread id apart from
+            // claude's.
+            (
+                "a different program resumes nothing",
+                Some(handle("codex")),
+                Some("claude"),
+                None,
+            ),
+            (
+                "the program that opened it resumes it",
+                Some(handle("codex")),
+                Some("codex"),
+                Some("019fb9a2"),
+            ),
+            // A worker that spawns nothing (the mock) has no program to match, so
+            // it can never inherit somebody else's session.
+            (
+                "a worker with no program resumes nothing",
+                Some(handle("codex")),
+                None,
+                None,
+            ),
+            ("no handle resumes nothing", None, Some("codex"), None),
+        ];
+        for (name, recorded, program, want) in cases {
+            assert_eq!(
+                resumable_id(recorded.as_ref(), program).as_deref(),
+                want,
+                "{name}"
+            );
+        }
     }
 }
 
@@ -1583,7 +1567,7 @@ mod resume_tests {
 mod check_workers_tests {
     use super::check_workers;
     use crate::workers::Workers;
-    use hex_kernel::graph::{Context, Graph, Node, NodeSpec};
+    use hex_kernel::graph::{Context, Graph, NodeSpec};
     use hex_proto::Disposition;
     use hex_worker::{CodexWorker, CommandWorker};
 
@@ -1594,29 +1578,11 @@ mod check_workers_tests {
             .terminal("fin", Disposition::Succeeded)
             .edge("a", "go", "fin")
             .build();
-        let NodeSpec::Agent {
-            worker,
-            prompt,
-            may_propose,
-            read_only,
-            ..
-        } = g.nodes["a"].spec.clone()
+        let Some(NodeSpec::Agent { context: c, .. }) = g.nodes.get_mut("a").map(|n| &mut n.spec)
         else {
             unreachable!("built as an agent")
         };
-        g.nodes.insert(
-            "a".to_owned(),
-            Node::new(
-                "a",
-                NodeSpec::Agent {
-                    worker,
-                    prompt,
-                    may_propose,
-                    read_only,
-                    context,
-                },
-            ),
-        );
+        *c = context;
         g
     }
 

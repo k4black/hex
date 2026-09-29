@@ -334,12 +334,10 @@ fn logs_show_final_message_by_default_and_full_output_with_flag() {
         "workers:\n  builder:\n    command: [sh, -c, 'echo HELLO-FROM-AGENT; printf \"FINAL-SUMMARY\\nVERDICT: ready\" > \"$HEX_RESULT_FILE\"']\n    result: file\n",
     )
     .expect("config");
-    let run = hex(dir.path(), &["run", "demo", "--json"]);
-    let v: serde_json::Value = serde_json::from_str(stdout(&run).trim()).unwrap();
-    let run_id = v["run_id"].as_str().unwrap();
+    let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
 
     // Default: the attempt's final message, not the full stdout.
-    let out = hex(dir.path(), &["logs", run_id]);
+    let out = hex(dir.path(), &["logs", &run_id]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let s = stdout(&out);
     assert!(
@@ -353,14 +351,14 @@ fn logs_show_final_message_by_default_and_full_output_with_flag() {
     );
 
     // --full: the full captured stdout.
-    let full = hex(dir.path(), &["logs", run_id, "--full"]);
+    let full = hex(dir.path(), &["logs", &run_id, "--full"]);
     assert!(
         stdout(&full).contains("HELLO-FROM-AGENT"),
         "full stdout shown with --full"
     );
 
     // --node filters to a single node's attempts.
-    let only = hex(dir.path(), &["logs", run_id, "--node", "build"]);
+    let only = hex(dir.path(), &["logs", &run_id, "--node", "build"]);
     assert!(stdout(&only).contains("FINAL-SUMMARY"));
     assert!(!stdout(&only).contains("[test]"), "filtered to build only");
 }
@@ -481,6 +479,7 @@ fn status_omits_the_usage_table_when_nothing_reported_any() {
     let run_id = run_id_of(&hex(dir.path(), &["run", "demo", "--json"]));
 
     let out = hex(dir.path(), &["status", &run_id]);
+    assert!(stdout(&out).contains("succeeded"), "{}", stdout(&out));
     assert!(!stdout(&out).contains("TOKENS"), "{}", stdout(&out));
 
     let json = hex(dir.path(), &["status", &run_id, "--json"]);
@@ -490,10 +489,6 @@ fn status_omits_the_usage_table_when_nothing_reported_any() {
     assert!(v["usage"]["by_node"].as_object().unwrap().is_empty(), "{v}");
 }
 
-/// Splice in the `AttemptReported` a usage-reporting worker writes, correlated to
-/// the `build` attempt — the kernel accepts it only while that attempt is in
-/// flight, so it goes directly after its `attempt_started`. `seq` is contiguous
-/// per run, so every following event is renumbered.
 /// Inject a report that spent tokens and named no price — codex's shape.
 fn inject_usage_unpriced(dir: &Path, run_id: &str) {
     inject_report(
@@ -532,8 +527,10 @@ fn inject_usage(dir: &Path, run_id: &str) {
     );
 }
 
-/// Insert `body` as an `attempt_reported` right after the `build` attempt started,
-/// renumbering `seq` (which `journal::scan` requires to be contiguous).
+/// Splice in the `AttemptReported` a usage-reporting worker writes, correlated to
+/// the `build` attempt — the kernel accepts it only while that attempt is in
+/// flight, so it goes directly after its `attempt_started`. `seq` is contiguous
+/// per run (`journal::scan` requires it), so every following event is renumbered.
 fn inject_report(dir: &Path, run_id: &str, body: serde_json::Value) {
     let path = dir
         .join(".hex")
@@ -884,7 +881,6 @@ fn runs_lists_a_finished_run_with_its_state() {
     // The `finished:` prefix is gone: the mark carries the colour and RESULT
     // carries the word, so saying "finished" twice added nothing.
     assert!(s.contains("succeeded"), "{s}");
-    assert!(!s.contains("finished:succeeded"), "no ceremony prefix: {s}");
 }
 
 #[test]
@@ -893,17 +889,6 @@ fn runs_on_a_project_with_no_runs_says_so() {
     let out = hex(dir.path(), &["runs"]);
     assert!(out.status.success());
     assert!(stdout(&out).contains("no runs yet"), "{}", stdout(&out));
-}
-
-#[test]
-fn status_reflects_a_finished_run() {
-    let dir = project();
-    let run = hex(dir.path(), &["run", "demo", "--json"]);
-    let v: serde_json::Value = serde_json::from_str(stdout(&run).trim()).unwrap();
-    let run_id = v["run_id"].as_str().unwrap();
-
-    let st = hex(dir.path(), &["status", run_id]);
-    assert!(stdout(&st).contains("succeeded"));
 }
 
 /// The two new verbs, end to end: `hex stats` folds the usage log this HOME

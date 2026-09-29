@@ -105,7 +105,7 @@ impl Inbox {
     pub fn claim_next(&self) -> Result<Option<Envelope>> {
         let queue = self.queue();
         loop {
-            let Some(name) = self.oldest_queued()? else {
+            let Some(name) = self.names()?.into_iter().next() else {
                 return Ok(None);
             };
             let raw = std::fs::read_to_string(queue.join(&name))?;
@@ -139,7 +139,19 @@ impl Inbox {
     /// Fails if the inbox directory cannot be read.
     pub fn queued(&self) -> Result<Vec<Envelope>> {
         let queue = self.queue();
-        let entries = match std::fs::read_dir(&queue) {
+        Ok(self
+            .names()?
+            .iter()
+            .filter_map(|n| std::fs::read_to_string(queue.join(n)).ok())
+            .filter_map(|raw| serde_json::from_str::<Envelope>(&raw).ok())
+            .collect())
+    }
+
+    /// Queued file names in arrival order (names are millis-first, so lexical
+    /// order is arrival order). No inbox yet is the common case: nobody has sent
+    /// anything.
+    fn names(&self) -> Result<Vec<String>> {
+        let entries = match std::fs::read_dir(self.queue()) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
@@ -149,29 +161,8 @@ impl Inbox {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".json"))
             .collect();
-        // Names are millis-first, so lexical order is arrival order.
         names.sort_unstable();
-        Ok(names
-            .iter()
-            .filter_map(|n| std::fs::read_to_string(queue.join(n)).ok())
-            .filter_map(|raw| serde_json::from_str::<Envelope>(&raw).ok())
-            .collect())
-    }
-
-    /// The lexicographically first queued file name — arrival order, since names
-    /// are millis-first.
-    fn oldest_queued(&self) -> Result<Option<String>> {
-        let entries = match std::fs::read_dir(self.queue()) {
-            Ok(entries) => entries,
-            // No inbox yet is the common case: nobody has sent anything.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        Ok(entries
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".json"))
-            .min())
+        Ok(names)
     }
 }
 
@@ -372,12 +363,6 @@ impl Liveness {
     }
 }
 
-impl std::fmt::Display for Liveness {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,42 +411,6 @@ mod tests {
         assert_eq!(inbox.queued().expect("queued").len(), 1);
     }
 
-    #[test]
-    fn send_then_claim_preserves_order_actor_and_payload() {
-        let dir = temp_run_dir("order");
-        let inbox = Inbox::new(&dir);
-        inbox
-            .send(
-                &Actor::human("kc"),
-                &Command::Steer {
-                    text: "smaller diff".to_owned(),
-                },
-            )
-            .expect("send steer");
-        inbox
-            .send(&Actor::runtime(), &Command::Cancel)
-            .expect("send");
-
-        let first = inbox.claim_next().expect("claim").expect("a command");
-        assert_eq!(first.actor, Actor::human("kc"));
-        assert_eq!(
-            first.command,
-            Command::Steer {
-                text: "smaller diff".to_owned()
-            }
-        );
-        let second = inbox.claim_next().expect("claim").expect("a command");
-        assert_eq!(second.command, Command::Cancel);
-        // Consumed exactly once, and the files survive in `done/` as evidence.
-        assert!(inbox.claim_next().expect("claim").is_none());
-        assert_eq!(
-            std::fs::read_dir(dir.join("control").join("done"))
-                .expect("done dir")
-                .count(),
-            2
-        );
-    }
-
     /// The property that makes an early return safe: claiming takes *one* command
     /// and leaves the rest queued. Draining the batch up front marked every file
     /// done, so a caller that stopped at the first `respond`/`pause`/`cancel`
@@ -489,6 +438,7 @@ mod tests {
             .expect("send steer");
 
         let first = inbox.claim_next().expect("claim").expect("a command");
+        assert_eq!(first.actor, Actor::human("kc"));
         assert_eq!(
             first.command,
             Command::Respond {
@@ -510,7 +460,14 @@ mod tests {
                 text: "USE-THE-V2-API".to_owned()
             }
         );
+        // Consumed exactly once, and the files survive in `done/` as evidence.
         assert!(inbox.claim_next().expect("claim").is_none());
+        assert_eq!(
+            std::fs::read_dir(dir.join("control").join("done"))
+                .expect("done dir")
+                .count(),
+            2
+        );
     }
 
     /// The temp-then-rename discipline is the whole point: a controller caught

@@ -10,10 +10,9 @@
 //! is to set this flag. What is worth pinning is everything downstream: that a
 //! set flag actually reaches the agent, and what the journal is left saying.
 
-use std::path::Path;
 use std::time::Instant;
 
-use common::temp_root;
+use common::{temp_root, write_graph};
 use hex_proto::EventBody;
 use hex_runtime::config::Config;
 use hex_runtime::{Isolation, Runtime, Status, Workers};
@@ -36,12 +35,6 @@ nodes:
     terminal: succeeded
 accept: { require: [] }
 "#;
-
-fn write_graph(root: &Path, name: &str, source: &str) {
-    let dir = root.join(".hex").join("graphs");
-    std::fs::create_dir_all(&dir).expect("mkdir graphs");
-    std::fs::write(dir.join(format!("{name}.yaml")), source).expect("write graph");
-}
 
 /// An interrupt kills the in-flight agent and leaves the run **paused**, not
 /// failed: nothing was exceeded and nothing went wrong, so `AttemptFailed` would

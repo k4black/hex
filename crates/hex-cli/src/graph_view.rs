@@ -89,17 +89,21 @@ fn accept_line(graph: &Graph, ui: Ui) -> Option<String> {
 fn budget_line(budget: &Budget, ui: Ui) -> String {
     let mut parts = Vec::new();
     if let Some(ms) = budget.elapsed_ms {
-        parts.push(format!("{} elapsed", human_ms(ms)));
+        parts.push(format!(
+            "{} elapsed",
+            humantime::format_duration(std::time::Duration::from_millis(ms))
+        ));
     }
     if let Some(ms) = budget.attempt_elapsed_ms {
-        parts.push(format!("{} per attempt", human_ms(ms)));
+        parts.push(format!(
+            "{} per attempt",
+            humantime::format_duration(std::time::Duration::from_millis(ms))
+        ));
     }
     if let Some(t) = budget.output_tokens {
         parts.push(format!("{t} generated tokens"));
     }
-    if parts.is_empty() {
-        return "unbounded".to_owned();
-    }
+    // Never empty: the loader always sets the per-attempt bound (gotcha 14).
     parts.join(&format!(" {} ", ui.glyphs().sep))
 }
 
@@ -244,7 +248,7 @@ fn policy(
             parts.push("agent".to_owned());
             // Both halves of the binding: a graph names a role, and which CLI
             // it lands on is exactly what you want when reading someone else's
-            // graph — it is also the only way gotcha 19's shadowing is visible.
+            // graph — it is also the only way gotcha 18's shadowing is visible.
             parts.push(match bindings.get(worker) {
                 Some(program) if program != worker => format!("{worker} {} {program}", g.binds),
                 _ => worker.clone(),
@@ -287,7 +291,7 @@ fn policy(
 
 /// A command node's resolved argv, one per line.
 ///
-/// The *resolved* argv, not the check name: gotcha 9's whole point is that a
+/// The *resolved* argv, not the check name: gotcha 13's whole point is that a
 /// gate whose verdict means nothing is worse than no gate, so the thing a reader
 /// has to be able to audit is the command that will actually run.
 fn steps(node: &hex_runtime::Node) -> Vec<String> {
@@ -342,11 +346,6 @@ fn cycles(out: &mut String, topo: &Topology, ui: Ui) {
         return;
     }
     let g = ui.glyphs();
-    let unbounded = topo
-        .cycles
-        .iter()
-        .filter(|c| c.bounded_by.is_none())
-        .count();
     out.push_str(&format!("\n{}\n", ui.paint(style::HEADER, "Cycles")));
     for (i, c) in topo.cycles.iter().enumerate() {
         let path = c.nodes.join(&format!(" {} ", g.step));
@@ -357,8 +356,8 @@ fn cycles(out: &mut String, topo: &Topology, ui: Ui) {
             c.nodes.first().map_or("", String::as_str)
         ));
     }
-    // Stated once. Repeating the same bound under every cycle made the section
-    // look longer than it was and buried the one case that matters.
+    // Stated once: repeating the same bound under every cycle made the section
+    // look longer than it was. Every loop has one — the loader bounds every node.
     let bounds: Vec<&str> = {
         let mut b: Vec<&str> = topo
             .cycles
@@ -369,15 +368,6 @@ fn cycles(out: &mut String, topo: &Topology, ui: Ui) {
         b.dedup();
         b
     };
-    if unbounded > 0 {
-        out.push_str(&format!(
-            "  {}\n",
-            ui.paint(
-                style::FAIL,
-                &format!("{unbounded} UNBOUNDED — no visit bound stops this loop")
-            )
-        ));
-    }
     if !bounds.is_empty() {
         out.push_str(&format!(
             "  {} {}\n",
@@ -407,14 +397,4 @@ fn summary(out: &mut String, graph: &Graph, topo: &Topology, ui: Ui) {
         "\n{}\n",
         ui.paint(style::DIM, &parts.join(&format!(" {} ", ui.glyphs().sep)))
     ));
-}
-
-/// Round milliseconds to the unit a human wrote them in.
-fn human_ms(ms: u64) -> String {
-    match ms {
-        ms if ms % 3_600_000 == 0 => format!("{}h", ms / 3_600_000),
-        ms if ms % 60_000 == 0 => format!("{}m", ms / 60_000),
-        ms if ms % 1_000 == 0 => format!("{}s", ms / 1_000),
-        ms => format!("{ms}ms"),
-    }
 }

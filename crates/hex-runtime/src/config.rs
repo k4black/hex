@@ -19,7 +19,7 @@ use serde::Deserialize;
 use crate::error::Result;
 
 /// The built-in configuration layer, embedded and parsed like any other.
-pub const DEFAULTS: &str = include_str!("defaults.yaml");
+const DEFAULTS: &str = include_str!("defaults.yaml");
 
 /// Merged configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -28,7 +28,7 @@ pub struct Config {
     /// Worker registry: name → how to invoke that agent CLI. Internal plumbing;
     /// graphs name a [`RoleSpec`], not a worker.
     pub workers: BTreeMap<String, WorkerSpec>,
-    /// Roles a graph can name (`worker: reviewer`): a worker plus the model,
+    /// Roles a graph can name (`role: reviewer`): a worker plus the model,
     /// effort, read-only policy and prompt preamble that define the job.
     pub roles: BTreeMap<String, RoleSpec>,
     /// Project checks: name → argv, referenced by a graph as
@@ -118,18 +118,10 @@ impl RoleSpec {
     /// survives, so a project can extend a built-in role's preamble without
     /// restating it.
     fn merge(&mut self, other: Self) {
-        if other.worker.is_some() {
-            self.worker = other.worker;
-        }
-        if other.model.is_some() {
-            self.model = other.model;
-        }
-        if other.effort.is_some() {
-            self.effort = other.effort;
-        }
-        if other.read_only.is_some() {
-            self.read_only = other.read_only;
-        }
+        self.worker = other.worker.or(self.worker.take());
+        self.model = other.model.or(self.model.take());
+        self.effort = other.effort.or(self.effort.take());
+        self.read_only = other.read_only.or(self.read_only.take());
         if other.prompt.is_some() {
             // An explicit prompt replaces the inherited one, and also discards
             // any appendix inherited with it — otherwise a redefinition would
@@ -208,31 +200,22 @@ impl Config {
     /// Public so callers can compose layers explicitly (and so tests can assert
     /// the merge rules that decide which role a graph actually gets).
     pub fn merge(&mut self, other: Self) {
-        for (name, spec) in other.workers {
-            self.workers.insert(name, spec);
-        }
+        self.workers.extend(other.workers);
         // Per-check granularity: a project overriding `test` keeps a user-level
         // `lint` rather than replacing the whole map.
-        for (name, argv) in other.checks {
-            self.checks.insert(name, argv);
-        }
+        self.checks.extend(other.checks);
         // Roles merge per field, so overriding one model inherits the rest.
         for (name, spec) in other.roles {
             self.roles.entry(name).or_default().merge(spec);
         }
-        if other.defaults.role.is_some() {
-            self.defaults.role = other.defaults.role;
-        }
-        if other.defaults.context.is_some() {
-            self.defaults.context = other.defaults.context;
-        }
+        self.defaults.role = other.defaults.role.or(self.defaults.role.take());
+        self.defaults.context = other.defaults.context.or(self.defaults.context.take());
     }
 }
 
 fn user_config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
     Some(
-        PathBuf::from(home)
+        crate::local_log::home_dir()?
             .join(".config")
             .join("hex")
             .join("config.yaml"),

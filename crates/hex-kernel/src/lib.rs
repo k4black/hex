@@ -1,8 +1,9 @@
 //! `hex-kernel` — the pure, deterministic kernel of hex.
 //!
 //! Owns the compiled graph IR (nodes, edges, bounded cycles), the projected
-//! run state, IR validation, and the three pure functions the runtime drives:
-//! [`reduce`], [`schedule`], and [`accept`]. Depends only on [`hex_proto`].
+//! run state, IR validation, and the two pure functions the runtime drives:
+//! [`reduce`] and [`schedule`] (which also enforces `accept.require`).
+//! Depends only on [`hex_proto`].
 //!
 //! The kernel is **pure**: no IO, no clock, no subprocesses, no worker
 //! adapters, no rendering. It never performs external actions — it emits
@@ -24,8 +25,8 @@ pub mod topology;
 pub mod validate;
 
 pub use graph::{Budget, Context, Edge, Graph, Node, NodeKind, NodeSpec, Requirement};
-pub use topology::{Cycle, EdgeClass, Topology, Transition};
-pub use validate::{Issue, check_journal, validate};
+pub use topology::{EdgeClass, Topology, Transition};
+pub use validate::{check_journal, validate};
 
 /// Status of a run, derived purely by folding [`reduce`] over the journal.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -76,7 +77,7 @@ pub struct RunState {
     pub current_attempt: Option<String>,
     /// Total attempts started across the whole run.
     pub attempts_total: u32,
-    /// Times each node has been entered (cycle-visit accounting).
+    /// Times each node has been entered, checked against its `max_visits` bound.
     pub visits: BTreeMap<String, u32>,
     /// The last routing signal each node produced (drives acceptance).
     pub signals: BTreeMap<String, String>,
@@ -213,20 +214,28 @@ impl Totals {
 }
 
 impl Usage {
-    /// Fold one attempt's report in, attributed to `node`.
+    /// What one attempt's report cost, in micro-USD: the attempt's own
+    /// `cost_micro_usd` when the agent reported one, and only otherwise the sum
+    /// of its per-model costs — never both, or claude (which reports both an
+    /// attempt total and the per-model costs that compose it) would be billed
+    /// twice. `0` when nothing was priced.
     ///
-    /// Cost is taken from the attempt's own `cost_micro_usd` when the agent
-    /// reported one, and only otherwise from the sum of its per-model costs —
-    /// never both, or claude (which reports both an attempt total and the
-    /// per-model costs that compose it) would be billed twice.
+    /// Saturating: an untrusted operand must not be able to panic a projection
+    /// that is recomputed on every read.
+    #[must_use]
+    pub fn attempt_cost(models: &[hex_proto::ModelUsage], cost: Option<u64>) -> u64 {
+        cost.unwrap_or_else(|| {
+            models
+                .iter()
+                .filter_map(|m| m.cost_micro_usd)
+                .fold(0u64, u64::saturating_add)
+        })
+    }
+
+    /// Fold one attempt's report in, attributed to `node`, costed by
+    /// [`Usage::attempt_cost`].
     fn add(&mut self, node: Option<&str>, models: &[hex_proto::ModelUsage], cost: Option<u64>) {
-        // Saturating throughout: an untrusted operand must not be able to panic a
-        // projection that is recomputed on every read.
-        let per_model_cost: u64 = models
-            .iter()
-            .filter_map(|m| m.cost_micro_usd)
-            .fold(0u64, u64::saturating_add);
-        let attempt_cost = cost.unwrap_or(per_model_cost);
+        let attempt_cost = Self::attempt_cost(models, cost);
         // Under-priced: no authoritative attempt total, and at least one model
         // that named no price. This is the fact separating a total from a lower
         // bound — and it must catch the *mixed* attempt too, where one model
@@ -270,7 +279,7 @@ impl RunState {
     /// Whether the run has reached any terminal state.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        matches!(self.status, Status::Finished(_))
+        self.status.is_finished()
     }
 
     /// Whether an attempt is in flight for [`RunState::current`] — i.e. an
@@ -334,58 +343,38 @@ pub enum Effect {
     },
 }
 
-/// Whether the acceptance contract (`accept.require`) is satisfied.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Acceptance {
-    /// All required signals observed.
-    Accepted,
-    /// Required `node.signal` evidence still missing.
-    Missing(Vec<String>),
-}
-
 /// Fold one journal event into the projected run state:
 /// `new_state = reduce(graph, old_state, event)`. Pure and deterministic; the
 /// single source of every state transition, **including routing**.
 ///
-/// Every "may this event apply here?" question is answered by a predicate in
-/// the private `lifecycle` module, shared verbatim with
-/// [`check_journal`]: what this function silently drops is
-/// exactly what that one rejects. Keeping the two in agreement is not a
-/// convention here — it is one function per rule.
+/// Every "may this event apply here?" question is answered by the private
+/// `lifecycle::admissible`, shared verbatim with [`check_journal`]: what this
+/// function silently drops is exactly what that one rejects. Keeping the two in
+/// agreement is not a convention here — it is one function per rule.
 #[must_use]
 pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
+    // Fail closed: an event the kernel could not have produced from this
+    // position (a forged, replayed or out-of-order record) never moves the
+    // projection.
+    if lifecycle::admissible(graph, &state, event).is_err() {
+        return state;
+    }
     match &event.body {
         EventBody::RunCreated { .. } => {
             state.status = Status::Created;
         }
         EventBody::RunStarted => {
-            if !lifecycle::run_start_ok(&state) {
-                return state;
-            }
             state.status = Status::Running;
-            state.current = Some(graph.entry.clone());
-            *state.visits.entry(graph.entry.clone()).or_insert(0) += 1;
+            enter(&mut state, &graph.entry);
             state.started_at_ms = event.at_ms;
         }
-        EventBody::AcceptanceUnmet { to, missing } => {
-            // Only the reroute `schedule` would itself have emitted from this
-            // position moves the run (see `lifecycle::unmet_reroute_ok`). This
-            // arm is where the two journal consumers drifted: it advanced
-            // `current` while the read path's audit did not, so one legitimate
-            // reroute made `status`/`logs`/`resume` reject the journal forever.
-            if !lifecycle::unmet_reroute_ok(graph, &state, to, missing) {
-                return state;
-            }
-            state.current = Some(to.clone());
-            *state.visits.entry(to.clone()).or_insert(0) += 1;
-        }
+        // Only the reroute `schedule` would itself have emitted from this position
+        // moves the run (see `lifecycle::unmet_reroute_ok`). This arm is where the
+        // two journal consumers drifted: it advanced `current` while the read
+        // path's audit did not, so one legitimate reroute made
+        // `status`/`logs`/`resume` reject the journal forever.
+        EventBody::AcceptanceUnmet { to, .. } => enter(&mut state, to),
         EventBody::AttemptStarted { .. } => {
-            // Fail closed on an attempt-start that could not have happened here:
-            // ignore it rather than marking the wrong (or an anonymous) attempt
-            // in flight, or letting an attempt exist on a `human`/`terminal` node.
-            if !lifecycle::attempt_start_ok(graph, &state, event) {
-                return state;
-            }
             state.attempts_total += 1;
             state.current_attempt = event.attempt_id.clone();
             // A fresh attempt has not reported usage yet. Clearing here is what
@@ -406,45 +395,21 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
         }
         EventBody::AttemptInterrupted => {
             // Orphaned attempt: clear the in-flight attempt so the same node is
-            // re-scheduled fresh. Correlated like other attempt outcomes so a
-            // forged interruption cannot desync the projection.
-            if !lifecycle::correlated(&state, event) {
-                return state;
-            }
+            // re-scheduled fresh, and drop any result it captured before
+            // crashing, so a re-attempt that produces none can't hand downstream
+            // stale text.
             state.current_attempt = None;
-            // Drop any result the interrupted attempt captured before crashing,
-            // so a re-attempt that produces none can't hand downstream stale text.
             if let Some(cur) = &state.current {
                 state.results.remove(cur);
             }
         }
         EventBody::Signal { name } => {
-            // Only a signal correlated to the in-flight attempt advances the
-            // graph. This guards replay of a corrupt/forged journal record
-            // whose node/attempt does not match the projected position.
-            if !lifecycle::correlated(&state, event) {
-                return state;
-            }
             state.current_attempt = None;
             if let Some(cur) = state.current.clone() {
-                state.signals.insert(cur.clone(), name.clone());
-                match graph.route(&cur, name) {
-                    Some(to) => {
-                        state.current = Some(to.to_owned());
-                        *state.visits.entry(to.to_owned()).or_insert(0) += 1;
-                    }
-                    None => {
-                        // No legal edge for this signal — a defensive failure
-                        // (validation guarantees `may_propose` events route).
-                        state.status = Status::Finished(Disposition::Failed);
-                    }
-                }
+                route_or_fail(graph, &mut state, cur, name);
             }
         }
         EventBody::AttemptFailed { disposition, .. } => {
-            if !lifecycle::correlated(&state, event) {
-                return state;
-            }
             state.current_attempt = None;
             // Terminal in one atomic event: the failure and its disposition are
             // recorded together, so a crash can never leave a failed attempt
@@ -465,11 +430,7 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             ..
         } => {
             // Summed, not overwritten — so unlike a result, a duplicate would
-            // silently inflate the bill. The guard rejects a second report from
-            // the same attempt.
-            if !lifecycle::attempt_report_ok(graph, &state, event) {
-                return state;
-            }
+            // silently inflate the bill; the guard admits one report per attempt.
             state.reported_attempt = state.current_attempt.clone();
             state
                 .usage
@@ -484,66 +445,22 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             }
         }
         EventBody::NodeResult { text } => {
-            // Recorded while the attempt is still in flight (before its signal),
-            // so it must correlate to the current attempt like other outcomes —
-            // and only an *agent* attempt captures a final message at all.
-            if !lifecycle::node_result_ok(graph, &state, event) {
-                return state;
-            }
             if let Some(cur) = state.current.clone() {
                 state.results.insert(cur, text.clone());
             }
         }
-        EventBody::RunPaused => {
-            // Pause is only meaningful between attempts (where the driver drains
-            // control commands); guarded like any transition so a forged record
-            // cannot suspend a finished run or orphan an in-flight attempt.
-            if lifecycle::pause_ok(&state) {
-                state.status = Status::Paused;
-            }
-        }
-        EventBody::RunResumed => {
-            if lifecycle::resume_ok(&state) {
-                state.status = Status::Running;
-            }
-        }
-        EventBody::Steered { text } => {
-            // Queued for the next agent attempt — but only from a position the
-            // driver could have journaled it in (an attempt boundary or a pause).
-            // A `Steered` before `run_created` used to reach the first prompt.
-            if lifecycle::steer_ok(&state) {
-                state.pending_steer.push(text.clone());
-            }
-        }
+        EventBody::RunPaused => state.status = Status::Paused,
+        EventBody::RunResumed => state.status = Status::Running,
+        EventBody::Steered { text } => state.pending_steer.push(text.clone()),
         // The request is an intent record: the run's position does not move, so a
         // crash while waiting simply re-asks on resume. It does arm `asked`, which
         // is what makes the eventual answer correlatable.
-        EventBody::HumanRequested { .. } => {
-            if lifecycle::human_request_ok(graph, &state, event) {
-                state.asked = event.node_id.clone();
-            }
-        }
+        EventBody::HumanRequested { .. } => state.asked = event.node_id.clone(),
         EventBody::HumanResponded { text, signal } => {
-            // A human node runs no attempt, so this cannot be correlated the way
-            // a signal is; it is correlated against the *outstanding question*
-            // instead (`asked`), which is the same fail-closed discipline.
-            if !lifecycle::human_response_ok(graph, &state, event) {
-                return state;
-            }
-            let Some(cur) = state.current.clone() else {
-                return state;
-            };
-            state.asked = None;
-            state.results.insert(cur.clone(), text.clone());
-            state.signals.insert(cur.clone(), signal.clone());
-            match graph.route(&cur, signal) {
-                Some(to) => {
-                    state.current = Some(to.to_owned());
-                    *state.visits.entry(to.to_owned()).or_insert(0) += 1;
-                }
-                // Validation guarantees a human node has exactly one edge, so
-                // this is a defensive failure like an unroutable signal.
-                None => state.status = Status::Finished(Disposition::Failed),
+            if let Some(cur) = state.current.clone() {
+                state.asked = None;
+                state.results.insert(cur.clone(), text.clone());
+                route_or_fail(graph, &mut state, cur, signal);
             }
         }
         EventBody::RunFinished { disposition } => {
@@ -558,6 +475,23 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
         EventBody::Note { .. } => {}
     }
     state
+}
+
+/// Move the run onto `to`, spending one visit against its bound.
+fn enter(state: &mut RunState, to: &str) {
+    state.current = Some(to.to_owned());
+    *state.visits.entry(to.to_owned()).or_insert(0) += 1;
+}
+
+/// Record `signal` as `from`'s last verdict and follow its edge. No legal edge
+/// fails the run — a defensive failure, since validation guarantees every
+/// proposable signal routes and a human node has exactly one edge.
+fn route_or_fail(graph: &Graph, state: &mut RunState, from: String, signal: &str) {
+    match graph.route(&from, signal) {
+        Some(to) => enter(state, to),
+        None => state.status = Status::Finished(Disposition::Failed),
+    }
+    state.signals.insert(from, signal.to_owned());
 }
 
 /// Derive the next [`Effect`] intents from `(graph, state)` at time `now_ms`.
@@ -582,7 +516,8 @@ pub fn schedule(graph: &Graph, state: &RunState, now_ms: u64) -> Vec<Effect> {
     if let NodeSpec::Terminal { disposition } = &node.spec {
         // A success terminal only succeeds if the acceptance contract holds.
         if *disposition == Disposition::Succeeded
-            && let Acceptance::Missing(missing) = accept(graph, state)
+            && let missing = lifecycle::missing_evidence(graph, state)
+            && !missing.is_empty()
         {
             // Prefer going and producing the missing evidence over dead-ending.
             // The transition comes from `Graph::implicit_reroute_from`, the one
@@ -655,21 +590,6 @@ pub fn schedule(graph: &Graph, state: &RunState, now_ms: u64) -> Vec<Effect> {
             idempotency_key,
         }],
         NodeSpec::Human { .. } => vec![Effect::RequestHuman { node_id: cur }],
-    }
-}
-
-/// Decide whether the run's acceptance contract (`accept.require`) is met.
-/// Deterministic evidence outranks any worker's "done" claim.
-#[must_use]
-pub fn accept(graph: &Graph, state: &RunState) -> Acceptance {
-    // Shared with the `AcceptanceUnmet` guard, so the evidence a journaled
-    // reroute claims is missing can be compared against what is *actually*
-    // missing.
-    let missing = lifecycle::missing_evidence(graph, state);
-    if missing.is_empty() {
-        Acceptance::Accepted
-    } else {
-        Acceptance::Missing(missing)
     }
 }
 

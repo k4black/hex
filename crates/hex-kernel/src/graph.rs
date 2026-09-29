@@ -2,8 +2,9 @@
 //!
 //! A run executes an exact snapshot of this IR. Roles ("planner", "reviewer")
 //! are *metadata* on an [`NodeKind::Agent`] node and interactivity is a policy
-//! flag — never new kinds. Keeping the kind set tiny, and rejecting unbounded
-//! cycles at validation time, are core design rules.
+//! flag — never new kinds. Keeping the kind set tiny, and bounding every cycle
+//! by construction (the loader gives every non-terminal node a visit bound),
+//! are core design rules.
 
 use std::collections::BTreeMap;
 
@@ -86,7 +87,7 @@ pub enum NodeSpec {
         /// The disposition this node records.
         disposition: Disposition,
     },
-    /// Suspend for a human (unimplemented in the slim MVP).
+    /// Suspend for a human decision or input, answered with `hex respond`.
     Human {
         /// Message shown to the operator.
         prompt: String,
@@ -181,13 +182,6 @@ impl Node {
             max_visits: None,
         }
     }
-
-    /// Set this node's visit bound (builder style).
-    #[must_use]
-    pub fn with_max_visits(mut self, visits: Option<u32>) -> Self {
-        self.max_visits = visits;
-        self
-    }
 }
 
 /// A legal transition, activated by a named routing event. Never model-chosen
@@ -247,7 +241,7 @@ pub const DEFAULT_ATTEMPT_ELAPSED_MS: u64 = 30 * 60 * 1000;
 ///
 /// Applied by the loader, so every cycle is bounded by construction. Terminal
 /// nodes keep `None`: `schedule` settles a terminal before any budget check, so
-/// a bound there is recorded but never enforced (gotcha 18).
+/// a bound there is recorded but never enforced (gotcha 22).
 pub const DEFAULT_NODE_VISITS: u32 = 5;
 
 /// The run's acceptance contract: the evidence a success terminal requires, and
@@ -315,18 +309,6 @@ impl Graph {
             .collect()
     }
 
-    /// The transitions the kernel can take that no [`Edge`] describes: a
-    /// **success** terminal back to `accept.on_unmet`, taken when the acceptance
-    /// contract is unmet there.
-    ///
-    /// The one definition of that implicit edge, because two consumers must agree
-    /// on it or core rule 5 goes blind: `schedule` *takes* it (emitting
-    /// `RerouteUnmet`), and cycle validation has to *see* it — `a → done` with
-    /// `on_unmet: a` is edge-acyclic yet loops for real. An empty `require` list is
-    /// always satisfied, so it yields nothing. Whether `to` exists is not asked
-    /// here: that is validation's `E-accept-unmet-node` and the reroute's own
-    /// lifecycle guard, and a nonexistent target has no outgoing edges so it can
-    /// close no cycle either.
     /// Whether `id` is acting as a **gate**: a `command` node whose verdict the
     /// acceptance contract names.
     ///
@@ -342,6 +324,18 @@ impl Graph {
         ) && self.accept.require.iter().any(|r| r.node == id)
     }
 
+    /// The transitions the kernel can take that no [`Edge`] describes: a
+    /// **success** terminal back to `accept.on_unmet`, taken when the acceptance
+    /// contract is unmet there.
+    ///
+    /// The one definition of that implicit edge, so its two consumers agree:
+    /// `schedule` *takes* it (emitting `RerouteUnmet`), and [`Topology`] *draws*
+    /// it — `a → done` with `on_unmet: a` is edge-acyclic yet loops for real. An
+    /// empty `require` list is always satisfied, so it yields nothing. Whether
+    /// `to` exists is not asked here: that is validation's `E-accept-unmet-node`
+    /// and the reroute's own lifecycle guard.
+    ///
+    /// [`Topology`]: crate::Topology
     #[must_use]
     pub fn implicit_reroutes(&self) -> Vec<(&str, &str)> {
         let Some(to) = self.accept.on_unmet.as_deref() else {
@@ -463,13 +457,6 @@ impl Builder {
             on: on.to_owned(),
             to: to.to_owned(),
         });
-        self
-    }
-
-    /// Set the budget.
-    #[must_use]
-    pub fn budget(mut self, budget: Budget) -> Self {
-        self.graph.budget = budget;
         self
     }
 

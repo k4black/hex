@@ -52,6 +52,12 @@ pub fn append(file: &str, value: &serde_json::Value) -> Result<(), String> {
 /// # Errors
 /// Fails if `$HOME` is unset.
 pub fn path(file: &str) -> Result<std::path::PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or("HOME is not set, cannot locate ~/.hex")?;
-    Ok(std::path::Path::new(&home).join(".hex").join(file))
+    let home = home_dir().ok_or("HOME is not set, cannot locate ~/.hex")?;
+    Ok(home.join(".hex").join(file))
+}
+
+/// `$HOME`, the root of every user-level path hex reads or writes.
+#[must_use]
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
 }

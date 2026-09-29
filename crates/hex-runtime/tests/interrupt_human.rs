@@ -4,10 +4,9 @@
 //! interrupt flag is process-global, so a test that sets it must not share a
 //! process with tests that run subprocesses. One flag-setting test per binary.
 
-use std::path::Path;
 use std::time::Instant;
 
-use common::temp_root;
+use common::{temp_root, write_graph};
 use hex_proto::EventBody;
 use hex_runtime::config::Config;
 use hex_runtime::{Isolation, Runtime, Status, Workers};
@@ -34,12 +33,6 @@ nodes:
     terminal: succeeded
 accept: { require: [] }
 "#;
-
-fn write_graph(root: &Path, name: &str, source: &str) {
-    let dir = root.join(".hex").join("graphs");
-    std::fs::create_dir_all(&dir).expect("mkdir graphs");
-    std::fs::write(dir.join(format!("{name}.yaml")), source).expect("write graph");
-}
 
 /// The human wait is the one blocking path that never reaches `wait_bounded`,
 /// so it needs (and now has) its own interrupt check. Before it, the request

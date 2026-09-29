@@ -20,12 +20,6 @@ fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
-/// The canonical path as a string, via the shared helper — a feedback line must
-/// never fail to write just because a path could not be resolved.
-fn real(path: &std::path::Path) -> String {
-    hex_runtime::local_log::canonical(path)
-}
-
 /// Append one feedback line to `~/.hex/feedback.jsonl`, creating the directory
 /// and file if needed.
 ///
@@ -38,12 +32,7 @@ pub fn record(message: &str, kind: Option<&str>) -> Result<ExitCode, String> {
     }
     let path = hex_runtime::local_log::path("feedback.jsonl")?;
 
-    // Epoch millis fits u64 for the next ~half-billion years; serde_json has no
-    // native u128, so cast down rather than reach for arbitrary_precision.
-    let ts_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let ts_ms = hex_runtime::journal::now_ms();
     let cwd = std::env::current_dir().unwrap_or_default();
     // `location` is the durable place to debug from: the real project root
     // inside a run, else the cwd. `workdir` is where the attempt physically ran
@@ -53,8 +42,8 @@ pub fn record(message: &str, kind: Option<&str>) -> Result<ExitCode, String> {
     let location = env_opt("HEX_PROJECT_ROOT")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| cwd.clone());
-    let location = real(&location);
-    let workdir = real(&cwd);
+    let location = hex_runtime::local_log::canonical(&location);
+    let workdir = hex_runtime::local_log::canonical(&cwd);
     let project = std::path::Path::new(&location)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

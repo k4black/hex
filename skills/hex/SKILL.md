@@ -46,7 +46,7 @@ starting.
 ```bash
 hex doctor              # are the agent CLIs and this project's checks runnable?
 hex list                # graphs available here (project > user > built-in)
-hex validate <graph>    # schema, references, bounded cycles, a reachable success
+hex validate <graph>    # schema, references, a reachable success
 ```
 
 `doctor` matters because preflight **refuses to start** a run whose agent CLI is missing instead of
@@ -218,11 +218,11 @@ run `failed` (stall detection), so an unfixable check stops burning budget on it
 
 ```yaml
 # .hex/config.yaml
-workers:                    # how to invoke a CLI — plumbing; a graph never names one
-  codex:  { kind: codex }   # kind: codex | claude | pi | opencode | command
-roles:                      # what a graph names
-  implementer: { worker: codex, effort: high }
-  reviewer:    { worker: claude, read_only: true, prompt_append: "Only correctness and security." }
+workers:                    # how to invoke a CLI — plumbing; a graph names a role
+  pi:     { kind: pi }      # kind: codex | claude | pi | opencode | command
+roles:                      # what a graph names. Shipped: claude implements, codex reviews
+  implementer: { worker: claude, effort: high }
+  reviewer:    { worker: pi, model: openrouter/z-ai/glm-5.3, prompt_append: "Only correctness and security." }
 checks:                     # what "green" means HERE. Empty by default.
   test: [cargo, test, --workspace]
 ```
@@ -234,6 +234,11 @@ having verified nothing is the failure mode hex exists to prevent.
 
 Trap: a `roles:` entry **shadows** a same-named `workers:` entry. Never name a scratch worker
 `implementer`/`reviewer`/`planner`/`researcher`.
+
+pi model ids need the provider prefix (`openrouter/…`); a bare id is ambiguous.
+
+`resume` recompiles against the **current** `roles:`. A live run keeps the roles it started with;
+to switch a role's worker or model mid-task, `hex pause`, edit config, then `hex resume`.
 
 ## 9. Write a graph
 
@@ -286,10 +291,10 @@ Rules that bite:
 |---|---|---|
 | top | `version` `name` `entry` `nodes` | required (`version` defaults to 1) |
 | top | `description` `example` | shown by `hex list` |
-| `defaults` | `role` `context` `budget` | `context`: `fresh` (default) or `continue` |
+| `defaults` | `role` `context` `budget` | `context`: `fresh` (default) or `continue`; `worker:` is an alias of `role:` (not both) |
 | `budget` | `elapsed` `attempt` `output_tokens` | run-wide, under `defaults:` |
 | node | `budget: { visits: N }` | the only per-node budget; defaults to 5 |
-| `agent` | `prompt` (required) `role` `may_propose` `context` `read_only` | `read_only` is advisory, prompt-enforced |
+| `agent` | `prompt` (required) `role` `may_propose` `context` `read_only` | `read_only` is advisory, prompt-enforced; `worker:` is an alias of `role:` (not both) |
 | `command` | `check:` or `run:`, `mode:` | `mode`: `ordered` (stop at first failure) or `parallel` (run all, fail if any did) |
 | `human` | `prompt` | blocks until `hex respond`; **exactly one** outgoing edge |
 | `terminal` | `succeeded` or `failed` **only** | the other dispositions are outcomes hex assigns |
@@ -330,7 +335,7 @@ Durations are humantime: `500ms` `30s` `20m` `2h` `1h30m`. **`m` is minutes, `M`
 |---|---|
 | `hex list`/`runs`/`doctor` show nothing you expect | not in the repo root; hex does not walk up. `cd` there — do **not** add a second config |
 | ``needs check `test`, which this project does not declare`` | add it to `checks:`, or use a literal `run:` step. If it *is* declared, you are in the wrong directory |
-| ``worker `x` cannot resume a session`` | `context: continue` on a worker without sessions — use `fresh`, or bind the role to codex/claude |
+| ``worker `x` cannot resume a session`` | `context: continue` on a worker without sessions — use `fresh`, or bind the role to codex, claude or pi |
 | ``unknown field `argv`, expected `kind`, `model`, `command`, `result``` | a config typo; every struct denies unknown fields |
 | a worker runs the wrong agent | a `roles:` entry shadowed your `workers:` entry — rename the worker |
 | ``no verdict in the final message (expected: …)`` | the agent did not end with `VERDICT: <signal>`; restate the outcome you expect in the prompt |
@@ -342,7 +347,7 @@ Durations are humantime: `500ms` `30s` `20m` `2h` `1h30m`. **`m` is minutes, `M`
 | exit 1 but the work looks fine | with `review`, `changes_requested` *is* a failure terminal — read the final message |
 | run is `running` but idle | `hex status` shows the in-flight attempt; if the process died, `hex resume` continues it |
 
-## Known broken (checked 2026-09-13)
+## Known broken
 
 - **`budget.output_tokens` has no end-to-end test** — no fake worker reports usage, so enforcement
   is covered by unit tests only.

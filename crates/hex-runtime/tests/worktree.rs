@@ -4,10 +4,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use common::{sh, temp_root, write_graph};
 use hex_runtime::config::Config;
 use hex_runtime::worktree;
 use hex_runtime::{Isolation, Runtime, Workers};
 use hex_worker::CommandWorker;
+
+mod common;
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -26,12 +29,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 /// A fresh temp git repo with one commit and a `.gitignore` ignoring `deps/`.
 fn temp_repo(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "hex-wt-{tag}-{}-{}",
-        std::process::id(),
-        hex_runtime::journal::now_ms()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
+    let root = temp_root(&format!("wt-{tag}"));
     git(&root, &["init", "-q", "-b", "main"]);
     git(&root, &["config", "user.email", "t@t.test"]);
     git(&root, &["config", "user.name", "t"]);
@@ -46,22 +44,17 @@ fn temp_repo(tag: &str) -> PathBuf {
 /// Serializes every test that asserts *which* pool slot is leased: `lease` takes
 /// the first slot it can lock, so "slot 0 is reused" only holds when no sibling
 /// test is leasing concurrently. Not root-caused, and not a product bug — see
-/// AGENTS.md gotcha 24.
+/// AGENTS.md gotcha 26.
 fn pool_shape_gate() -> std::sync::MutexGuard<'static, ()> {
     static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GATE.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn sh(script: &str) -> Vec<String> {
-    vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()]
-}
-
 #[test]
 fn resolve_base_returns_head_sha_and_rejects_unknown_refs() {
     let root = temp_repo("resolve");
-    let (base_ref, sha) = worktree::resolve_base(&root, None).expect("HEAD resolves");
-    assert_eq!(base_ref, "HEAD");
+    let sha = worktree::resolve_base(&root, None).expect("HEAD resolves");
     assert_eq!(sha.len(), 40, "full sha: {sha}");
     assert!(worktree::resolve_base(&root, Some("no-such-ref")).is_err());
 }
@@ -79,7 +72,7 @@ fn ensure_gitignored_is_idempotent() {
 fn lease_creates_then_reuses_the_same_slot_when_clean() {
     let _gate = pool_shape_gate();
     let root = temp_repo("reuse");
-    let (_, sha) = worktree::resolve_base(&root, None).unwrap();
+    let sha = worktree::resolve_base(&root, None).unwrap();
 
     let first = worktree::lease(&root, "hex/r1", &sha).unwrap();
     assert!(first.warmup_needed, "fresh slot wants warmup");
@@ -105,7 +98,7 @@ fn lease_creates_then_reuses_the_same_slot_when_clean() {
 fn parallel_lease_grows_the_pool() {
     let _gate = pool_shape_gate();
     let root = temp_repo("parallel");
-    let (_, sha) = worktree::resolve_base(&root, None).unwrap();
+    let sha = worktree::resolve_base(&root, None).unwrap();
     // Hold the first lease while leasing again → a second slot must be created.
     let a = worktree::lease(&root, "hex/a", &sha).unwrap();
     let b = worktree::lease(&root, "hex/b", &sha).unwrap();
@@ -117,7 +110,7 @@ fn parallel_lease_grows_the_pool() {
 fn dirty_slot_is_reclaimed_and_deps_survive() {
     let _gate = pool_shape_gate();
     let root = temp_repo("reclaim");
-    let (_, sha) = worktree::resolve_base(&root, None).unwrap();
+    let sha = worktree::resolve_base(&root, None).unwrap();
 
     let first = worktree::lease(&root, "hex/r1", &sha).unwrap();
     let slot = first.dir.clone();
@@ -150,7 +143,7 @@ fn dirty_slot_is_reclaimed_and_deps_survive() {
 fn reattach_recreates_a_missing_checkout_from_the_branch() {
     let _gate = pool_shape_gate();
     let root = temp_repo("reattach");
-    let (_, sha) = worktree::resolve_base(&root, None).unwrap();
+    let sha = worktree::resolve_base(&root, None).unwrap();
     let leased = worktree::lease(&root, "hex/r1", &sha).unwrap();
     let dir = leased.dir.clone();
     drop(leased);
@@ -172,7 +165,7 @@ fn reattach_recreates_a_missing_checkout_from_the_branch() {
 fn run_warmup_runs_argv_and_propagates_failure() {
     let _gate = pool_shape_gate();
     let root = temp_repo("warmup");
-    let (_, sha) = worktree::resolve_base(&root, None).unwrap();
+    let sha = worktree::resolve_base(&root, None).unwrap();
     let slot = worktree::lease(&root, "hex/r1", &sha).unwrap();
     let logdir = root.join(".hex");
     std::fs::create_dir_all(&logdir).unwrap();
@@ -199,9 +192,7 @@ nodes:
 accept: { require: [] }
 "#;
     let root = temp_repo("e2e");
-    let gdir = root.join(".hex/graphs");
-    std::fs::create_dir_all(&gdir).unwrap();
-    std::fs::write(gdir.join("wt.yaml"), GRAPH).unwrap();
+    write_graph(&root, "wt", GRAPH);
 
     // The worker records its cwd (the slot) as the result, then reports its
     // verdict — both in the captured message, since `result: file` reads only
@@ -268,7 +259,7 @@ accept: { require: [] }
 fn release_slot_keeps_a_slot_reused_by_another_branch() {
     let _gate = pool_shape_gate();
     let root = temp_repo("release-branch");
-    let (_, base_sha) = worktree::resolve_base(&root, None).expect("base");
+    let base_sha = worktree::resolve_base(&root, None).expect("base");
     let slot = worktree::lease(&root, "hex/old-run", &base_sha).expect("lease");
     let dir = slot.dir.clone();
     drop(slot); // the lease lock is gone, as after a pause or a finished run

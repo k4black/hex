@@ -45,7 +45,7 @@ impl Workers {
     ///   can be used directly;
     /// - every **role** under the role's name, built from the worker it binds plus
     ///   that role's `model`/`effort`. This is what a graph normally names
-    ///   (`worker: reviewer`), and it is why two roles can share one CLI while
+    ///   (`role: reviewer`), and it is why two roles can share one CLI while
     ///   differing in model, effort and prompt.
     ///
     /// Roles are registered last, so a role wins a name clash with a worker — the

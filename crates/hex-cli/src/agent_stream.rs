@@ -125,43 +125,69 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    /// The line that made streaming worse than silence: 6 KB of session banner
-    /// listing every installed tool, before the agent has done anything.
+    /// Lines a tail must not show.
     #[test]
-    fn a_session_banner_is_not_shown() {
-        let banner =
-            r#"{"type":"system","subtype":"init","tools":["Task","Bash"],"session_id":"x"}"#;
-        assert_eq!(humanize(banner), None);
-    }
-
-    #[test]
-    fn token_pings_and_rate_limits_are_not_shown() {
-        for noise in [
-            r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":50}"#,
-            r#"{"type":"rate_limit_event","rate_limit_info":{}}"#,
-            r#"{"type":"thread.started","thread_id":"019f"}"#,
-            r#"{"type":"turn.completed","usage":{"input_tokens":1}}"#,
+    fn hidden() {
+        for (case, line) in [
+            // The line that made streaming worse than silence: 6 KB of session
+            // banner listing every installed tool, before the agent did anything.
+            (
+                "session banner",
+                r#"{"type":"system","subtype":"init","tools":["Task","Bash"],"session_id":"x"}"#,
+            ),
+            (
+                "thinking-token ping",
+                r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":50}"#,
+            ),
+            (
+                "rate limit",
+                r#"{"type":"rate_limit_event","rate_limit_info":{}}"#,
+            ),
+            (
+                "codex thread start",
+                r#"{"type":"thread.started","thread_id":"019f"}"#,
+            ),
+            (
+                "codex turn usage",
+                r#"{"type":"turn.completed","usage":{"input_tokens":1}}"#,
+            ),
+            // The final message, which the caller prints in full — showing it
+            // twice is not a tail, it is an echo.
+            (
+                "result object",
+                r#"{"type":"result","result":"all done","total_cost_usd":0.1}"#,
+            ),
+            (
+                "codex reasoning",
+                r#"{"type":"item.completed","item":{"type":"reasoning","text":"..."}}"#,
+            ),
+            ("blank line", "   "),
         ] {
-            assert_eq!(humanize(noise), None, "{noise}");
+            assert_eq!(humanize(line), None, "{case}");
         }
     }
 
-    /// The final result object is the attempt's final message, which the caller
-    /// prints in full — showing it twice is not a tail, it is an echo.
+    /// Lines a tail shows, and as what.
     #[test]
-    fn the_result_object_is_left_to_the_caller() {
-        let result = r#"{"type":"result","result":"all done","total_cost_usd":0.1}"#;
-        assert_eq!(humanize(result), None);
-    }
-
-    #[test]
-    fn claude_prose_comes_through_verbatim() {
-        let line = r#"{"type":"assistant","message":{"content":[
-            {"type":"text","text":"Reading the driver to see how attempts start."}]}}"#;
-        assert_eq!(
-            humanize(line).as_deref(),
-            Some("Reading the driver to see how attempts start.")
-        );
+    fn shown() {
+        for (case, line, want) in [
+            (
+                "claude prose",
+                r#"{"type":"assistant","message":{"content":[
+            {"type":"text","text":"Reading the driver to see how attempts start."}]}}"#,
+                "Reading the driver to see how attempts start.",
+            ),
+            (
+                "codex agent message",
+                r#"{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}"#,
+                "hi",
+            ),
+            // A `kind: command` worker prints plain text and must not be mistaken
+            // for an agent stream and dropped.
+            ("plain output", "running 3 tests", "running 3 tests"),
+        ] {
+            assert_eq!(humanize(line).as_deref(), Some(want), "{case}");
+        }
     }
 
     /// A tool call shows *what it touched*, never its whole input — a Write's
@@ -175,25 +201,6 @@ mod tests {
         let out = humanize(line).expect("a tool line");
         assert_eq!(out, "· Write crates/hex-cli/src/graph_view.rs");
         assert!(!out.contains("thousand"), "the payload stays out: {out}");
-    }
-
-    #[test]
-    fn codex_agent_messages_come_through_and_reasoning_does_not() {
-        let msg = r#"{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}"#;
-        assert_eq!(humanize(msg).as_deref(), Some("hi"));
-        let reasoning = r#"{"type":"item.completed","item":{"type":"reasoning","text":"..."}}"#;
-        assert_eq!(humanize(reasoning), None);
-    }
-
-    /// A `kind: command` worker prints plain text and must not be mistaken for
-    /// an agent stream and dropped.
-    #[test]
-    fn plain_output_passes_through_untouched() {
-        assert_eq!(
-            humanize("running 3 tests").as_deref(),
-            Some("running 3 tests")
-        );
-        assert_eq!(humanize("   ").as_deref(), None);
     }
 
     #[test]

@@ -48,17 +48,12 @@ pub struct Slot {
 }
 
 /// The relative path (from the project root) hex keeps worktree slots under.
-pub const WORKTREES_DIR: &str = ".hex/worktrees";
+pub(crate) const WORKTREES_DIR: &str = ".hex/worktrees";
 
 /// Whether `root` is inside a git working tree.
 #[must_use]
 pub fn is_git_repo(root: &Path) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .is_ok_and(|o| o.status.success())
+    git(root, &["rev-parse", "--is-inside-work-tree"]).is_ok()
 }
 
 /// Run `git -C root <args>`, returning trimmed stdout on success.
@@ -80,13 +75,13 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// Resolve the base ref name and its commit sha. `base` = `None` means `HEAD`.
+/// Resolve the base ref to its commit sha. `base` = `None` means `HEAD`.
 ///
 /// # Errors
 /// Fails if the ref does not resolve to a commit.
-pub fn resolve_base(root: &Path, base: Option<&str>) -> Result<(String, String)> {
+pub fn resolve_base(root: &Path, base: Option<&str>) -> Result<String> {
     let base_ref = base.unwrap_or("HEAD");
-    let sha = git(
+    git(
         root,
         &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
     )
@@ -94,8 +89,7 @@ pub fn resolve_base(root: &Path, base: Option<&str>) -> Result<(String, String)>
         HexError::new(format!(
             "base ref `{base_ref}` does not resolve to a commit"
         ))
-    })?;
-    Ok((base_ref.to_owned(), sha))
+    })
 }
 
 /// Ensure `entry` is present in `<root>/.gitignore`, appending it if missing so a
@@ -104,19 +98,7 @@ pub fn resolve_base(root: &Path, base: Option<&str>) -> Result<(String, String)>
 /// # Errors
 /// Propagates IO failures reading/writing `.gitignore`.
 pub fn ensure_gitignored(root: &Path, entry: &str) -> Result<()> {
-    let path = root.join(".gitignore");
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
-    if current.lines().any(|l| l.trim() == entry) {
-        return Ok(());
-    }
-    let mut next = current;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str(entry);
-    next.push('\n');
-    std::fs::write(&path, next)?;
-    Ok(())
+    crate::init::gitignore(root, &[entry]).map(drop)
 }
 
 /// Lease a pooled slot for `branch`, branching from `base_sha`. Walks slot
@@ -129,10 +111,10 @@ pub fn lease(root: &Path, branch: &str, base_sha: &str) -> Result<Slot> {
     let pool = root.join(WORKTREES_DIR);
     std::fs::create_dir_all(&pool)?;
     for n in 0..1024u32 {
-        let Some(lock) = crate::try_lock_file(&pool.join(format!("{n}.lock")))? else {
+        let dir = pool.join(n.to_string());
+        let Some(lock) = slot_lock(root, &dir)? else {
             continue; // busy — a live run holds this slot
         };
-        let dir = pool.join(n.to_string());
         let (warmup_needed, reclaimed) = if !dir.exists() {
             // Fresh slot: cold deps, warmup wanted. `worktree add` checks the
             // branch out for us.

@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use common::temp_root;
+use common::{sh, temp_root, write_graph};
 use hex_proto::{Actor, Command, Disposition, EventBody};
 use hex_runtime::config::Config;
 use hex_runtime::{Inbox, Isolation, Runtime, Status, Workers};
@@ -58,16 +58,6 @@ nodes:
     terminal: succeeded
 accept: { require: [] }
 "#;
-
-fn write_graph(root: &Path, name: &str, source: &str) {
-    let dir = root.join(".hex").join("graphs");
-    std::fs::create_dir_all(&dir).expect("mkdir graphs");
-    std::fs::write(dir.join(format!("{name}.yaml")), source).expect("write graph");
-}
-
-fn sh(script: &str) -> Vec<String> {
-    vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()]
-}
 
 /// A shell snippet that queues `json` in the *running* run's control inbox,
 /// temp-then-rename, exactly as `hex pause`/`hex cancel` do. The run dir is
@@ -142,27 +132,51 @@ fn only_run_dir(root: &Path) -> PathBuf {
         .expect("one run")
 }
 
-/// A cancel queued while the run is live must actually stop it. Before the
-/// inbox, `Runtime::cancel` refused outright: the driver holds the journal's
-/// single write lock, so the only honest way in is to ask the holder.
-#[test]
-fn a_cancel_command_ends_a_live_run() {
-    let root = temp_root("cancel");
-    write_graph(&root, "cl", LOOP_GRAPH);
-    let runtime = Runtime::with_workers(
-        root.clone(),
+/// A `LOOP_GRAPH` runtime whose implementer queues `command` (the JSON value of
+/// the envelope's `command` field) from inside its own attempt, then reports
+/// `ready`; the reviewer runs `reviewer`.
+fn loop_runtime(root: &Path, command: &str, reviewer: &str) -> Runtime {
+    write_graph(root, "cl", LOOP_GRAPH);
+    Runtime::with_workers(
+        root.to_path_buf(),
         Config::builtin(),
         workers(&[
             (
                 "implementer",
                 format!(
                     "{}echo 'VERDICT: ready'",
-                    queue(&format!("{{{FROM_OPERATOR},\"command\":\"cancel\"}}"))
+                    queue(&format!("{{{FROM_OPERATOR},\"command\":{command}}}"))
                 ),
             ),
-            ("reviewer", "echo 'VERDICT: approved'".to_owned()),
+            ("reviewer", reviewer.to_owned()),
         ]),
+    )
+}
+
+/// The `APPROVAL_GRAPH` workers: the planner writes `PLAN-A` to its result file,
+/// the builder saves its prompt and reports `ready`.
+fn approval_workers() -> Workers {
+    let mut ws = workers(&[(
+        "builder",
+        "cat > build-prompt.txt; echo 'VERDICT: ready'".to_owned(),
+    )]);
+    ws.insert(
+        "planner",
+        Box::new(
+            CommandWorker::new("planner", sh("printf 'PLAN-A' > \"$HEX_RESULT_FILE\""))
+                .with_result_capture(Some(ResultCapture::File)),
+        ),
     );
+    ws
+}
+
+/// A cancel queued while the run is live must actually stop it. Before the
+/// inbox, `Runtime::cancel` refused outright: the driver holds the journal's
+/// single write lock, so the only honest way in is to ask the holder.
+#[test]
+fn a_cancel_command_ends_a_live_run() {
+    let root = temp_root("cancel");
+    let runtime = loop_runtime(&root, r#""cancel""#, "echo 'VERDICT: approved'");
 
     let report = runtime
         .start("cl", None, None, &Isolation::Shared)
@@ -198,21 +212,7 @@ fn a_cancel_command_ends_a_live_run() {
 #[test]
 fn pause_returns_without_a_terminal_and_resume_continues_the_same_run() {
     let root = temp_root("pause");
-    write_graph(&root, "cl", LOOP_GRAPH);
-    let runtime = Runtime::with_workers(
-        root.clone(),
-        Config::builtin(),
-        workers(&[
-            (
-                "implementer",
-                format!(
-                    "{}echo 'VERDICT: ready'",
-                    queue(&format!("{{{FROM_OPERATOR},\"command\":\"pause\"}}"))
-                ),
-            ),
-            ("reviewer", "echo 'VERDICT: approved'".to_owned()),
-        ]),
-    );
+    let runtime = loop_runtime(&root, r#""pause""#, "echo 'VERDICT: approved'");
 
     let report = runtime
         .start("cl", None, None, &Isolation::Shared)
@@ -264,26 +264,10 @@ fn pause_returns_without_a_terminal_and_resume_continues_the_same_run() {
 #[test]
 fn steer_text_reaches_the_next_attempts_prompt() {
     let root = temp_root("steer");
-    write_graph(&root, "cl", LOOP_GRAPH);
-    let runtime = Runtime::with_workers(
-        root.clone(),
-        Config::builtin(),
-        workers(&[
-            (
-                "implementer",
-                format!(
-                    "{}echo 'VERDICT: ready'",
-                    queue(&format!(
-                        "{{{FROM_OPERATOR},\"command\":{{\"steer\":{{\"text\":\"USE-THE-V2-API\"}}}}}}"
-                    ))
-                ),
-            ),
-            // No `{prompt}` in the argv, so the resolved prompt arrives on stdin.
-            (
-                "reviewer",
-                "cat > review-prompt.txt; echo 'VERDICT: approved'".to_owned(),
-            ),
-        ]),
+    let runtime = loop_runtime(
+        &root,
+        r#"{"steer":{"text":"USE-THE-V2-API"}}"#,
+        "cat > review-prompt.txt; echo 'VERDICT: approved'",
     );
 
     let report = runtime
@@ -318,20 +302,7 @@ fn a_human_node_blocks_until_answered_and_its_answer_becomes_the_node_result() {
     let root = temp_root("human");
     write_graph(&root, "ap", APPROVAL_GRAPH);
 
-    // The builder is a standard text-capture script worker; the planner writes
-    // its plan to the result file instead of printing it.
-    let mut ws = workers(&[(
-        "builder",
-        "cat > build-prompt.txt; echo 'VERDICT: ready'".to_owned(),
-    )]);
-    ws.insert(
-        "planner",
-        Box::new(
-            CommandWorker::new("planner", sh("printf 'PLAN-A' > \"$HEX_RESULT_FILE\""))
-                .with_result_capture(Some(ResultCapture::File)),
-        ),
-    );
-    let runtime = Runtime::with_workers(root.clone(), Config::builtin(), ws);
+    let runtime = Runtime::with_workers(root.clone(), Config::builtin(), approval_workers());
 
     let operator = answer_when_asked(
         &root,
@@ -388,20 +359,7 @@ fn a_respond_and_a_steer_queued_together_both_apply() {
     let root = temp_root("batch");
     write_graph(&root, "ap", APPROVAL_GRAPH);
 
-    // The builder is a standard text-capture script worker; the planner writes
-    // its plan to the result file instead of printing it.
-    let mut ws = workers(&[(
-        "builder",
-        "cat > build-prompt.txt; echo 'VERDICT: ready'".to_owned(),
-    )]);
-    ws.insert(
-        "planner",
-        Box::new(
-            CommandWorker::new("planner", sh("printf 'PLAN-A' > \"$HEX_RESULT_FILE\""))
-                .with_result_capture(Some(ResultCapture::File)),
-        ),
-    );
-    let runtime = Runtime::with_workers(root.clone(), Config::builtin(), ws);
+    let runtime = Runtime::with_workers(root.clone(), Config::builtin(), approval_workers());
 
     let operator = answer_when_asked(
         &root,
@@ -443,25 +401,10 @@ fn a_respond_and_a_steer_queued_together_both_apply() {
 #[test]
 fn a_respond_with_no_human_waiting_is_journaled_as_ignored() {
     let root = temp_root("stray-respond");
-    write_graph(&root, "cl", LOOP_GRAPH);
-    let runtime = Runtime::with_workers(
-        root.clone(),
-        Config::builtin(),
-        workers(&[
-            (
-                "implementer",
-                format!(
-                    "{}echo 'VERDICT: ready'",
-                    queue(&format!(
-                        "{{{FROM_OPERATOR},\"command\":{{\"respond\":{{\"text\":\"yes\"}}}}}}"
-                    ))
-                ),
-            ),
-            (
-                "reviewer",
-                "cat > review-prompt.txt; echo 'VERDICT: approved'".to_owned(),
-            ),
-        ]),
+    let runtime = loop_runtime(
+        &root,
+        r#"{"respond":{"text":"yes"}}"#,
+        "cat > review-prompt.txt; echo 'VERDICT: approved'",
     );
 
     let report = runtime
@@ -491,21 +434,7 @@ fn a_respond_with_no_human_waiting_is_journaled_as_ignored() {
 #[test]
 fn cancelling_a_crashed_run_closes_its_orphaned_attempt() {
     let root = temp_root("crashed-cancel");
-    write_graph(&root, "cl", LOOP_GRAPH);
-    let runtime = Runtime::with_workers(
-        root.clone(),
-        Config::builtin(),
-        workers(&[
-            (
-                "implementer",
-                format!(
-                    "{}echo 'VERDICT: ready'",
-                    queue(&format!("{{{FROM_OPERATOR},\"command\":\"pause\"}}"))
-                ),
-            ),
-            ("reviewer", "echo 'VERDICT: approved'".to_owned()),
-        ]),
-    );
+    let runtime = loop_runtime(&root, r#""pause""#, "echo 'VERDICT: approved'");
     let report = runtime
         .start("cl", None, None, &Isolation::Shared)
         .expect("run");
@@ -557,21 +486,7 @@ fn cancelling_a_crashed_run_closes_its_orphaned_attempt() {
 #[test]
 fn cancel_of_an_idle_run_is_recorded_directly() {
     let root = temp_root("idle-cancel");
-    write_graph(&root, "cl", LOOP_GRAPH);
-    let runtime = Runtime::with_workers(
-        root.clone(),
-        Config::builtin(),
-        workers(&[
-            (
-                "implementer",
-                format!(
-                    "{}echo 'VERDICT: ready'",
-                    queue(&format!("{{{FROM_OPERATOR},\"command\":\"pause\"}}"))
-                ),
-            ),
-            ("reviewer", "echo 'VERDICT: approved'".to_owned()),
-        ]),
-    );
+    let runtime = loop_runtime(&root, r#""pause""#, "echo 'VERDICT: approved'");
     // Pause it first, so the run exists, is unfinished, and has no driver.
     let report = runtime
         .start("cl", None, None, &Isolation::Shared)

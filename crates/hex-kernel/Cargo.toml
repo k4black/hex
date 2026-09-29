@@ -1,6 +1,6 @@
 [package]
 name = "hex-kernel"
-description = "hex: pure deterministic kernel — graph IR, journal model, projections, reduce/schedule/accept"
+description = "hex: pure deterministic kernel — graph IR, journal model, projections, reduce + schedule"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

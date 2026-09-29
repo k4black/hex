@@ -14,6 +14,7 @@ pub mod control;
 pub mod doctor;
 pub mod driver;
 pub mod error;
+mod init;
 pub mod interrupt;
 pub mod journal;
 pub mod loader;
@@ -31,9 +32,10 @@ pub use driver::{AttemptView, NodeProgress, NodeState, ProgressSink};
 pub use error::{HexError, Result};
 pub use hex_kernel::graph::NodeKind;
 pub use hex_kernel::graph::{Budget, Context, Node, NodeSpec};
-pub use hex_kernel::topology::{Cycle, EdgeClass, Topology, Transition};
-pub use hex_kernel::{Graph, RunState, Status, Totals, Usage};
-pub use hex_proto::{Actor, Command, Disposition, Event, EventBody, ModelUsage, PROTOCOL_VERSION};
+pub use hex_kernel::topology::{EdgeClass, Topology, Transition};
+pub use hex_kernel::{Graph, Status, Totals, Usage};
+pub use hex_proto::{Actor, Command, Disposition, Event, EventBody, ModelUsage};
+pub use init::{InitReport, init};
 pub use preset::{Entry as GraphEntry, Layer};
 pub use workers::Workers;
 pub use worktree::Isolation;
@@ -42,6 +44,7 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use config::Config;
 use driver::{Session, check_workers, graph_hash};
@@ -71,7 +74,7 @@ pub struct RunReport {
 }
 
 /// What `hex prune` removed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct PruneReport {
     /// Run ids whose directories were removed.
     pub removed: Vec<String>,
@@ -151,6 +154,10 @@ pub struct StatusReport {
     /// That node's question, so the thing you have to answer is on screen with the
     /// fact that you have to answer it.
     pub question: Option<String>,
+    /// Why a finished run ended, when the journal says: the `Note` recorded just
+    /// before `RunFinished` (a budget bound, an unmet acceptance) or the
+    /// terminal `AttemptFailed`'s reason. `None` while the run is unfinished.
+    pub why: Option<String>,
 }
 
 /// How far a follower has read each of an attempt's streams.
@@ -174,6 +181,84 @@ impl StreamCursor {
         runtime.read_streams(run_id, attempt_id, &mut cursor)?;
         Ok(cursor)
     }
+}
+
+/// One attempt's captured streams, as an opaque handle — what
+/// [`Runtime::read_streams`] reads, for a client (the live preview) that holds an
+/// [`AttemptView`] rather than a run id. The paths inside are the runtime's
+/// business.
+#[derive(Debug, Clone, Default)]
+pub struct AttemptStreams {
+    dir: PathBuf,
+}
+
+impl AttemptStreams {
+    pub(crate) fn of(run_dir: &Path, attempt_id: &str) -> Self {
+        Self {
+            dir: run_dir.join("attempts").join(attempt_id),
+        }
+    }
+
+    /// Everything appended since `cursor`: the attempt's own stdout/stderr
+    /// **and** both streams of every numbered step directory a `command` node
+    /// writes, in declared position.
+    ///
+    /// # Errors
+    /// Fails if a stream exists but cannot be read.
+    pub fn read(&self, cursor: &mut StreamCursor) -> Result<Vec<StreamChunk>> {
+        let mut chunks = Vec::new();
+        for path in attempt_streams(&self.dir) {
+            let label = stream_label(&self.dir, &path);
+            let offset = cursor.offsets.entry(path.clone()).or_insert(0);
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let len = meta.len();
+            // A shorter file means it was truncated (a re-attempt clears its logs);
+            // leaving the cursor past the end would go silent forever.
+            if len < *offset {
+                *offset = 0;
+            }
+            if len == *offset {
+                continue;
+            }
+            // Read exactly the bytes we accounted for. Reading to EOF instead would
+            // print anything a concurrent writer appended *after* the length was
+            // sampled while advancing the cursor only to the sampled length — so
+            // the next read would print those bytes a second time.
+            let mut bytes = read_span(&path, *offset, len - *offset)?;
+            // A read boundary can split a multi-byte char; hold its first bytes
+            // back for the next read instead of decoding them as U+FFFD.
+            bytes.truncate(bytes.len() - incomplete_utf8_tail(&bytes));
+            *offset += bytes.len() as u64;
+            if !bytes.is_empty() {
+                chunks.push(StreamChunk {
+                    label,
+                    text: String::from_utf8_lossy(&bytes).into_owned(),
+                });
+            }
+        }
+        Ok(chunks)
+    }
+}
+
+/// How many trailing bytes of `buf` begin a UTF-8 sequence that is not complete
+/// yet (0 when the buffer ends on a boundary).
+fn incomplete_utf8_tail(buf: &[u8]) -> usize {
+    for back in 1..=buf.len().min(3) {
+        let b = buf[buf.len() - back];
+        if b & 0xC0 == 0x80 {
+            continue; // a continuation byte: keep looking for its lead
+        }
+        let need = match b {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        return if back < need { back } else { 0 };
+    }
+    0
 }
 
 /// Newly appended output from one of an attempt's streams.
@@ -257,7 +342,7 @@ pub struct Runtime {
     root: PathBuf,
     config: Config,
     workers: Workers,
-    sink: Option<Box<dyn ProgressSink>>,
+    sink: Option<Arc<dyn ProgressSink>>,
     /// Whether finished runs append to the user-global `~/.hex/stats.jsonl`.
     /// On for the real constructor, off for `with_workers`: the test suite runs
     /// thousands of mock attempts, and before this gate they all landed in the
@@ -300,7 +385,7 @@ impl Runtime {
     /// start/finish of every attempt during a `run`/`resume`, so a foreground
     /// caller can stream live progress and preview in-flight agent output.
     #[must_use]
-    pub fn with_progress(mut self, sink: Box<dyn ProgressSink>) -> Self {
+    pub fn with_progress(mut self, sink: Arc<dyn ProgressSink>) -> Self {
         self.sink = Some(sink);
         self
     }
@@ -451,9 +536,10 @@ impl Runtime {
         // with the verified hash), not live config. The prompt is verified
         // present and re-substituted at attempt-start.
         let prompt = inputs.get("prompt").map(String::as_str);
-        // Roles come from live config on resume: their preambles are already baked
-        // into the recorded prompts via `checks`-style resolution at creation, and
-        // re-resolving them cannot change the graph's shape.
+        // Roles come from the CURRENT live config, by design (gotcha 18): a live
+        // run keeps the roles it compiled, and pause/stop + resume recompiles
+        // with the updated `roles:` (worker, model, preamble). Role changes
+        // cannot change the graph's shape.
         let graph = self.compile_with(&source, &defaults, &self.config.roles, &checks)?;
         if prompt.is_none() && loader::uses_prompt(&graph) {
             return Err(HexError::new(
@@ -474,33 +560,6 @@ impl Runtime {
     /// # Errors
     /// Fails on resolution/validation, missing workers, or IO errors.
     pub fn start(
-        &self,
-        reference: &str,
-        prompt: Option<&str>,
-        name: Option<&str>,
-        isolation: &Isolation,
-    ) -> Result<RunReport> {
-        self.start_run(reference, prompt, name, isolation)
-    }
-
-    /// Compile `source` and refuse everything that must not reach a run: an
-    /// invalid graph, a missing operator prompt, an unknown worker, an agent CLI
-    /// that is not installed.
-    fn prepare(&self, source: &str, prompt: Option<&str>) -> Result<Graph> {
-        let graph = self.compile(source)?;
-        // A graph that references {{prompt}} in a node prompt needs one at run
-        // time (validate and graph stay lenient).
-        if prompt.is_none() && loader::uses_prompt(&graph) {
-            return Err(HexError::new(
-                "this graph needs a prompt — pass -p/--prompt <text> or -f/--file <path>",
-            ));
-        }
-        check_workers(&graph, &self.workers)?;
-        doctor::preflight(&graph, &self.workers)?;
-        Ok(graph)
-    }
-
-    fn start_run(
         &self,
         reference: &str,
         prompt: Option<&str>,
@@ -562,58 +621,78 @@ impl Runtime {
             self.sink.as_deref(),
         );
 
-        session.record(
-            None,
-            None,
-            Actor::runtime(),
-            EventBody::RunCreated {
-                graph_hash: hash,
-                inputs,
-                defaults: defaults_to_map(&self.config.defaults),
-                checks: resolved_checks(&graph),
-            },
-        )?;
+        let stats_inputs = inputs.clone();
+        session.runtime_event(EventBody::RunCreated {
+            graph_hash: hash,
+            inputs,
+            defaults: defaults_to_map(&self.config.defaults),
+            checks: resolved_checks(&graph),
+        })?;
         // A reclaimed slot discarded a prior run's uncommitted work — record
         // exactly what, in this run's authoritative journal.
         if let Some(report) = slot.as_ref().and_then(|s| s.reclaimed.as_deref())
             && !report.is_empty()
         {
-            session.record(
-                None,
-                None,
-                Actor::runtime(),
-                EventBody::Note {
-                    text: format!(
-                        "worktree slot reclaimed; discarded a prior run's uncommitted changes:\n{report}"
-                    ),
-                },
-            )?;
+            session.runtime_event(EventBody::Note {
+                text: format!(
+                    "worktree slot reclaimed; discarded a prior run's uncommitted changes:\n{report}"
+                ),
+            })?;
         }
-        session.record(None, None, Actor::runtime(), EventBody::RunStarted)?;
+        session.runtime_event(EventBody::RunStarted)?;
 
         let disposition = session.drive()?;
-        // Record the run's cross-repo facts at RunFinished only — a paused run's
-        // line is written by whichever resume finishes it. Best-effort:
-        // telemetry must never fail a run.
-        if let Some(d) = disposition
-            && self.stats
-        {
-            let branch = slot.as_ref().map(|s| s.branch.clone());
-            stats::record_run(
-                &self.root,
-                &graph.name,
-                &resolved.origin,
-                branch.as_deref(),
-                d,
-                session.state(),
-            );
-        }
+        self.record_stats(&graph, Some(&stats_inputs), disposition, session.state());
         drop(slot); // release the worktree lock only after the run finishes
         Ok(RunReport {
             run_id,
             origin: resolved.origin,
             disposition,
         })
+    }
+
+    /// Append the run's cross-repo stats line — at `RunFinished` only, so a
+    /// paused run (`disposition` `None`) writes nothing and whichever resume
+    /// finishes it writes the one line; visits are cumulative, so one finished
+    /// run folds to one line. Origin and branch come from the `RunCreated`
+    /// inputs, so a resumed or cancelled run keeps its original classification.
+    /// Best-effort: telemetry must never fail a run.
+    fn record_stats(
+        &self,
+        graph: &Graph,
+        inputs: Option<&BTreeMap<String, String>>,
+        disposition: Option<Disposition>,
+        state: &State,
+    ) {
+        let Some(d) = disposition.filter(|_| self.stats) else {
+            return;
+        };
+        let get = |key: &str| inputs.and_then(|i| i.get(key)).map(String::as_str);
+        stats::record_run(
+            &self.root,
+            &graph.name,
+            get(ORIGIN).unwrap_or("unknown"),
+            get(WT_BRANCH),
+            d,
+            state,
+        );
+    }
+
+    /// Compile `source` and refuse everything that must not reach a run: an
+    /// invalid graph, a missing operator prompt, an unknown worker, an agent CLI
+    /// that is not installed.
+    fn prepare(&self, source: &str, prompt: Option<&str>) -> Result<Graph> {
+        let graph = self.compile(source)?;
+        // A graph that references {{prompt}} in a node prompt needs one at run
+        // time (validate and graph stay lenient).
+        if prompt.is_none() && loader::uses_prompt(&graph) {
+            return Err(HexError::new(
+                "this graph needs a prompt — pass -p/--prompt <text> or -f/--file <path>",
+            ));
+        }
+        check_workers(&graph, &self.workers)?;
+        doctor::preflight(&graph, &self.workers)?;
+        Ok(graph)
     }
 
     /// Lease and prime a worktree slot for a run. Fails closed outside a git repo.
@@ -629,8 +708,8 @@ impl Runtime {
                 "`--worktree` requires the project to be a git repository",
             ));
         }
-        worktree::ensure_gitignored(&self.root, ".hex/worktrees/")?;
-        let (_base_ref, base_sha) = worktree::resolve_base(&self.root, base)?;
+        worktree::ensure_gitignored(&self.root, &format!("{}/", worktree::WORKTREES_DIR))?;
+        let base_sha = worktree::resolve_base(&self.root, base)?;
         let branch = format!("hex/{run_id}");
         let slot = worktree::lease(&self.root, &branch, &base_sha)?;
         if slot.warmup_needed && !init.is_empty() {
@@ -663,11 +742,6 @@ impl Runtime {
         let created = run_created(&events);
         let inputs = created.as_ref().map(|(_, inputs, _, _)| inputs);
         let prompt = inputs.and_then(|i| i.get("prompt").cloned());
-        // The origin recorded at creation, so a resumed built-in still counts as
-        // one. Runs older than the key fall back to a marker.
-        let origin = inputs
-            .and_then(|i| i.get(ORIGIN).cloned())
-            .unwrap_or_else(|| format!("resume:{run_id}"));
         let mut workdir = self.root.clone();
         let mut worktree_ctx = None;
         // Held for the run's duration (released on drop / crash); never read.
@@ -698,9 +772,6 @@ impl Runtime {
         check_workers(&graph, &self.workers)?;
         doctor::preflight(&graph, &self.workers)?;
 
-        // Captured before `worktree_ctx` moves into the session; the stats line
-        // written at the end still needs them.
-        let resumed_branch = worktree_ctx.as_ref().map(|c| c.branch.clone());
         let mut session = Session::new(
             &graph,
             &self.workers,
@@ -725,13 +796,13 @@ impl Runtime {
 
         // Crashed after RunCreated but before RunStarted: activate the entry.
         if matches!(session.state().status, Status::Created) {
-            session.record(None, None, Actor::runtime(), EventBody::RunStarted)?;
+            session.runtime_event(EventBody::RunStarted)?;
         }
 
         // Paused by an operator: lift the pause before scheduling, so the journal
         // shows the suspension being ended rather than silently ignored.
         if matches!(session.state().status, Status::Paused) {
-            session.record(None, None, Actor::runtime(), EventBody::RunResumed)?;
+            session.runtime_event(EventBody::RunResumed)?;
         }
 
         // Orphaned attempt (started, no terminal): mark it interrupted — with
@@ -748,20 +819,7 @@ impl Runtime {
         }
 
         let disposition = session.drive()?;
-        // At RunFinished only, like `start`: a pause writes no line, and the
-        // visits are cumulative, so one finished run folds to one line.
-        if let Some(d) = disposition
-            && self.stats
-        {
-            stats::record_run(
-                &self.root,
-                &graph.name,
-                &origin,
-                resumed_branch.as_deref(),
-                d,
-                session.state(),
-            );
-        }
+        self.record_stats(&graph, inputs, disposition, session.state());
         Ok(RunReport {
             run_id: run_id.to_owned(),
             origin: format!("resume:{run_id}"),
@@ -836,6 +894,7 @@ impl Runtime {
             pending_steer: state.pending_steer.clone(),
             asked: state.asked.clone(),
             question,
+            why: state.is_finished().then(|| terminal_why(&events)).flatten(),
         })
     }
 
@@ -860,37 +919,10 @@ impl Runtime {
         // The attempt id comes from the journal, never from an operator, but it
         // still ends up in a path — so it gets the same grammar check as a run id.
         validate_run_id(attempt_id)?;
-        let dir = self.run_dir(run_id)?.join("attempts").join(attempt_id);
-        let mut chunks = Vec::new();
-        for path in attempt_streams(&dir) {
-            let label = stream_label(&dir, &path);
-            let offset = cursor.offsets.entry(path.clone()).or_insert(0);
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
-            let len = meta.len();
-            // A shorter file means it was truncated (a re-attempt clears its logs);
-            // leaving the cursor past the end would go silent forever.
-            if len < *offset {
-                *offset = 0;
-            }
-            if len == *offset {
-                continue;
-            }
-            // Read exactly the bytes we accounted for. Reading to EOF instead would
-            // print anything a concurrent writer appended *after* the length was
-            // sampled while advancing the cursor only to the sampled length — so
-            // the next read would print those bytes a second time.
-            let text = read_span(&path, *offset, len - *offset)?;
-            *offset = len;
-            if !text.is_empty() {
-                chunks.push(StreamChunk { label, text });
-            }
-        }
-        Ok(chunks)
+        AttemptStreams::of(&self.run_dir(run_id)?, attempt_id).read(cursor)
     }
 
-    /// Read every event of a run (for `watch`).
+    /// Read every event of a run, unverified.
     ///
     /// # Errors
     /// Fails if the run does not exist.
@@ -961,7 +993,7 @@ impl Runtime {
     ///
     /// A graph names a *role*; which CLI that lands on comes from config and is
     /// the fact a reader of someone else's graph most wants — and the only way
-    /// gotcha 19's role-shadows-worker trap is visible at all.
+    /// gotcha 18's role-shadows-worker trap is visible at all.
     #[must_use]
     pub fn worker_bindings(&self) -> BTreeMap<String, String> {
         self.workers
@@ -991,7 +1023,7 @@ impl Runtime {
         // Read the journal FIRST, before probing the lock. A finished run needs
         // no lock — the terminal event is already there — and the probe is the
         // flaky path: a just-released `fs4` lock intermittently still reads as
-        // busy under load (gotcha 24), which made `hex cancel` right after a run
+        // busy under load (gotcha 26), which made `hex cancel` right after a run
         // ended queue a command instead of recording.
         let journal_path = run_dir.join("events.jsonl");
         if !journal_path.exists() {
@@ -1011,7 +1043,7 @@ impl Runtime {
         // Taking the same exclusive lock a driver holds proves no live process is
         // writing, and holding it makes the append atomic w.r.t. a concurrent
         // resume. A *paused* run has no driver left to hand the command to, so a
-        // busy probe there is usually the fs4 flake (gotcha 24) — retry briefly
+        // busy probe there is usually the fs4 flake (gotcha 26) — retry briefly
         // before believing it. If it stays busy, a real writer (a concurrent
         // `resume`) holds it: queue, never append beside another writer.
         let suspended = matches!(&folded, Ok((_, s)) if matches!(s.status, Status::Paused));
@@ -1061,22 +1093,14 @@ impl Runtime {
             },
         )?;
         // This is the run's one RunFinished, so its stats line is written here.
-        if self.stats {
-            let inputs = run_created(&events).map(|(_, inputs, _, _)| inputs);
-            let get = |key| {
-                inputs
-                    .as_ref()
-                    .and_then(|i: &BTreeMap<_, String>| i.get(key).cloned())
-            };
-            stats::record_run(
-                &self.root,
-                &graph.name,
-                get(ORIGIN).as_deref().unwrap_or("unknown"),
-                get(WT_BRANCH).as_deref(),
-                Disposition::Cancelled,
-                &state,
-            );
-        }
+        self.record_stats(
+            &graph,
+            run_created(&events)
+                .map(|(_, inputs, _, _)| inputs)
+                .as_ref(),
+            Some(Disposition::Cancelled),
+            &state,
+        );
         Ok(Cancellation::Recorded)
     }
 
@@ -1275,6 +1299,32 @@ fn liveness_of(run_dir: &Path, status: &Status) -> (Liveness, bool) {
         // that nobody is driving (which would invite a second writer).
         Err(_) => (Liveness::Live, true),
     }
+}
+
+/// Why a run ended: the terminal cluster's `Note` (what `RecordTerminal` and
+/// `finish` journal just before `RunFinished`) or `AttemptFailed` reason.
+///
+/// Only the *terminal cluster* counts. Scanning the whole journal for the last
+/// note instead would surface a stale one: a run whose check failed on round one
+/// and passed on round two would end `succeeded` while reporting "1 of 3 steps
+/// failed" as its reason.
+fn terminal_why(events: &[Event]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .take_while(|e| {
+            matches!(
+                e.body,
+                EventBody::Note { .. }
+                    | EventBody::RunFinished { .. }
+                    | EventBody::AttemptFailed { .. }
+            )
+        })
+        .find_map(|e| match &e.body {
+            EventBody::Note { text } => Some(text.clone()),
+            EventBody::AttemptFailed { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
 }
 
 /// The run's creation record — hash, inputs, and effective defaults — read in a
@@ -1511,14 +1561,14 @@ fn stream_label(attempt_dir: &Path, path: &Path) -> String {
         .into_owned()
 }
 
-/// Exactly `len` bytes of `path` starting at `offset`, lossily decoded.
-fn read_span(path: &Path, offset: u64, len: u64) -> Result<String> {
+/// Exactly `len` bytes of `path` starting at `offset`.
+fn read_span(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut buf = Vec::new();
     file.take(len).read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(buf)
 }
 
 /// Total bytes under `dir`, best-effort (an unreadable entry counts as 0).
@@ -1542,17 +1592,27 @@ fn dir_size(dir: &Path) -> u64 {
     total
 }
 
-/// The project root for a runtime: the current working directory.
-///
-/// # Errors
-/// Fails if the current directory cannot be read.
-pub fn project_root() -> Result<PathBuf> {
-    std::env::current_dir().map_err(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read that lands mid-codepoint holds the lead bytes back, so a follower
+    /// never prints U+FFFD for a char that was merely split across two polls.
+    #[test]
+    fn a_split_multibyte_char_is_held_for_the_next_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let streams = AttemptStreams::of(dir.path(), "a1");
+        std::fs::create_dir_all(&streams.dir).unwrap();
+        let log = streams.dir.join("stdout.log");
+        let mut cursor = StreamCursor::default();
+        // 'é' is 0xC3 0xA9; the first read sees only its lead byte.
+        std::fs::write(&log, [b'x', 0xC3]).unwrap();
+        let first = streams.read(&mut cursor).unwrap();
+        assert_eq!(first[0].text, "x");
+        std::fs::write(&log, [b'x', 0xC3, 0xA9, b'\n']).unwrap();
+        let second = streams.read(&mut cursor).unwrap();
+        assert_eq!(second[0].text, "é\n");
+    }
 
     #[test]
     fn slug_is_lowercase_kebab() {

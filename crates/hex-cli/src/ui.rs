@@ -143,16 +143,13 @@ impl Ui {
     /// from one match on [`Mark`], so a green `✗` is unrepresentable.
     #[must_use]
     pub fn mark(self, m: Mark) -> String {
-        let (uni, ascii, hue) = match m {
-            Mark::Ok => ("✓", "+", Some(AnsiColor::Green)),
-            Mark::Fail => ("✗", "x", Some(AnsiColor::Red)),
-            Mark::Warn => ("!", "!", Some(AnsiColor::Yellow)),
-            Mark::Running => ("▸", ">", Some(AnsiColor::Cyan)),
-            Mark::Idle => ("·", ".", None),
-        };
-        let style = match hue {
-            Some(c) => Style::new().fg_color(Some(anstyle::Color::Ansi(c))),
-            None => style::DIM,
+        let (uni, ascii, style) = match m {
+            Mark::Ok => ("✓", "+", style::OK),
+            Mark::Fail => ("✗", "x", style::FAIL),
+            Mark::Warn => ("!", "!", style::WARN),
+            // Cyan, the signal colour: live is the state that is still moving.
+            Mark::Running => ("▸", ">", style::SIGNAL),
+            Mark::Idle => ("·", ".", style::DIM),
         };
         self.paint(style, if self.unicode { uni } else { ascii })
             .to_string()
@@ -527,16 +524,24 @@ mod tests {
         }
     }
 
+    /// An explicit `--color` beats everything; under `auto`, machine output and
+    /// pipes are never coloured.
     #[test]
-    fn an_explicit_choice_beats_everything() {
-        assert!(!paint(When::Never, false, true));
-        assert!(paint(When::Always, true, false), "even --json");
-    }
-
-    #[test]
-    fn machine_output_and_pipes_are_never_coloured() {
-        assert!(!paint(When::Auto, true, true), "--json");
-        assert!(!paint(When::Auto, false, false), "not a tty");
+    fn colour_policy() {
+        for (case, when, json, tty, want) in [
+            ("never beats a tty", When::Never, false, true, false),
+            (
+                "always beats --json and a pipe",
+                When::Always,
+                true,
+                false,
+                true,
+            ),
+            ("auto --json", When::Auto, true, true, false),
+            ("auto into a pipe", When::Auto, false, false, false),
+        ] {
+            assert_eq!(paint(when, json, tty), want, "{case}");
+        }
     }
 
     /// Styling must never change a column's width, or a coloured table and a

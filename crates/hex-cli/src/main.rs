@@ -13,7 +13,7 @@
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use hex_runtime::{
     Actor, Cancellation, Command as ControlCommand, Disposition, Isolation, Runtime,
 };
@@ -24,8 +24,6 @@ mod agent_stream;
 mod feedback;
 mod graph_view;
 mod preview;
-#[cfg(test)]
-mod test_support;
 mod ui;
 use hex_runtime::Layer;
 
@@ -115,17 +113,8 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
         /// Run in an isolated git worktree, branched from BASE (default HEAD)
-        #[arg(
-            long,
-            value_name = "BASE",
-            num_args = 0..=1,
-            default_missing_value = "",
-            conflicts_with = "no_worktree"
-        )]
+        #[arg(long, value_name = "BASE", num_args = 0..=1, default_missing_value = "")]
         worktree: Option<String>,
-        /// Force the shared workspace (project root), overriding any default
-        #[arg(long)]
-        no_worktree: bool,
         /// Warmup argv run once in a fresh/reclaimed worktree (no shell)
         #[arg(long, value_name = "CMD", requires = "worktree")]
         worktree_init: Option<String>,
@@ -236,8 +225,11 @@ enum GraphFormat {
 fn main() -> ExitCode {
     // clap handles `--help`/`-h`/`--version` and parse/usage errors itself
     // (usage errors exit 2, help/version exit 0), matching the old exit codes.
-    let cli = Cli::parse();
-    match dispatch(cli) {
+    // Parsed in two steps so the stats log gets clap's own canonical verb name
+    // (aliases resolved) instead of a hand-kept match over every variant.
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    match dispatch(cli, matches.subcommand_name().unwrap_or_default()) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("hex: {err}");
@@ -248,7 +240,7 @@ fn main() -> ExitCode {
 
 /// Dispatch a verb. Returns the process exit code; `Err` is a usage/setup
 /// failure (exit 2).
-fn dispatch(cli: Cli) -> Result<ExitCode, String> {
+fn dispatch(cli: Cli, verb: &str) -> Result<ExitCode, String> {
     let json = cli.json;
     let Some(command) = cli.command else {
         // Bare `hex` is a usage error, so render clap's own help — byte-for-byte
@@ -263,7 +255,6 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
     // The observation verbs (`status`, `logs`, `wait`, `runs`, `stats`) are the
     // ones agents poll in a loop — logging them grows the file with poll
     // frequency instead of with work done, which breaks the fold-on-read ceiling.
-    let verb = command_verb(&command);
     if !matches!(verb, "init" | "status" | "logs" | "wait" | "runs" | "stats") {
         hex_runtime::stats::record_cli(
             verb,
@@ -286,14 +277,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             file,
             name,
             worktree,
-            no_worktree,
             worktree_init,
             no_preview,
         } => cmd_run(
             graph.as_deref(),
-            resolve_prompt(&prompt, &file)?,
+            resolve_prompt(prompt, file.as_deref())?,
             name.as_deref(),
-            isolation_from(worktree.as_deref(), no_worktree, worktree_init.as_deref()),
+            isolation_from(worktree.as_deref(), worktree_init.as_deref()),
             json,
             no_preview,
             ui::Ui::stdout(cli.color, json),
@@ -335,31 +325,6 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
     }
 }
 
-/// The canonical verb name for the stats log — stable, lowercase, the same word
-/// the CLI accepts.
-fn command_verb(command: &Command) -> &'static str {
-    match command {
-        Command::Init => "init",
-        Command::List => "list",
-        Command::Doctor => "doctor",
-        Command::Validate { .. } => "validate",
-        Command::Graph { .. } => "graph",
-        Command::Run { .. } => "run",
-        Command::Resume { .. } => "resume",
-        Command::Runs => "runs",
-        Command::Status { .. } => "status",
-        Command::Logs { .. } => "logs",
-        Command::Wait { .. } => "wait",
-        Command::Pause { .. } => "pause",
-        Command::Steer { .. } => "steer",
-        Command::Respond { .. } => "respond",
-        Command::Cancel { .. } => "cancel",
-        Command::Feedback { .. } => "feedback",
-        Command::Stats => "stats",
-        Command::Prune { .. } => "prune",
-    }
-}
-
 /// Which class of caller invoked this verb — the coarse fact a run journal
 /// cannot hold. `subgraph` means it ran inside an attempt (the runtime injected
 /// `HEX_RUN_ID`); otherwise a terminal is `interactive` and a pipe or an agent's
@@ -388,7 +353,7 @@ fn operator_actor() -> Actor {
 
 /// Open a runtime rooted at the current directory.
 fn open_runtime() -> Result<Runtime, String> {
-    let root = hex_runtime::project_root().map_err(|e| e.to_string())?;
+    let root = std::env::current_dir().map_err(|e| e.to_string())?;
     Runtime::new(root).map_err(|e| e.to_string())
 }
 
@@ -415,7 +380,7 @@ fn open_runtime_streaming(json: bool, no_preview: bool) -> Result<Runtime, Strin
             "interrupting: stopping the agent and saving progress (press again to force-quit)",
         );
     });
-    Ok(open_runtime()?.with_progress(Box::new(preview::SharedPreview(sink))))
+    Ok(open_runtime()?.with_progress(sink))
 }
 
 /// A one-line rendering of an event for progress output.
@@ -438,145 +403,20 @@ pub(crate) fn event_line(e: &hex_runtime::Event) -> String {
     )
 }
 
-/// The starter `.hex/config.yaml`. Every key is commented out: the built-in layer
-/// (`hex-runtime/src/defaults.yaml`) already supplies working workers and roles,
-/// so an uncommented copy of them here would freeze this machine's defaults into
-/// the repository and stop deep-merge doing its job.
-const CONFIG_TEMPLATE: &str = "\
-# hex project configuration.
-#
-# This is the last of three layers: the built-in defaults (embedded in the `hex`
-# binary), then `~/.config/hex/config.yaml`, then this file. Layers deep-merge per
-# key, so setting `roles.reviewer.model` here keeps the built-in worker, effort,
-# read_only and prompt. Run `hex doctor` to see what the merged result resolves to.
-
-# Project checks: name → argv. **Deliberately empty.**
-#
-# What \"green\" means is your decision, so hex autodetects nothing and ships no
-# commands. Declare a check here and a graph can gate on it as
-# `command: { check: test }`; naming an undeclared check is refused before the run
-# starts, rather than passing silently. Two built-in presets (`tdd`,
-# `implement-until-green`) are a gate, so they need `test` declared.
-#
-#   checks:
-#     test: [cargo, test, --workspace]
-#     lint: [cargo, clippy, --workspace, --all-targets]
-checks: {}
-
-# Roles are what a graph names (`role: reviewer`). Each binds a worker CLI to a
-# model, a reasoning effort, a read-only policy, and a prompt preamble. Override
-# only what should differ from the built-in layer; `prompt_append` extends the
-# inherited preamble, `prompt` replaces it.
-#
-#   roles:
-#     reviewer:
-#       prompt_append: |
-#         This repository's invariants are in AGENTS.md — read it before judging a
-#         design choice.
-
-# Workers are the CLI adapters behind a role — internal plumbing a graph never
-# names directly. `kind` picks the adapter: codex | claude | opencode | command.
-#
-#   workers:
-#     codex:
-#       kind: codex
-";
-
-/// Lines `hex init` adds to `.gitignore`: a run's journal and a worktree slot are
-/// machine-local working state, not source.
-const GITIGNORE_LINES: [&str; 2] = [".hex/runs/", ".hex/worktrees/"];
-
-/// Set the current repository up for hex.
-///
-/// Idempotent by construction: every step reports `created` or `exists` and an
-/// existing `.hex/config.yaml` is never rewritten — the operator's checks and role
-/// overrides are exactly the content a second `hex init` must not be able to lose.
+/// Set the current repository up for hex: the runtime creates the layout, this
+/// renders what it made.
 fn cmd_init(json: bool) -> Result<ExitCode, String> {
-    let root = hex_runtime::project_root().map_err(|e| e.to_string())?;
-    let mut created: Vec<String> = Vec::new();
-    let mut existed: Vec<String> = Vec::new();
-
-    for dir in [root.join(".hex"), root.join(".hex").join("graphs")] {
-        let name = format!("{}/", relative(&root, &dir));
-        if dir.is_dir() {
-            existed.push(name);
-        } else {
-            std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {name}: {e}"))?;
-            created.push(name);
-        }
-    }
-
-    let config = root.join(".hex").join("config.yaml");
-    let config_name = relative(&root, &config);
-    if config.exists() {
-        existed.push(config_name.clone());
-    } else {
-        std::fs::write(&config, CONFIG_TEMPLATE)
-            .map_err(|e| format!("cannot write {config_name}: {e}"))?;
-        created.push(config_name);
-    }
-
-    let gitignore = root.join(".gitignore");
-    // Bytes, not a `String`, and a read failure is fatal rather than "empty".
-    // Treating an unreadable file as empty and then writing our two lines over it
-    // deletes whatever it held — a `.gitignore` with one non-UTF-8 byte in a
-    // comment, or one we lack permission to read, was silently truncated to two
-    // lines. Appending raw bytes also preserves the original exactly.
-    let mut current = match std::fs::read(&gitignore) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => {
-            return Err(format!("cannot read {}: {e}", relative(&root, &gitignore)));
-        }
-    };
-    // Decide what is missing before mutating, so the comparison view and the
-    // buffer are never borrowed at once.
-    let needed: Vec<&str> = {
-        let existing = String::from_utf8_lossy(&current);
-        GITIGNORE_LINES
-            .iter()
-            .copied()
-            .filter(|line| {
-                let present = existing.lines().any(|l| l.trim() == *line);
-                if present {
-                    existed.push(format!(".gitignore:{line}"));
-                }
-                !present
-            })
-            .collect()
-    };
-    let appended = !needed.is_empty();
-    for line in needed {
-        // A file whose last line has no terminator would otherwise get our entry
-        // glued onto it, silently ignoring both patterns.
-        if !current.is_empty() && !current.ends_with(b"\n") {
-            current.push(b'\n');
-        }
-        current.extend_from_slice(line.as_bytes());
-        current.push(b'\n');
-        created.push(format!(".gitignore:{line}"));
-    }
-    // Only touch the file when we have something to add: a second `hex init` must
-    // leave the tree byte-for-byte, mtime included, as it found it.
-    if appended {
-        std::fs::write(&gitignore, &current)
-            .map_err(|e| format!("cannot write .gitignore: {e}"))?;
-    }
-
+    let root = std::env::current_dir().map_err(|e| e.to_string())?;
+    let report = hex_runtime::init(&root).map_err(|e| e.to_string())?;
     if json {
-        outln!(
-            "{}",
-            serde_json::json!({
-                "root": root.display().to_string(),
-                "created": created,
-                "existed": existed,
-            })
-        );
+        let mut v = serde_json::to_value(&report).map_err(|e| e.to_string())?;
+        v["root"] = root.display().to_string().into();
+        outln!("{v}");
     } else {
-        for name in &created {
+        for name in &report.created {
             outln!("created  {name}");
         }
-        for name in &existed {
+        for name in &report.existed {
             outln!("exists   {name}");
         }
         outln!(
@@ -605,20 +445,7 @@ fn cmd_list(json: bool, ui: ui::Ui) -> Result<ExitCode, String> {
 fn print_graph_list(runtime: &Runtime, json: bool, ui: ui::Ui) {
     let graphs = runtime.list_graphs();
     if json {
-        let items: Vec<_> = graphs
-            .iter()
-            .map(|g| {
-                serde_json::json!({
-                    "name": g.name,
-                    "origin": g.origin,
-                    "layer": g.layer.label(),
-                    "shadows": g.shadows,
-                    "description": g.description,
-                    "example": g.example,
-                })
-            })
-            .collect();
-        outln!("{}", serde_json::json!({ "graphs": items }));
+        outln!("{}", serde_json::json!({ "graphs": graphs }));
         return;
     }
     if graphs.is_empty() {
@@ -700,20 +527,7 @@ fn cmd_doctor(json: bool, color: ui::When, ui: ui::Ui) -> Result<ExitCode, Strin
     let runtime = open_runtime()?;
     let report = runtime.doctor();
     if json {
-        let findings = report
-            .findings
-            .iter()
-            .map(|f| {
-                serde_json::json!({
-                    "kind": f.kind,
-                    "name": f.name,
-                    "program": f.program,
-                    "ok": f.ok,
-                    "detail": f.detail,
-                })
-            })
-            .collect::<Vec<_>>();
-        let v = serde_json::json!({ "ok": report.ok(), "findings": findings });
+        let v = serde_json::json!({ "ok": report.ok(), "findings": report.findings });
         outln!("{v}");
     } else if report.findings.is_empty() {
         outln!("no workers or checks configured");
@@ -830,10 +644,7 @@ fn cmd_graph(
     Ok(ExitCode::SUCCESS)
 }
 
-fn isolation_from(worktree: Option<&str>, no_worktree: bool, init: Option<&str>) -> Isolation {
-    if no_worktree {
-        return Isolation::Shared;
-    }
+fn isolation_from(worktree: Option<&str>, init: Option<&str>) -> Isolation {
     match worktree {
         None => Isolation::Shared,
         Some(base) => Isolation::Worktree {
@@ -845,10 +656,6 @@ fn isolation_from(worktree: Option<&str>, no_worktree: bool, init: Option<&str>)
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one verb's flags; a struct would only move them"
-)]
 fn cmd_run(
     reference: Option<&str>,
     prompt: Option<String>,
@@ -957,33 +764,9 @@ impl Payoff {
             .last()
             .map(|a| a.steps.iter().filter(|s| s.failed()).cloned().collect())
             .unwrap_or_default();
-        let events = runtime.events(run_id).unwrap_or_default();
-        // `RecordTerminal` journals its reason as a `Note` immediately before the
-        // terminal, so only the *terminal cluster* counts. Scanning the whole
-        // journal for the last note instead would surface a stale one: a run whose
-        // check failed on round one and passed on round two would end `succeeded`
-        // while printing "1 of 3 steps failed" as its reason.
-        let why = events
-            .iter()
-            .rev()
-            .take_while(|e| {
-                matches!(
-                    e.body,
-                    hex_runtime::EventBody::Note { .. }
-                        | hex_runtime::EventBody::RunFinished { .. }
-                        | hex_runtime::EventBody::AttemptFailed { .. }
-                )
-            })
-            .find_map(|e| match &e.body {
-                hex_runtime::EventBody::Note { text } => Some(text.clone()),
-                hex_runtime::EventBody::AttemptFailed { reason, .. } => Some(reason.clone()),
-                _ => None,
-            });
-        let usage = runtime
-            .status(run_id)
-            .ok()
-            .map(|s| s.usage.total)
-            .filter(|t| t.tokens() > 0);
+        let status = runtime.status(run_id).ok();
+        let why = status.as_ref().and_then(|s| s.why.clone());
+        let usage = status.map(|s| s.usage.total).filter(|t| t.tokens() > 0);
         Self {
             result,
             why,
@@ -1010,16 +793,7 @@ impl Payoff {
             // A check's diagnosis is at the end of its output, not the start.
             let combined = format!("{}{}", step.stdout, step.stderr);
             let lines: Vec<&str> = combined.lines().collect();
-            let start = lines.len().saturating_sub(FAILED_STEP_TAIL_LINES);
-            if start > 0 {
-                outln!(
-                    "{}",
-                    ui.paint(ui::style::DIM, &format!("… {start} earlier line(s)"))
-                );
-            }
-            for line in &lines[start..] {
-                outln!("{}", ui.paint(ui::style::DIM, line));
-            }
+            print_last(&lines, FAILED_STEP_TAIL_LINES, ui);
         }
         if let Some(result) = &self.result {
             outln!("\n── final message ──");
@@ -1163,7 +937,7 @@ fn spend_line(t: &hex_runtime::Totals, ui: ui::Ui) -> String {
 }
 
 /// The glyph for a run's state — the column you scan before reading anything.
-pub(crate) fn mark_for(r: &hex_runtime::RunSummary) -> ui::Mark {
+fn mark_for(r: &hex_runtime::RunSummary) -> ui::Mark {
     use hex_runtime::Liveness;
     match &r.state {
         Liveness::Error(_) => ui::Mark::Warn,
@@ -1184,7 +958,7 @@ pub(crate) fn mark_for(r: &hex_runtime::RunSummary) -> ui::Mark {
 ///
 /// Left uncoloured on purpose: the mark in the first column already carries the
 /// colour, and colour must never be the only thing saying what happened.
-pub(crate) fn result_word(r: &hex_runtime::RunSummary) -> String {
+fn result_word(r: &hex_runtime::RunSummary) -> String {
     use hex_runtime::Liveness;
     match &r.state {
         Liveness::Error(_) => "unreadable".to_owned(),
@@ -1197,7 +971,7 @@ pub(crate) fn result_word(r: &hex_runtime::RunSummary) -> String {
 }
 
 /// A compact "how long ago" for a listing (`3m`, `2h`, `4d`).
-pub(crate) fn age(at_ms: u64) -> String {
+fn age(at_ms: u64) -> String {
     if at_ms == 0 {
         return "-".to_owned();
     }
@@ -1222,20 +996,9 @@ fn cmd_stats(json: bool, ui: ui::Ui) -> Result<ExitCode, String> {
     let path = hex_runtime::local_log::path(hex_runtime::stats::FILE)?;
     let agg = hex_runtime::stats::fold(&path)?;
     if json {
-        outln!(
-            "{}",
-            serde_json::json!({
-                "path": path.display().to_string(),
-                "lines": agg.lines,
-                "verbs": agg.verbs,
-                "graphs": agg.graphs,
-                "repos": agg.repos,
-                "dispositions": agg.dispositions,
-                "nodes": agg.nodes,
-                "worktree_runs": agg.worktree_runs,
-                "shared_runs": agg.shared_runs,
-            })
-        );
+        let mut v = serde_json::to_value(&agg).map_err(|e| e.to_string())?;
+        v["path"] = path.display().to_string().into();
+        outln!("{v}");
         return Ok(ExitCode::SUCCESS);
     }
     if agg.lines == 0 {
@@ -1313,11 +1076,7 @@ fn cmd_prune(older_than: Option<&str>, all: bool, json: bool) -> Result<ExitCode
     if json {
         outln!(
             "{}",
-            serde_json::json!({
-                "removed": report.removed,
-                "kept": report.kept,
-                "bytes": report.bytes,
-            })
+            serde_json::to_value(&report).map_err(|e| e.to_string())?
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -1728,9 +1487,7 @@ fn follow_logs(
                 .map_or(String::new(), |w| format!(" via {w}"));
             outln!("\u{2500}\u{2500} {attempt_id} [{node_id}]{via} \u{2500}\u{2500}");
             let cursor = if attaching {
-                for line in tail_of(runtime, run_id, attempt_id, tail_lines) {
-                    outln!("{}", ui.paint(ui::style::DIM, &line));
-                }
+                print_last(&stream_lines(runtime, run_id, attempt_id), tail_lines, ui);
                 hex_runtime::StreamCursor::at_end(runtime, run_id, attempt_id)
                     .map_err(|e| e.to_string())?
             } else {
@@ -1780,10 +1537,12 @@ fn drain(
     Ok(())
 }
 
-/// The last `lines` lines an attempt has written, across all of its streams.
-fn tail_of(runtime: &Runtime, run_id: &str, attempt_id: &str, lines: usize) -> Vec<String> {
+/// Every line an attempt has written so far, humanized, across all of its
+/// streams — its own two and each command step's — so codex (all stderr) and a
+/// gate (all step dirs) are not silent.
+fn stream_lines(runtime: &Runtime, run_id: &str, attempt_id: &str) -> Vec<String> {
     let mut cursor = hex_runtime::StreamCursor::default();
-    let all: Vec<String> = runtime
+    runtime
         .read_streams(run_id, attempt_id, &mut cursor)
         .unwrap_or_default()
         .iter()
@@ -1793,8 +1552,21 @@ fn tail_of(runtime: &Runtime, run_id: &str, attempt_id: &str, lines: usize) -> V
                 .filter_map(agent_stream::humanize)
                 .collect::<Vec<_>>()
         })
-        .collect();
-    all[all.len().saturating_sub(lines)..].to_vec()
+        .collect()
+}
+
+/// The last `n` of `lines`, dimmed, after a count of what was cut.
+fn print_last<S: AsRef<str>>(lines: &[S], n: usize, ui: ui::Ui) {
+    let start = lines.len().saturating_sub(n);
+    if start > 0 {
+        outln!(
+            "{}",
+            ui.paint(ui::style::DIM, &format!("… {start} earlier line(s)"))
+        );
+    }
+    for line in &lines[start..] {
+        outln!("{}", ui.paint(ui::style::DIM, line.as_ref()));
+    }
 }
 
 /// Lines of a still-running attempt shown by default. Enough to see what the
@@ -1882,7 +1654,16 @@ fn cmd_logs(
                 // "(no final message captured)" over ten lines of live output reads
                 // as "nothing happened". Show its tail instead, and say it is live.
                 None if in_flight.as_deref() == Some(l.attempt_id.as_str()) => {
-                    print_tail(&l.stdout, &l.stderr, tail_lines, ui);
+                    let lines = stream_lines(&runtime, run_id, &l.attempt_id);
+                    if lines.is_empty() {
+                        outln!(
+                            "{}",
+                            ui.paint(ui::style::DIM, "(running; nothing captured yet)")
+                        );
+                    } else {
+                        print_last(&lines, tail_lines, ui);
+                        outln!("{}", ui.paint(ui::style::DIM, "(still running)"));
+                    }
                 }
                 None => outln!(
                     "{}",
@@ -1904,35 +1685,6 @@ fn cmd_logs(
         }
     }
     Ok(ExitCode::SUCCESS)
-}
-
-/// The last `lines` lines of a live attempt's output, across both streams —
-/// codex writes everything to stderr and nothing to stdout, so either alone is
-/// silent for one of the two agents.
-fn print_tail(stdout: &str, stderr: &str, lines: usize, ui: ui::Ui) {
-    let combined: Vec<String> = stdout
-        .lines()
-        .chain(stderr.lines())
-        .filter_map(agent_stream::humanize)
-        .collect();
-    if combined.is_empty() {
-        outln!(
-            "{}",
-            ui.paint(ui::style::DIM, "(running; nothing captured yet)")
-        );
-        return;
-    }
-    let start = combined.len().saturating_sub(lines);
-    if start > 0 {
-        outln!(
-            "{}",
-            ui.paint(ui::style::DIM, &format!("… {start} earlier line(s)"))
-        );
-    }
-    for line in &combined[start..] {
-        outln!("{}", ui.paint(ui::style::DIM, line));
-    }
-    outln!("{}", ui.paint(ui::style::DIM, "(still running)"));
 }
 
 /// Print one captured stream, dimmed, skipping it when it holds nothing worth a
@@ -1994,19 +1746,14 @@ fn cmd_cancel(run_id: &str, json: bool) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Resolve the operator prompt from `-p` (inline) or `-f` (file). At most one
-/// may be given (enforced at parse time; the both-arm is a defensive fallback).
-fn resolve_prompt(
-    prompt: &Option<String>,
-    file: &Option<String>,
-) -> Result<Option<String>, String> {
-    match (prompt, file) {
-        (Some(_), Some(_)) => Err("pass only one of -p/--prompt or -f/--file".to_owned()),
-        (Some(text), None) => Ok(Some(text.clone())),
-        (None, Some(path)) => std::fs::read_to_string(path)
+/// Resolve the operator prompt from `-p` (inline) or `-f` (file). clap's
+/// `conflicts_with` guarantees at most one is given.
+fn resolve_prompt(prompt: Option<String>, file: Option<&str>) -> Result<Option<String>, String> {
+    match file {
+        Some(path) => std::fs::read_to_string(path)
             .map(Some)
             .map_err(|e| format!("cannot read prompt file `{path}`: {e}")),
-        (None, None) => Ok(None),
+        None => Ok(prompt),
     }
 }
 
@@ -2100,18 +1847,13 @@ fn event_summary(body: &hex_runtime::EventBody) -> String {
             cost_micro_usd,
             ..
         } => {
-            let spent = cost_micro_usd
-                .or_else(|| {
-                    // Saturating like every other fold over reported usage: a
-                    // garbled value must not panic the renderer of the event that
-                    // carries it.
-                    let per_model: u64 = models
-                        .iter()
-                        .filter_map(|m| m.cost_micro_usd)
-                        .fold(0u64, u64::saturating_add);
-                    (per_model > 0).then_some(per_model)
-                })
-                .map_or(String::new(), |c| format!(", {}", usd(c)));
+            // An explicit total prints even at zero; a per-model sum only when priced.
+            let cost = hex_runtime::Usage::attempt_cost(models, *cost_micro_usd);
+            let spent = if cost_micro_usd.is_some() || cost > 0 {
+                format!(", {}", usd(cost))
+            } else {
+                String::new()
+            };
             let names: Vec<&str> = models.iter().map(|m| m.model.as_str()).collect();
             format!(
                 "usage {} tokens{spent}{}",
@@ -2137,7 +1879,6 @@ fn event_summary(body: &hex_runtime::EventBody) -> String {
 mod tests {
 
     use super::*;
-    use crate::test_support::unique;
 
     fn parse(xs: &[&str]) -> Result<Cli, clap::Error> {
         let mut v = vec!["hex"];
@@ -2149,10 +1890,8 @@ mod tests {
     /// `-f`, or nothing), through the same parse → `resolve_prompt` path.
     #[test]
     fn a_prompt_comes_from_a_flag_a_file_or_nowhere() {
-        let dir =
-            std::env::temp_dir().join(format!("hex-cli-p-{}-{}", std::process::id(), unique()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("prompt.md");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt.md");
         std::fs::write(&path, "prompt from file").unwrap();
 
         for (case, args, want) in [
@@ -2178,25 +1917,10 @@ mod tests {
                 panic!("{case}: expected run command");
             };
             assert_eq!(
-                resolve_prompt(&prompt, &file).unwrap().as_deref(),
+                resolve_prompt(prompt, file.as_deref()).unwrap().as_deref(),
                 want,
                 "{case}"
             );
         }
-    }
-
-    #[test]
-    fn logs_flags_parse() {
-        let cli = parse(&["logs", "run_1", "--node", "build", "--full", "--json"]).unwrap();
-        assert!(cli.json);
-        let Some(Command::Logs {
-            run_id, node, full, ..
-        }) = cli.command
-        else {
-            panic!("expected logs command");
-        };
-        assert_eq!(run_id, "run_1");
-        assert_eq!(node.as_deref(), Some("build"));
-        assert!(full);
     }
 }

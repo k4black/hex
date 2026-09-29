@@ -14,7 +14,7 @@
 //! workers are missing. (A `self` probe of `hex` on the agent's `PATH` died with
 //! the `hex emit` channel — the agent no longer runs `hex`, so do not re-add it.)
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hex_kernel::graph::{Graph, NodeSpec};
 
@@ -22,7 +22,7 @@ use crate::error::{HexError, Result};
 use crate::workers::Workers;
 
 /// One preflight finding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Finding {
     /// What was probed: `worker` or `check`.
     pub kind: &'static str,
@@ -76,12 +76,12 @@ pub fn report(workers: &Workers, checks: &BTreeMap<String, Vec<String>>) -> Repo
     // Auth after presence: a missing binary already has a row, and running its
     // probe would only add noise. Identical argvs are probed once (roles alias
     // workers), keyed under the first name that produced them.
-    let mut seen: BTreeMap<Vec<String>, ()> = BTreeMap::new();
+    let mut seen = BTreeSet::new();
     for (name, worker) in workers.entries() {
         let Some(argv) = worker.auth_probe() else {
             continue;
         };
-        if seen.insert(argv.clone(), ()).is_some()
+        if !seen.insert(argv.clone())
             || argv
                 .first()
                 .is_some_and(|program| which::which(program).is_err())
@@ -132,32 +132,21 @@ fn auth_probe(name: &str, argv: &[String]) -> Finding {
 
 /// Probe one named entry's executable.
 fn probe(kind: &'static str, name: &str, program: Option<&str>) -> Finding {
-    let Some(program) = program else {
-        return Finding {
-            kind,
-            name: name.to_owned(),
-            program: None,
-            // A worker that spawns nothing (the mock) is fine; it just isn't a
-            // binary we can check.
-            ok: true,
-            detail: "no executable to probe".to_owned(),
-        };
+    let (ok, detail) = match program {
+        // A worker that spawns nothing (the mock) is fine; it just isn't a
+        // binary we can check.
+        None => (true, "no executable to probe".to_owned()),
+        Some(program) => match which::which(program) {
+            Ok(path) => (true, path.display().to_string()),
+            Err(_) => (false, format!("`{program}` not found on PATH")),
+        },
     };
-    match which::which(program).ok() {
-        Some(path) => Finding {
-            kind,
-            name: name.to_owned(),
-            program: Some(program.to_owned()),
-            detail: path.display().to_string(),
-            ok: true,
-        },
-        None => Finding {
-            kind,
-            name: name.to_owned(),
-            program: Some(program.to_owned()),
-            ok: false,
-            detail: format!("`{program}` not found on PATH"),
-        },
+    Finding {
+        kind,
+        name: name.to_owned(),
+        program: program.map(ToOwned::to_owned),
+        ok,
+        detail,
     }
 }
 
@@ -217,8 +206,6 @@ mod tests {
         ]);
         let report = report(&Workers::default(), &checks);
         assert!(!report.ok());
-        // Whether `hex` is installed depends on the machine running the tests, so
-        // this asserts about checks only.
         assert!(report.broken().contains(&"bad"), "{:?}", report.broken());
         assert!(!report.broken().contains(&"good"));
         let good = report
@@ -227,16 +214,5 @@ mod tests {
             .find(|f| f.name == "good")
             .expect("good check probed");
         assert!(good.detail.starts_with("sh -c ("), "argv shown: {good:?}");
-    }
-
-    /// Nothing configured, nothing probed — and so nothing broken.
-    #[test]
-    fn report_probes_every_configured_worker() {
-        let report = report(&Workers::default(), &BTreeMap::new());
-        assert!(
-            report.findings.is_empty(),
-            "nothing configured, nothing probed"
-        );
-        assert!(report.ok(), "and therefore nothing is broken");
     }
 }

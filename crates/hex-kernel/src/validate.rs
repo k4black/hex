@@ -486,6 +486,7 @@ pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<crate::RunState,
             }
             continue;
         }
+        // Shape facts the projection cannot see, checked before the guards.
         match &e.body {
             EventBody::RunCreated { .. } => {
                 if created {
@@ -493,152 +494,32 @@ pub fn check_journal(graph: &Graph, events: &[Event]) -> Result<crate::RunState,
                 }
                 created = true;
             }
-            EventBody::RunStarted => {
-                if !created || !lifecycle::run_start_ok(&state) {
-                    return Err(bad_at(i, &state, "run_started out of order"));
-                }
+            EventBody::RunStarted if !created => {
+                return Err(bad_at(i, &state, "run_started out of order"));
             }
-            EventBody::AcceptanceUnmet { to, missing } => {
-                if !lifecycle::unmet_reroute_ok(graph, &state, to, missing) {
-                    return Err(bad_at(
-                        i,
-                        &state,
-                        format!(
-                            "acceptance_unmet to `{to}` is not a reroute the kernel could have \
-                             emitted here: it needs an idle running run parked on a success \
-                             terminal, `to` equal to the graph's `accept.on_unmet`, and exactly \
-                             the evidence acceptance actually reports missing"
-                        ),
-                    ));
-                }
+            EventBody::AttemptStarted { .. } if e.node_id.is_none() || e.attempt_id.is_none() => {
+                return Err(bad(i, "attempt_started missing node/attempt id"));
             }
-            EventBody::AttemptStarted { .. } => {
-                if e.node_id.is_none() || e.attempt_id.is_none() {
-                    return Err(bad(i, "attempt_started missing node/attempt id"));
-                }
-                if !lifecycle::attempt_start_ok(graph, &state, e) {
-                    return Err(bad_at(
-                        i,
-                        &state,
-                        "attempt_started must target an idle running run's current agent or \
-                         command node",
-                    ));
-                }
-            }
-            // A routing signal is only meaningful from the attempt that produced
-            // it. (`reduce` then routes; a signal with no legal edge is a
-            // defensive run failure there, so it is accepted here.)
-            EventBody::Signal { .. } => {
-                if !lifecycle::correlated(&state, e) {
-                    return Err(bad_at(
-                        i,
-                        &state,
-                        "signal does not match the in-flight attempt",
-                    ));
-                }
-            }
-            EventBody::AttemptFailed { disposition, .. } => {
-                if !lifecycle::correlated(&state, e) {
-                    return Err(bad_at(
-                        i,
-                        &state,
-                        "attempt_failed does not match the in-flight attempt",
-                    ));
-                }
-                // Stricter than `reduce`, which collapses a forged success
-                // disposition to `failed` rather than rejecting the journal.
-                if !matches!(disposition, Disposition::Failed | Disposition::TimedOut) {
-                    return Err(bad(i, "attempt_failed carries a non-failure disposition"));
-                }
-            }
-            EventBody::AttemptInterrupted => {
-                if !lifecycle::correlated(&state, e) {
-                    return Err(bad_at(
-                        i,
-                        &state,
-                        "attempt_interrupted does not match the in-flight attempt",
-                    ));
-                }
-            }
+            _ => {}
+        }
+        lifecycle::admissible(graph, &state, e).map_err(|why| bad_at(i, &state, why))?;
+        // The deliberate asymmetries (see the `lifecycle` module doc): the audit
+        // is stricter than `reduce` on these two.
+        match &e.body {
             EventBody::RunFinished { .. } => {
                 if state.awaiting() {
                     return Err(bad(i, "run_finished while an attempt is still in flight"));
                 }
                 run_finished_seen = true;
             }
-            // Pause/resume bracket a suspension. Both are recorded at attempt
-            // boundaries, so an in-flight attempt makes them impossible.
-            EventBody::RunPaused => {
-                if !lifecycle::pause_ok(&state) {
-                    return Err(bad_at(i, &state, "run_paused while not idle-running"));
-                }
+            // `reduce` collapses a forged success disposition to `failed` rather
+            // than rejecting the journal.
+            EventBody::AttemptFailed { disposition, .. }
+                if !matches!(disposition, Disposition::Failed | Disposition::TimedOut) =>
+            {
+                return Err(bad(i, "attempt_failed carries a non-failure disposition"));
             }
-            EventBody::RunResumed => {
-                if !lifecycle::resume_ok(&state) {
-                    return Err(bad_at(i, &state, "run_resumed without a pause"));
-                }
-            }
-            // Steering is inert until an attempt reads it, but it must still come
-            // from a position the driver could have journaled it in: it drains the
-            // control inbox at an attempt boundary or while blocked on a human
-            // node, never mid-attempt and never before the run exists.
-            EventBody::Steered { .. } => {
-                if !lifecycle::steer_ok(&state) {
-                    return Err(bad_at(
-                        i,
-                        &state,
-                        "steered outside an attempt boundary or a pause",
-                    ));
-                }
-            }
-            EventBody::HumanRequested { .. } => {
-                if !lifecycle::human_request_ok(graph, &state, e) {
-                    return Err(bad_at(
-                        i,
-                        &state,
-                        "human_requested must target an idle running run's current human node",
-                    ));
-                }
-            }
-            EventBody::HumanResponded { .. } => {
-                if !lifecycle::human_response_ok(graph, &state, e) {
-                    return Err(bad_at(
-                        i,
-                        &state,
-                        "human_responded does not answer an outstanding question on the node the \
-                         run is parked on",
-                    ));
-                }
-            }
-            // NodeResult rides inside an in-flight attempt (before its signal).
-            // Only an *agent* attempt produces a result, and at most one per
-            // attempt — so a stray/forged/duplicate record can't slip through
-            // and later surface as a bogus final message. Both halves live in the
-            // shared guard: `reduce` drops exactly what this rejects.
-            EventBody::NodeResult { .. } => {
-                if !lifecycle::node_result_ok(graph, &state, e) {
-                    return Err(bad_at(
-                        i,
-                        &state,
-                        "node_result does not match an in-flight agent attempt that has not \
-                         already recorded one",
-                    ));
-                }
-            }
-            // Usage rides inside its attempt like a result, and at most once —
-            // it is summed into the projection, so a duplicate inflates the
-            // bill rather than overwriting a value.
-            EventBody::AttemptReported { .. } => {
-                if !lifecycle::attempt_report_ok(graph, &state, e) {
-                    return Err(bad_at(
-                        i,
-                        &state,
-                        "attempt_reported does not match an in-flight agent attempt that has not \
-                         already reported",
-                    ));
-                }
-            }
-            EventBody::Note { .. } => {}
+            _ => {}
         }
         // The projection every guard above reads is `reduce`'s own, so the audit
         // and the driver can never disagree about where the run is.
@@ -692,20 +573,14 @@ fn reachable_from<'a>(graph: &'a Graph, start: &'a str) -> BTreeSet<&'a str> {
     seen
 }
 
-// Core rule 5 — every cycle is bounded — no longer needs an analysis here:
-// with every non-terminal node visit-bounded by the loader, an unbounded cycle
-// cannot be constructed. There is deliberately no `check_cycles`.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph::Graph;
     use hex_proto::Disposition;
 
-    /// Core rule 5 is enforced *by construction* now: the loader fills every
-    /// non-terminal node's visit bound (`DEFAULT_NODE_VISITS`, or a declared
-    /// `budget: { visits: N }`), so an unbounded cycle cannot be built and the
-    /// old `check_cycles`/`E-unbounded-cycle` analysis is gone. What is still
-    /// worth validating is a bound that is spent before anything runs: a
+    /// The loader bounds every non-terminal node (core rule 5), so the one
+    /// visit bound worth validating is one spent before anything runs: a
     /// declared `visits: 0`.
     #[test]
     fn a_zero_visit_bound_is_rejected() {
@@ -735,45 +610,128 @@ mod tests {
     }
 
     /// `implement --ready|blocked--> done`, acceptance requiring `implement.ready`
-    /// and rerouting on unmet. A visit bound is optional here: with the run-wide
-    /// retry budgets gone, cycle validation no longer exists to require one.
-    fn unmet_loop_graph(node_visits: Option<u32>) -> Graph {
-        let mut builder = Graph::builder("t", "implement")
+    /// and rerouting on unmet.
+    fn unmet_loop_graph() -> Graph {
+        Graph::builder("t", "implement")
             .agent("implement", "w", "p", &["ready", "blocked"])
             .terminal("done", Disposition::Succeeded)
             .edge("implement", "ready", "done")
             .edge("implement", "blocked", "done")
             .require("implement", "ready")
-            .on_unmet("implement");
-        if let Some(visits) = node_visits {
-            builder = builder.max_visits("implement", visits);
+            .on_unmet("implement")
+            .build()
+    }
+
+    /// Each malformed graph is rejected with its issue code. The case name is
+    /// in the failure message.
+    #[test]
+    fn malformed_graphs_are_rejected() {
+        let agent_to_done = |propose: &[&str], prompt: &str| {
+            Graph::builder("t", "a")
+                .agent("a", "w", prompt, propose)
+                .terminal("done", Disposition::Succeeded)
+        };
+        let cases: Vec<(&str, Graph, &str)> = vec![
+            (
+                "dangling_edge_target",
+                Graph::builder("t", "a")
+                    .agent("a", "w", "p", &["go"])
+                    .edge("a", "go", "nowhere")
+                    .build(),
+                "E-edge-to",
+            ),
+            (
+                "proposal_without_edge",
+                agent_to_done(&["go", "stop"], "p")
+                    .edge("a", "go", "done")
+                    .build(),
+                "E-proposal-no-edge",
+            ),
+            (
+                // Require a signal the referenced node can never emit.
+                "unsatisfiable_acceptance",
+                agent_to_done(&["go"], "p")
+                    .edge("a", "go", "done")
+                    .require("a", "nope")
+                    .build(),
+                "E-accept-unsatisfiable",
+            ),
+            (
+                "bad_signal_name",
+                agent_to_done(&["Go Now"], "p")
+                    .edge("a", "Go Now", "done")
+                    .build(),
+                "E-bad-signal-name",
+            ),
+            (
+                "unknown_result_reference",
+                agent_to_done(&["go"], "use {{ghost.result}}")
+                    .edge("a", "go", "done")
+                    .build(),
+                "E-result-ref",
+            ),
+            (
+                // A gate produces `passed`/`failed`, never a captured result.
+                "result_reference_to_a_non_agent",
+                agent_to_done(&["go"], "look at {{check.result}}")
+                    .command("check", &["true"])
+                    .edge("a", "go", "check")
+                    .edge("check", "passed", "done")
+                    .edge("check", "failed", "a")
+                    .require("check", "passed")
+                    .build(),
+                "E-result-ref",
+            ),
+            (
+                "unterminated_template_token",
+                agent_to_done(&["go"], "look at {{ghost.result and go")
+                    .edge("a", "go", "done")
+                    .build(),
+                "E-result-ref",
+            ),
+            (
+                "reserved_done_in_may_propose",
+                agent_to_done(&["done"], "p")
+                    .edge("a", "done", "done")
+                    .build(),
+                "E-done-reserved",
+            ),
+            (
+                // `unknown` is the runtime's to raise (a missing or unrecognised
+                // verdict), so an agent declaring it would be claiming a signal it
+                // cannot produce.
+                "reserved_unknown_in_may_propose",
+                agent_to_done(&["unknown"], "p")
+                    .edge("a", "unknown", "done")
+                    .build(),
+                "E-unknown-reserved",
+            ),
+            (
+                // A clean finish with no verdict would mean both "implicitly done"
+                // and "reported nothing"; the runtime must not guess which.
+                "declaring_outcomes_and_a_done_edge",
+                agent_to_done(&["go"], "p")
+                    .edge("a", "go", "done")
+                    .edge("a", "done", "done")
+                    .build(),
+                "E-mixed-done-and-proposals",
+            ),
+            (
+                "unreachable_node",
+                agent_to_done(&["go"], "p")
+                    .terminal("orphan", Disposition::Failed)
+                    .edge("a", "go", "done")
+                    .build(),
+                "E-unreachable",
+            ),
+        ];
+        for (case, g, code) in cases {
+            let issues = validate(&g).unwrap_err();
+            assert!(
+                issues.iter().any(|i| i.code == code),
+                "{case}: expected {code}, got {issues:?}"
+            );
         }
-        builder.build()
-    }
-
-    /// Assert `validate` rejects the graph with the given issue code.
-    fn rejects(g: &Graph, code: &str) {
-        let issues = validate(g).unwrap_err();
-        assert!(issues.iter().any(|i| i.code == code), "{code}: {issues:?}");
-    }
-
-    #[test]
-    fn dangling_edge_target_is_rejected() {
-        let g = Graph::builder("t", "a")
-            .agent("a", "w", "p", &["go"])
-            .edge("a", "go", "nowhere")
-            .build();
-        rejects(&g, "E-edge-to");
-    }
-
-    #[test]
-    fn proposal_without_edge_is_rejected() {
-        let g = Graph::builder("t", "a")
-            .agent("a", "w", "p", &["go", "stop"])
-            .terminal("done", Disposition::Succeeded)
-            .edge("a", "go", "done")
-            .build();
-        rejects(&g, "E-proposal-no-edge");
     }
 
     fn ev(seq: u64, node: Option<&str>, attempt: Option<&str>, body: EventBody) -> Event {
@@ -912,28 +870,6 @@ mod tests {
     }
 
     #[test]
-    fn unsatisfiable_acceptance_is_rejected() {
-        // Require a signal the referenced node can never emit.
-        let g = Graph::builder("t", "a")
-            .agent("a", "w", "p", &["go"])
-            .terminal("done", Disposition::Succeeded)
-            .edge("a", "go", "done")
-            .require("a", "nope")
-            .build();
-        rejects(&g, "E-accept-unsatisfiable");
-    }
-
-    #[test]
-    fn bad_signal_name_is_rejected() {
-        let g = Graph::builder("t", "a")
-            .agent("a", "w", "p", &["Go Now"])
-            .terminal("done", Disposition::Succeeded)
-            .edge("a", "Go Now", "done")
-            .build();
-        rejects(&g, "E-bad-signal-name");
-    }
-
-    #[test]
     fn agent_with_done_edge_and_no_proposals_is_valid() {
         // Implicit completion: an agent that emits nothing routes the reserved
         // `done`, which needs no may_propose entry.
@@ -950,41 +886,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_result_reference_is_rejected() {
-        let g = Graph::builder("t", "a")
-            .agent("a", "w", "use {{ghost.result}}", &["go"])
-            .terminal("done", Disposition::Succeeded)
-            .edge("a", "go", "done")
-            .build();
-        rejects(&g, "E-result-ref");
-    }
-
-    #[test]
-    fn result_reference_to_a_non_agent_is_rejected() {
-        // A gate produces `passed`/`failed`, never a captured result.
-        let g = Graph::builder("t", "a")
-            .agent("a", "w", "look at {{check.result}}", &["go"])
-            .command("check", &["true"])
-            .terminal("done", Disposition::Succeeded)
-            .edge("a", "go", "check")
-            .edge("check", "passed", "done")
-            .edge("check", "failed", "a")
-            .require("check", "passed")
-            .build();
-        rejects(&g, "E-result-ref");
-    }
-
-    #[test]
-    fn unterminated_template_token_is_rejected() {
-        let g = Graph::builder("t", "a")
-            .agent("a", "w", "look at {{ghost.result and go", &["go"])
-            .terminal("done", Disposition::Succeeded)
-            .edge("a", "go", "done")
-            .build();
-        rejects(&g, "E-result-ref");
-    }
-
-    #[test]
     fn acceptance_accepts_a_synthesized_done() {
         // `accept.require: [a.done]` is satisfiable when `a` has a `done` edge.
         let g = Graph::builder("t", "a")
@@ -994,28 +895,6 @@ mod tests {
             .require("a", "done")
             .build();
         assert!(validate(&g).is_ok(), "{:?}", validate(&g));
-    }
-
-    #[test]
-    fn reserved_done_in_may_propose_is_rejected() {
-        let g = Graph::builder("t", "a")
-            .agent("a", "w", "p", &["done"])
-            .terminal("fin", Disposition::Succeeded)
-            .edge("a", "done", "fin")
-            .build();
-        rejects(&g, "E-done-reserved");
-    }
-
-    /// `unknown` is the runtime's to raise (a missing or unrecognised verdict),
-    /// so an agent declaring it would be claiming a signal it cannot produce.
-    #[test]
-    fn reserved_unknown_in_may_propose_is_rejected() {
-        let g = Graph::builder("t", "a")
-            .agent("a", "w", "p", &["unknown"])
-            .terminal("fin", Disposition::Succeeded)
-            .edge("a", "unknown", "fin")
-            .build();
-        rejects(&g, "E-unknown-reserved");
     }
 
     /// A node may route its `unknown` case without declaring it, exactly as it
@@ -1030,20 +909,6 @@ mod tests {
             .edge("a", "unknown", "stop")
             .build();
         assert!(validate(&g).is_ok(), "{:?}", validate(&g));
-    }
-
-    /// Declaring outcomes *and* handling `done` is ambiguous: a clean finish with
-    /// no verdict would mean both "implicitly done" and "reported nothing", and
-    /// the runtime must not guess which the author meant.
-    #[test]
-    fn declaring_outcomes_and_a_done_edge_together_is_rejected() {
-        let g = Graph::builder("t", "a")
-            .agent("a", "w", "p", &["go"])
-            .terminal("fin", Disposition::Succeeded)
-            .edge("a", "go", "fin")
-            .edge("a", "done", "fin")
-            .build();
-        rejects(&g, "E-mixed-done-and-proposals");
     }
 
     /// A `human` node with the edges it needs: `hex validate` used to accept
@@ -1287,7 +1152,7 @@ mod tests {
     /// because `reduce` moved its current node and this function did not.
     #[test]
     fn check_journal_accepts_a_reroute_and_the_attempt_that_follows_it() {
-        let g = unmet_loop_graph(None);
+        let g = unmet_loop_graph();
         let mut events = vec![
             ev(
                 0,
@@ -1371,7 +1236,7 @@ mod tests {
     /// `accept.on_unmet` never named) is a forgery, not a transition.
     #[test]
     fn check_journal_rejects_a_reroute_the_kernel_could_not_emit() {
-        let g = unmet_loop_graph(None);
+        let g = unmet_loop_graph();
         let events = vec![
             ev(
                 0,
@@ -1494,16 +1359,5 @@ mod tests {
             },
         ));
         assert!(check_journal(&g, &events).is_err());
-    }
-
-    #[test]
-    fn unreachable_node_is_rejected() {
-        let g = Graph::builder("t", "a")
-            .agent("a", "w", "p", &["go"])
-            .terminal("done", Disposition::Succeeded)
-            .terminal("orphan", Disposition::Failed)
-            .edge("a", "go", "done")
-            .build();
-        rejects(&g, "E-unreachable");
     }
 }

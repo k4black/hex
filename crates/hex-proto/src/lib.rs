@@ -97,7 +97,7 @@ pub enum Disposition {
     Failed,
     /// An operator cancelled the run.
     Cancelled,
-    /// A budget (attempts/visits) was exhausted.
+    /// A budget (node visits, elapsed time, or output tokens) was exhausted.
     BudgetExhausted,
     /// A time budget elapsed.
     TimedOut,

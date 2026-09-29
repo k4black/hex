@@ -11,9 +11,10 @@
 //! because a journal is append-only.
 //!
 //! So each rule lives here exactly once, as a predicate answering: *could the
-//! kernel itself have produced this event from this position?* [`reduce`] drops
-//! an event whose predicate is false (a forged record never moves the
-//! projection); [`check_journal`] reports the same `false` as an
+//! kernel itself have produced this event from this position?* [`admissible`]
+//! maps each event to its predicate and rejection message, and both consumers
+//! call it: [`reduce`] drops an event it rejects (a forged record never moves
+//! the projection); [`check_journal`] reports the same rejection as an
 //! `E-journal-lifecycle` issue. And `check_journal` folds *through* `reduce`
 //! rather than tracking its own position, so the state both consult is by
 //! construction the same one. Adding a guard means editing one function.
@@ -34,9 +35,10 @@
 //! (inert `Note`s, plus the single uniform `RunFinished` a self-terminating
 //! `AttemptFailed` may be followed by — it must *agree* with the disposition
 //! already recorded), and `attempt_started` carrying both ids (a clearer message
-//! for what [`attempt_start_ok`] would reject anyway).
+//! for what [`attempt_start_ok`] would reject anyway). Those stay as explicit
+//! arms in `check_journal`, around its one call to [`admissible`].
 
-use hex_proto::{Disposition, Event};
+use hex_proto::{Disposition, Event, EventBody};
 
 use crate::graph::{Graph, NodeKind, NodeSpec};
 use crate::{RunState, Status};
@@ -218,4 +220,75 @@ pub(crate) fn resume_ok(state: &RunState) -> bool {
 /// prompt as if an operator had sent it.
 pub(crate) fn steer_ok(state: &RunState) -> bool {
     idle_running(state) || state.status == Status::Paused
+}
+
+/// Whether `event` may apply at `state`: every per-event guard, with the reason
+/// it fails. [`reduce`](crate::reduce) drops an event on `Err`;
+/// [`check_journal`](crate::check_journal) reports the reason as an
+/// `E-journal-lifecycle` issue. `RunCreated`, `RunFinished` and `Note` carry no
+/// guard here — the audit's stricter handling of `RunFinished` and of a
+/// non-failure `AttemptFailed` are the deliberate asymmetries in the module doc.
+pub(crate) fn admissible(graph: &Graph, state: &RunState, event: &Event) -> Result<(), String> {
+    let (ok, why) = match &event.body {
+        EventBody::RunCreated { .. } | EventBody::RunFinished { .. } | EventBody::Note { .. } => {
+            return Ok(());
+        }
+        EventBody::RunStarted => (run_start_ok(state), "run_started out of order"),
+        EventBody::AcceptanceUnmet { to, missing } => {
+            if unmet_reroute_ok(graph, state, to, missing) {
+                return Ok(());
+            }
+            return Err(format!(
+                "acceptance_unmet to `{to}` is not a reroute the kernel could have emitted \
+                 here: it needs an idle running run parked on a success terminal, `to` equal \
+                 to the graph's `accept.on_unmet`, and exactly the evidence acceptance \
+                 actually reports missing"
+            ));
+        }
+        EventBody::AttemptStarted { .. } => (
+            attempt_start_ok(graph, state, event),
+            "attempt_started must target an idle running run's current agent or command node",
+        ),
+        // A routing signal is only meaningful from the attempt that produced it.
+        // (`reduce` then routes; a signal with no legal edge is a defensive run
+        // failure there, so it is admissible here.)
+        EventBody::Signal { .. } => (
+            correlated(state, event),
+            "signal does not match the in-flight attempt",
+        ),
+        EventBody::AttemptFailed { .. } => (
+            correlated(state, event),
+            "attempt_failed does not match the in-flight attempt",
+        ),
+        EventBody::AttemptInterrupted => (
+            correlated(state, event),
+            "attempt_interrupted does not match the in-flight attempt",
+        ),
+        EventBody::RunPaused => (pause_ok(state), "run_paused while not idle-running"),
+        EventBody::RunResumed => (resume_ok(state), "run_resumed without a pause"),
+        EventBody::Steered { .. } => (
+            steer_ok(state),
+            "steered outside an attempt boundary or a pause",
+        ),
+        EventBody::HumanRequested { .. } => (
+            human_request_ok(graph, state, event),
+            "human_requested must target an idle running run's current human node",
+        ),
+        EventBody::HumanResponded { .. } => (
+            human_response_ok(graph, state, event),
+            "human_responded does not answer an outstanding question on the node the run is \
+             parked on",
+        ),
+        EventBody::NodeResult { .. } => (
+            node_result_ok(graph, state, event),
+            "node_result does not match an in-flight agent attempt that has not already \
+             recorded one",
+        ),
+        EventBody::AttemptReported { .. } => (
+            attempt_report_ok(graph, state, event),
+            "attempt_reported does not match an in-flight agent attempt that has not already \
+             reported",
+        ),
+    };
+    if ok { Ok(()) } else { Err(why.to_owned()) }
 }

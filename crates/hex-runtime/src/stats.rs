@@ -85,7 +85,7 @@ pub struct GraphUse {
 }
 
 /// Everything `hex stats` shows, folded from the log.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Aggregate {
     /// Lines successfully parsed.
     pub lines: u64,
