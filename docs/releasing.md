@@ -62,8 +62,7 @@ infra to `main`. If the run fails for a missing secret, re-run it after setup.
   - Repository: `hex`
   - Workflow name: `release.yml` (the caller; `publish-pypi.yml` is a
     reusable workflow and PyPI checks the top-level one)
-  - Environment: `pypi`
-- In `k4black/hex` > Settings > Environments, create the environment `pypi`.
+  - Environment: empty (the repo uses no environments; secrets live at repo level)
 
 ### crates.io
 
