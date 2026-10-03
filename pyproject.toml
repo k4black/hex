@@ -3,7 +3,7 @@ requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
 [project]
-name = "hex-cli"
+name = "hex-agents-cli"
 description = "A thin, deterministic control plane for agentic loops and graphs"
 readme = "README.md"
 license = "MIT"

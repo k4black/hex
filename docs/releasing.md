@@ -17,7 +17,7 @@
 6. dist publish jobs push the channels:
    - Homebrew: `k4black/homebrew-tap`, formula `hex-cli` (`brew install k4black/tap/hex-cli`);
    - npm: `@k4black/hex-cli`;
-   - PyPI: `hex-cli` (`publish-pypi.yml`, maturin wheels + sdist).
+   - PyPI: `hex-agents-cli` (`publish-pypi.yml`, maturin wheels + sdist).
 
 **First release (0.1.0).** 0.1.0 is not on crates.io, so release-plz opens no
 PR for it. The first push to `main` after the setup below publishes 0.1.0 and
@@ -57,7 +57,7 @@ infra to `main`. If the run fails for a missing secret, re-run it after setup.
 ### PyPI
 
 - pypi.org > Account > Publishing > add a pending trusted publisher:
-  - PyPI project name: `hex-cli`
+  - PyPI project name: `hex-agents-cli` (`hex-cli` is refused as too similar to `hexcli`)
   - Owner: `k4black`
   - Repository: `hex`
   - Workflow name: `release.yml` (the caller; `publish-pypi.yml` is a

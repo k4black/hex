@@ -27,7 +27,7 @@ Do not install it for them unless they ask.
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/k4black/hex/releases/latest/download/hex-cli-installer.sh | sh
 brew install k4black/tap/hex-cli
-uv tool install hex-cli          # or: pipx install hex-cli
+uv tool install hex-agents-cli   # or: pipx install hex-agents-cli
 npm install -g @k4black/hex-cli
 cargo binstall hex-cli           # or: cargo install hex-cli
 mise use -g github:k4black/hex
