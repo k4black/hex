@@ -42,8 +42,8 @@ infra to `main`. If the run fails for a missing secret, re-run it after setup.
   write. Metadata read is automatic.
 - Install it on `k4black/hex`.
 - In `k4black/hex` > Settings > Secrets and variables > Actions, add:
-  - `APP_ID`: the App ID;
-  - `APP_PRIVATE_KEY`: a generated private key (the full `.pem`).
+  - `RELEASE_APP_ID`: the App ID;
+  - `RELEASE_APP_PRIVATE_KEY`: a generated private key (the full `.pem`).
 - The App token makes the tag trigger `release.yml` and the release PR
   trigger `test.yml`. `GITHUB_TOKEN` events trigger no workflows.
 
