@@ -37,7 +37,7 @@ jobs:
           args: --release --out dist
       - uses: actions/upload-artifact@v7
         with:
-          name: wheel-${{ matrix.target }}-${{ matrix.manylinux }}
+          name: pypi-wheel-${{ matrix.target }}-${{ matrix.manylinux }}
           path: dist/*.whl
 
   sdist:
@@ -52,7 +52,7 @@ jobs:
           args: --out dist
       - uses: actions/upload-artifact@v7
         with:
-          name: sdist
+          name: pypi-sdist
           path: dist/*.tar.gz
 
   publish:
@@ -61,8 +61,11 @@ jobs:
     permissions:
       id-token: write
     steps:
+      # Only this workflow's artifacts: the run also holds dist's manifests,
+      # which twine rejects.
       - uses: actions/download-artifact@v8
         with:
+          pattern: pypi-*
           path: dist
           merge-multiple: true
       - uses: pypa/gh-action-pypi-publish@release/v1
