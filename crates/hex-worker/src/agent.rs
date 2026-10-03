@@ -1166,12 +1166,24 @@ fn kill_group(child: &mut Child) -> std::io::Result<()> {
             "cannot signal the attempt's process group: {e}"
         ))),
     };
-    tolerate_gone(killpg(pgid, Signal::SIGTERM))?;
+    // macOS answers `EPERM`, not `ESRCH`, when every process left in the group
+    // is a zombie. Once the leader has exited, every member is ours (same uid),
+    // so an `EPERM` there means "only zombies left" and counts as gone.
+    let sweep = |r: nix::Result<()>| match r {
+        Err(nix::errno::Errno::EPERM) => Ok(()),
+        r => tolerate_gone(r),
+    };
+    match killpg(pgid, Signal::SIGTERM) {
+        Err(nix::errno::Errno::EPERM) if child.try_wait()?.is_some() => {
+            return sweep(killpg(pgid, Signal::SIGKILL));
+        }
+        r => tolerate_gone(r)?,
+    }
     let deadline = Instant::now() + GROUP_TERM_GRACE;
     while Instant::now() < deadline {
         if child.try_wait()?.is_some() {
             // The leader is gone; sweep any group member that ignored SIGTERM.
-            return tolerate_gone(killpg(pgid, Signal::SIGKILL));
+            return sweep(killpg(pgid, Signal::SIGKILL));
         }
         std::thread::sleep(Duration::from_millis(25));
     }

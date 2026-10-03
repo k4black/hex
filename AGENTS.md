@@ -399,7 +399,9 @@ not built. _Avoid_: sign-off, confirmation.
    recorded one; its absence stays legal for older journals.
 34. **A killed attempt takes its process group.** `logged_command` spawns with
    `process_group(0)`; `wait_bounded`'s deadline path sends `killpg(SIGTERM)`,
-   waits 2s, then `SIGKILL`, through `nix` (no `unsafe`). `child.kill()` alone
+   waits 2s, then `SIGKILL`, through `nix` (no `unsafe`). macOS answers
+   `EPERM` for a group of only zombies, so `EPERM` after the leader exited
+   counts as gone. `child.kill()` alone
    left grandchildren running. Pinned by
    `a_timed_out_attempt_kills_the_whole_process_group`.
 35. **A dead attempt's output is salvaged.** `run_agent` captures the result

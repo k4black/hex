@@ -37,12 +37,6 @@ research in `docs/design/gpt-research-{1,2}.md`.
 
 ## Open
 
-CI flakes:
-- [ ] `a_timed_out_attempt_keeps_what_the_agent_already_wrote` failed once on
-      the macOS runner (`timed_out` false), not reproduced in 40 local runs. The
-      assert now prints the outcome; read it on the next failure. Suspect
-      `killpg` returning `EPERM` on macOS.
-
 Review cost and quality:
 - [ ] Feed the reviewer the diff, not the repo. A cross-model `checklist` run
       cost ≈ $40, mostly the reviewer re-reading the repo each round, and the
