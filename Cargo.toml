@@ -26,7 +26,7 @@ yaml_serde = "0.10"          # maintained serde_yaml fork ("The YAML Organizatio
 # Insertion-ordered map, so a node's `on:` edges compile in the order the author
 # wrote them rather than alphabetically. Already in the tree: yaml_serde uses it.
 indexmap = { version = "2", features = ["serde"] }
-sha2 = "0.10"
+sha2 = "0.11"
 fs4 = { version = "1", features = ["sync"] }   # OS advisory file locks (maintained fs2 successor)
 uuid = { version = "1", features = ["v4"] }    # collision-resistant run-id suffixes
 humantime = "2"              # parse `30m`/`2h`/`500ms` budget durations
