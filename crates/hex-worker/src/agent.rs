@@ -1580,7 +1580,7 @@ mod tests {
         let start = Instant::now();
         let outcome = worker.run(&req);
         assert!(start.elapsed().as_secs() < 5, "must not wait for the child");
-        assert!(outcome.timed_out);
+        assert!(outcome.timed_out, "{outcome:?}");
         assert!(
             outcome.error.expect("failed").contains("time budget"),
             "the error names the time budget"
