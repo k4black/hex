@@ -60,8 +60,9 @@ infra to `main`. If the run fails for a missing secret, re-run it after setup.
   - PyPI project name: `hex-agents-cli` (`hex-cli` is refused as too similar to `hexcli`)
   - Owner: `k4black`
   - Repository: `hex`
-  - Workflow name: `release.yml` (the caller; `publish-pypi.yml` is a
-    reusable workflow and PyPI checks the top-level one)
+  - Workflow name: `publish-pypi.yml`. PyPI matches the `job_workflow_ref`
+    claim, which names the reusable workflow that runs the upload, not the
+    caller `release.yml`. PyPI does not officially support reusable workflows.
   - Environment: empty (the repo uses no environments; secrets live at repo level)
 
 ### crates.io
