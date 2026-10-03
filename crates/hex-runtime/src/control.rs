@@ -67,9 +67,16 @@ impl Inbox {
         std::fs::create_dir_all(self.tmp())?;
         std::fs::create_dir_all(self.queue())?;
         let queue = self.queue();
-        // Millis-first names make a lexicographic sort match arrival order, and
-        // the uuid keeps two commands issued in the same millisecond distinct.
-        let name = format!("{:013}-{}.json", now_ms(), uuid::Uuid::new_v4().simple());
+        // Millis-first names make a lexicographic sort match arrival order. The
+        // per-process sequence keeps one sender's commands in order within a
+        // millisecond; the uuid keeps different senders' names distinct.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!(
+            "{:013}-{seq:010}-{}.json",
+            now_ms(),
+            uuid::Uuid::new_v4().simple()
+        );
         let envelope = Envelope {
             actor: actor.clone(),
             command: command.clone(),

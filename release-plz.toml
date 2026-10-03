@@ -1,0 +1,37 @@
+[workspace]
+# Below 1.0: `feat` and `!` bump the minor, `fix` bumps the patch.
+features_always_increment_minor = true
+# dist (release.yml) creates the GitHub Release from the tag.
+git_release_enable = false
+# Only hex-cli is tagged (below): dist reads at most 3 tags per commit.
+git_tag_enable = false
+# One CHANGELOG.md at the root, owned by hex-cli (below).
+changelog_update = false
+# The libraries are internals with no stable API.
+semver_check = false
+pr_labels = ["release"]
+
+[[package]]
+name = "hex-proto"
+version_group = "hex"
+
+[[package]]
+name = "hex-kernel"
+version_group = "hex"
+
+[[package]]
+name = "hex-worker"
+version_group = "hex"
+
+[[package]]
+name = "hex-runtime"
+version_group = "hex"
+
+[[package]]
+name = "hex-cli"
+version_group = "hex"
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+changelog_update = true
+changelog_path = "./CHANGELOG.md"
+changelog_include = ["hex-proto", "hex-kernel", "hex-worker", "hex-runtime"]

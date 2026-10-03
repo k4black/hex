@@ -1,12 +1,15 @@
 [package]
 name = "hex-cli"
-description = "hex: command-line operator surface (the `hex` binary)"
+description = "hex: a thin, deterministic control plane that runs agent CLIs (Claude Code, Codex, Pi, opencode) over a bounded, journaled graph"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["agents", "llm", "orchestration", "workflow", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "hex"

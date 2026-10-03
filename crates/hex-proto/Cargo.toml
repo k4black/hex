@@ -1,12 +1,12 @@
 [package]
 name = "hex-proto"
-description = "hex: versioned control protocol — events, commands, capabilities"
+description = "Internal crate of hex: versioned control protocol (events, commands, capabilities). No stable API; install hex-cli instead."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+homepage.workspace = true
 
 [dependencies]
 serde = { workspace = true }

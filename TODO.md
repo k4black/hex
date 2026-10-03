@@ -51,6 +51,8 @@ Review cost and quality:
       as "red". Needs per-test targeting.
 - [ ] Agent-result stall detection (gate-signature stall detection exists).
 
+Skill:
+
 Correctness:
 - [ ] `gate_sigs` is in-memory: a pause/resume between two identical gate
       failures resets the stall count. Journal the signature if seen in practice.

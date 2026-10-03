@@ -1,12 +1,12 @@
 [package]
 name = "hex-worker"
-description = "hex: Worker trait, capability manifest, and adapters (mock, subprocess)"
+description = "Internal crate of hex: Worker trait and agent CLI adapters. No stable API; install hex-cli instead."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+homepage.workspace = true
 
 [dependencies]
 hex-proto = { workspace = true }

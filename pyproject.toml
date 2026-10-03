@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "hex-agents-cli"
+description = "A thin, deterministic control plane for agentic loops and graphs"
+readme = "README.md"
+license = "MIT"
+dynamic = ["version"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Repository = "https://github.com/k4black/hex"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "crates/hex-cli/Cargo.toml"
+strip = true

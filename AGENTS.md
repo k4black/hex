@@ -19,7 +19,7 @@ runtime orchestrates and records · the cli is a window.*
 | `hex-proto` | Versioned protocol: `Event`, `Command`, `Capability`. Only stable public surface. | — |
 | `hex-kernel` | **Pure**: Graph IR, journal model, projections, `reduce` + `schedule` (acceptance is checked inside `schedule`). No IO/subprocess/clock. | proto |
 | `hex-worker` | `Worker` trait + capability manifest + adapters (mock, subprocess, coding-agent presets). Runs **one** worker; never coordinates. | proto |
-| `hex-runtime` | Imperative shell: drive loop, effect execution, journal writer, control ingestion, workspace isolation, run supervision, `init`. Exposes the concrete `Runtime`, including `read_streams`, so tailing a live attempt needs no knowledge of `.hex/`. | kernel, worker, proto |
+| `hex-runtime` | Imperative shell: drive loop, effect execution, journal writer, control ingestion, workspace isolation, run supervision, `init`, the embedded agent skill (`skill.rs`). Exposes the concrete `Runtime`, including `read_streams`, so tailing a live attempt needs no knowledge of `.hex/`. | kernel, worker, proto |
 | `hex-cli` | The `hex` binary: thin client over `Runtime`; arg parsing + rendering only. | runtime |
 
 A future transport or viewer is another thin client over `Runtime`, never a
@@ -175,8 +175,9 @@ not built. _Avoid_: sign-off, confirmation.
 ## Gotchas
 
 1. Binary is `hex`, package is `hex-cli`: use `cargo run --bin hex`, not `-p hex`.
-2. **What exists:** README.md "Status" lists what works, what is broken and
-   what is not built; TODO.md is the forward list. Not built: `interactive`,
+2. **What exists:** TODO.md lists what is open, what is broken and what is
+   not built. The README's first ```yaml block must stay a valid graph:
+   `the_readme_example_graph_is_valid` loads it. Not built: `interactive`,
    `templates:`/`extends:`, capability matching beyond session-resume and
    result capture.
 3. A node's routing token is an `EventBody::Signal { name }`. Agent proposals
@@ -327,7 +328,8 @@ not built. _Avoid_: sign-off, confirmation.
    so a poller never reads a torn write. The driver drains the inbox before
    each `schedule()`, moving a file into `done/` *before* applying it
    (at-most-once: losing a `steer` is cheaper than double-applying a
-   terminal). Files sort as `{now_ms:013}-{uuid}.json`.
+   terminal). Files sort as `{now_ms:013}-{seq:010}-{uuid}.json`; the
+   per-process `seq` keeps one sender's same-millisecond commands in order.
 24. **`pause` returns without a terminal.** `Session::drive()` returns
    `Option<Disposition>`; `None` means paused and no `RunFinished` was
    written, so `hex resume` continues the run. Pause applies only at an
@@ -397,7 +399,9 @@ not built. _Avoid_: sign-off, confirmation.
    recorded one; its absence stays legal for older journals.
 34. **A killed attempt takes its process group.** `logged_command` spawns with
    `process_group(0)`; `wait_bounded`'s deadline path sends `killpg(SIGTERM)`,
-   waits 2s, then `SIGKILL`, through `nix` (no `unsafe`). `child.kill()` alone
+   waits 2s, then `SIGKILL`, through `nix` (no `unsafe`). macOS answers
+   `EPERM` for a group of only zombies, so `EPERM` after the leader exited
+   counts as gone. `child.kill()` alone
    left grandchildren running. Pinned by
    `a_timed_out_attempt_kills_the_whole_process_group`.
 35. **A dead attempt's output is salvaged.** `run_agent` captures the result
@@ -486,4 +490,15 @@ not built. _Avoid_: sign-off, confirmation.
    an implementer told to touch only its scope cannot turn it green. Stall
    detection (`failure_signature` in `driver.rs`) ends the run `failed` after
    two identical failing outputs. Fix candidates are in TODO.md.
-44. _add new gotchas here as they are discovered_
+44. **The agent skill is embedded and version-stamped.** `skill.rs` embeds
+   `crates/hex-runtime/skill/hex/` (`skills/hex` is a symlink to it).
+   `hex skill install` writes it to `~/.claude/skills/hex/` and
+   `~/.agents/skills/hex/` and stamps `metadata.hex-version` into SKILL.md.
+   - A stamped copy is hex-owned. `run`, `resume`, `init` and `doctor`
+     rewrite one whose stamp differs from the binary. The refresh never
+     installs and never fails the verb.
+   - A symlink (the dev checkout) is never touched. An unstamped copy is
+     skipped unless `install --force`.
+   - A new skill file needs its own `include_str!` entry in `skill::FILES`.
+   - doctor's `skill` rows are informational: `Report::ok` ignores them.
+45. _add new gotchas here as they are discovered_

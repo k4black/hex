@@ -1,0 +1,7 @@
+interface:
+  display_name: "hex"
+  short_description: "Run a bounded, resumable agent loop with the hex CLI"
+  default_prompt: "Use $hex to run a hex preset on this task."
+
+policy:
+  allow_implicit_invocation: false
