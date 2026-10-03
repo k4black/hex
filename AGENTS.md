@@ -328,7 +328,8 @@ not built. _Avoid_: sign-off, confirmation.
    so a poller never reads a torn write. The driver drains the inbox before
    each `schedule()`, moving a file into `done/` *before* applying it
    (at-most-once: losing a `steer` is cheaper than double-applying a
-   terminal). Files sort as `{now_ms:013}-{uuid}.json`.
+   terminal). Files sort as `{now_ms:013}-{seq:010}-{uuid}.json`; the
+   per-process `seq` keeps one sender's same-millisecond commands in order.
 24. **`pause` returns without a terminal.** `Session::drive()` returns
    `Option<Disposition>`; `None` means paused and no `RunFinished` was
    written, so `hex resume` continues the run. Pause applies only at an
