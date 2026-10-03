@@ -68,4 +68,9 @@ jobs:
           pattern: pypi-*
           path: dist
           merge-multiple: true
+      # No PEP 740 attestations: their certificate names the caller
+      # (release.yml), while the trusted publisher must name this file, so PyPI
+      # rejects the upload. PyPI does not support reusable workflows officially.
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: false
