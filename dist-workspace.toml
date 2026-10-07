@@ -19,8 +19,9 @@ formula = "hex-cli"
 npm-scope = "@k4black"
 # Plan jobs to run in CI
 plan-jobs = ["./test"]
-# Publish jobs to run in CI
-publish-jobs = ["homebrew", "npm", "./publish-pypi"]
+# Publish jobs to run in CI. ./publish-homebrew replaces dist's homebrew job to
+# add `conflicts_with "hex"`, which dist cannot configure.
+publish-jobs = ["./publish-homebrew", "npm", "./publish-pypi"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program

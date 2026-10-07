@@ -1,0 +1,58 @@
+# dist's own homebrew publish job, plus one step: the formula declares that it
+# conflicts with homebrew-core's `hex` (a hexdump tool), which also installs
+# `bin/hex`. dist 0.33 has no config for extra formula lines. After a dist
+# upgrade, diff this file against dist's generated `publish-homebrew-formula`.
+name: publish-homebrew
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  formula:
+    runs-on: ubuntu-22.04
+    env:
+      PLAN: ${{ inputs.plan }}
+      GITHUB_USER: "axo bot"
+      GITHUB_EMAIL: "admin+bot@axo.dev"
+    if: ${{ !fromJson(inputs.plan).announcement_is_prerelease || fromJson(inputs.plan).publish_prereleases }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+          repository: "k4black/homebrew-tap"
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      - name: Fetch homebrew formulae
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: Formula/
+          merge-multiple: true
+      - name: Declare the conflict with homebrew-core hex
+        run: |
+          f=Formula/hex-cli.rb
+          grep -q 'conflicts_with "hex"' "$f" ||
+            perl -pi -e 's/^(  license .*\n)/$1  conflicts_with "hex", because: "both install a `hex` binary"\n/' "$f"
+          # Fail loudly if dist's template no longer has the anchor line.
+          grep -q 'conflicts_with "hex"' "$f"
+      - name: Commit formula files
+        run: |
+          git config --global user.name "${GITHUB_USER}"
+          git config --global user.email "${GITHUB_EMAIL}"
+
+          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
+            filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
+            name=$(echo "$filename" | sed "s/\.rb$//")
+            version=$(echo "$release" | jq .app_version --raw-output)
+
+            export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+            brew update
+            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
+
+            git add "Formula/${filename}"
+            git commit -m "${name} ${version}"
+          done
+          git push

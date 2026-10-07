@@ -16,6 +16,9 @@
    - it creates the GitHub Release with the archives and the shell installer.
 6. dist publish jobs push the channels:
    - Homebrew: `k4black/homebrew-tap`, formula `hex-cli` (`brew install k4black/tap/hex-cli`);
+     `publish-homebrew.yml` replaces dist's homebrew job only to add
+     `conflicts_with "hex"` (homebrew-core `hex` also installs `bin/hex`).
+     After a dist upgrade, diff it against dist's generated job;
    - npm: `@k4black/hex-cli`;
    - PyPI: `hex-agents-cli` (`publish-pypi.yml`, maturin wheels + sdist).
 
