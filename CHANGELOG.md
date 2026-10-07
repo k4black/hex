@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/k4black/hex/compare/v0.1.2...v0.1.3) - 2026-10-07
+
+### Other
+
+- update Cargo.lock dependencies
+- update Cargo.toml dependencies
+- *(deps)* bump sha2 from 0.10.9 to 0.11.0 ([#4](https://github.com/k4black/hex/pull/4))
+
 ## [0.1.2](https://github.com/k4black/hex/compare/v0.1.1...v0.1.2)
 
 ### Fixed
