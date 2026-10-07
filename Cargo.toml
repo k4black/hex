@@ -40,7 +40,7 @@ nix = { version = "0.30", features = ["signal"] }
 # Safe SIGINT/SIGTERM handling (delivery on a normal thread via a self-pipe, so
 # no `unsafe` and no async-signal-safety constraints). Already in the tree:
 # crossterm depends on it, so naming it directly adds no crates.
-signal-hook = "0.3"
+signal-hook = "0.4"
 # Terminal styling. All five are already in the tree (anstream/anstyle/
 # anstyle-query via clap, crossterm + unicode-width via ratatui), so naming them directly adds no
 # crates — and `anstyle::Style` is the *same* vocabulary clap paints `--help`
