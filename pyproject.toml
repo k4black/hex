@@ -22,3 +22,6 @@ Repository = "https://github.com/k4black/hex"
 bindings = "bin"
 manifest-path = "crates/hex-cli/Cargo.toml"
 strip = true
+# The sdist must carry LICENSE: its metadata names it, and PyPI rejects a
+# missing License-File.
+include = [{ path = "LICENSE", format = "sdist" }]

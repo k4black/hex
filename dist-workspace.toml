@@ -31,3 +31,8 @@ pr-run-mode = "skip"
 [dist.github-custom-runners]
 # Native arm64 runner: builds the aarch64 musl binary without cross.
 aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
+
+# publish-pypi.yml checks out the repo (contents: read) and publishes via OIDC
+# (id-token: write). A called workflow cannot exceed what its caller grants.
+[dist.github-custom-job-permissions]
+publish-pypi = { contents = "read", id-token = "write" }

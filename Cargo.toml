@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"        # floor set by ratatui 0.30 (the live-preview TUI)
 license = "MIT"
@@ -13,10 +13,10 @@ homepage = "https://github.com/k4black/hex"
 [workspace.dependencies]
 # Internal crates (dependencies point strictly inward: proto <- kernel,
 # proto/kernel <- worker, kernel/worker <- runtime, clients <- runtime).
-hex-proto = { path = "crates/hex-proto", version = "0.1.0" }
-hex-kernel = { path = "crates/hex-kernel", version = "0.1.0" }
-hex-worker = { path = "crates/hex-worker", version = "0.1.0" }
-hex-runtime = { path = "crates/hex-runtime", version = "0.1.0" }
+hex-proto = { path = "crates/hex-proto", version = "0.1.2" }
+hex-kernel = { path = "crates/hex-kernel", version = "0.1.2" }
+hex-worker = { path = "crates/hex-worker", version = "0.1.2" }
+hex-runtime = { path = "crates/hex-runtime", version = "0.1.2" }
 
 # External, shared across the workspace so versions stay aligned.
 clap = { version = "4", features = ["derive"] }
