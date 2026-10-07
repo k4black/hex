@@ -36,7 +36,7 @@ jiff = { version = "0.2", default-features = false, features = ["std"] }
 # Safe wrappers for the POSIX signal calls; `killpg` is what lets a timed-out
 # attempt take its whole process group down instead of orphaning grandchildren.
 # A safe wrapper, so the workspace's `unsafe_code = "forbid"` still holds.
-nix = { version = "0.30", features = ["signal"] }
+nix = { version = "0.31", features = ["signal"] }
 # Safe SIGINT/SIGTERM handling (delivery on a normal thread via a self-pipe, so
 # no `unsafe` and no async-signal-safety constraints). Already in the tree:
 # crossterm depends on it, so naming it directly adds no crates.
