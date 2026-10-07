@@ -1066,11 +1066,23 @@ fn failure_signature(attempt_dir: &std::path::Path) -> String {
         for file in ["stdout.log", "stderr.log", "exit"] {
             // Stream, not read: a gate's output (a full test run) is unbounded.
             if let Ok(mut f) = std::fs::File::open(dir.join(file)) {
-                let _ = std::io::copy(&mut f, &mut hasher);
+                let mut buf = [0u8; 8192];
+                while let Ok(n @ 1..) = std::io::Read::read(&mut f, &mut buf) {
+                    hasher.update(&buf[..n]);
+                }
             }
         }
     }
-    format!("{:x}", hasher.finalize())
+    lower_hex(&hasher.finalize())
+}
+
+/// Bytes as lowercase hex: a digest's own type does not format as hex.
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 /// Run every step concurrently, then report all failures.
@@ -1369,7 +1381,7 @@ fn verdict_instruction(may_propose: &[String]) -> String {
 #[must_use]
 pub fn graph_hash(source: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(source.as_bytes()))
+    lower_hex(&Sha256::digest(source.as_bytes()))
 }
 
 /// The session id to resume, given the recorded handle and the program that is
