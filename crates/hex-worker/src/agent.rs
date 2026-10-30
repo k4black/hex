@@ -67,6 +67,13 @@ const MAX_PARTIAL_BYTES: u64 = 8 * 1024;
 /// needs no capability.
 const RESUMABLE: &[Capability] = &[Capability::SessionResume, Capability::CostReporting];
 
+/// [`RESUMABLE`], plus forking a session into a new one.
+const FORKABLE: &[Capability] = &[
+    Capability::SessionResume,
+    Capability::SessionFork,
+    Capability::CostReporting,
+];
+
 /// Where an adapter's session id and usage come from. Deliberately separate from
 /// [`ResultCapture`]: a `CommandWorker` may well capture its result from a file
 /// like codex does without emitting codex's event stream, so the capture mode
@@ -110,14 +117,20 @@ impl CodexWorker {
     /// prompt to keep a reviewer from editing. Enforced read-only awaits a
     /// non-workspace control transport (see TODO).
     #[must_use]
-    pub fn command(&self, extra_writable: Option<&Path>, resume: Option<&str>) -> Vec<String> {
+    pub fn command(
+        &self,
+        extra_writable: Option<&Path>,
+        resume: Option<&str>,
+        fork: bool,
+    ) -> Vec<String> {
         let mut argv = strs(&["codex", "exec"]);
-        // `resume` is a *subcommand*, and it accepts a strictly smaller flag set
-        // than `exec`: no `--sandbox`, no `--add-dir`, no `--cd`. Everything those
-        // would have expressed has to travel as a `-c` config override instead.
-        // (Verified against the CLI: `codex exec resume --help`.)
+        // `resume` and `fork` are *subcommands*, and they accept a strictly
+        // smaller flag set than `exec`: no `--sandbox`, no `--add-dir`, no
+        // `--cd`. Everything those would have expressed has to travel as a `-c`
+        // config override instead. (Verified against the CLI: `codex exec resume
+        // --help`, `codex exec fork --help`.)
         if let Some(session) = resume {
-            argv.push("resume".to_owned());
+            argv.push(if fork { "fork" } else { "resume" }.to_owned());
             argv.push(session.to_owned());
         }
         argv.extend(strs(&[
@@ -183,7 +196,7 @@ impl Worker for CodexWorker {
         )
     }
     fn capabilities(&self) -> &'static [Capability] {
-        RESUMABLE
+        FORKABLE
     }
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         run_agent(
@@ -191,6 +204,7 @@ impl Worker for CodexWorker {
             &self.command(
                 request.extra_writable_dir.as_deref(),
                 request.resume_session.as_deref(),
+                request.fork_session,
             ),
             Some(ResultCapture::File),
             Some(UsageSource::CodexJsonl),
@@ -222,7 +236,7 @@ impl ClaudeWorker {
     // cannot be enforced without crippling the agent. The role's prompt keeps it
     // read-only. (Enforced read-only awaits a stronger sandbox.)
     #[must_use]
-    pub fn command(&self, resume: Option<&str>) -> Vec<String> {
+    pub fn command(&self, resume: Option<&str>, fork: bool) -> Vec<String> {
         // Codex confines effects with an OS sandbox (`workspace-write`); Claude
         // has no equivalent flag here, so we approximate an *auto classifier*
         // instead of bypassing every check:
@@ -260,8 +274,11 @@ impl ClaudeWorker {
         push_flag(&mut argv, "--model", self.model.as_deref());
         push_flag(&mut argv, "--effort", self.effort.as_deref());
         // Unlike codex's subcommand, claude resumes with a plain flag, so the
-        // rest of the argv is unchanged.
+        // rest of the argv is unchanged. A fork is the same resume with a new id.
         push_flag(&mut argv, "--resume", resume);
+        if fork && resume.is_some() {
+            argv.push("--fork-session".to_owned());
+        }
         argv
     }
 }
@@ -290,12 +307,12 @@ impl Worker for ClaudeWorker {
         Some(strs(&["claude", "auth", "status"]))
     }
     fn capabilities(&self) -> &'static [Capability] {
-        RESUMABLE
+        FORKABLE
     }
     fn run(&self, request: &WorkRequest) -> WorkOutcome {
         run_agent(
             "claude",
-            &self.command(request.resume_session.as_deref()),
+            &self.command(request.resume_session.as_deref(), request.fork_session),
             Some(ResultCapture::JsonlResult),
             Some(UsageSource::ClaudeJson),
             // claude reports its own model per entry, so no hint is needed.
@@ -594,7 +611,7 @@ fn run_agent(
         // operator interrupt; the flag is what tells them apart. Salvage and the
         // usage report are kept either way — an interrupted attempt spent real
         // tokens, and throwing that away is what "no logs and no notice" means.
-        Ok(None) if crate::interrupt::requested() => {
+        Ok(None) if crate::interrupt::should_stop() => {
             return WorkOutcome::interrupted()
                 .with_result(salvage("the run was interrupted"))
                 .with_report(report);
@@ -715,7 +732,11 @@ fn read_report(source: UsageSource, attempt_dir: &Path, model_hint: Option<&str>
 /// Line-by-line rather than whole-file, because a killed attempt leaves a
 /// half-written final line and the earlier lines are still perfectly good facts.
 fn codex_report(path: &Path, model_hint: Option<&str>) -> AttemptReport {
-    let mut report = AttemptReport::default();
+    // A resumed or forked thread reports the whole thread's usage.
+    let mut report = AttemptReport {
+        cumulative: true,
+        ..AttemptReport::default()
+    };
     let mut usage = ModelUsage {
         model: model_hint.unwrap_or("codex").to_owned(),
         ..ModelUsage::default()
@@ -780,6 +801,8 @@ fn claude_report(path: &Path) -> AttemptReport {
             .and_then(serde_json::Value::as_f64)
             .and_then(micro_usd),
         duration_ms: v.get("duration_ms").and_then(serde_json::Value::as_u64),
+        // A resumed or forked session reports the whole session's usage.
+        cumulative: true,
         models: Vec::new(),
         // Stamped by the shared plumbing, which knows the program it spawned.
         agent: None,
@@ -872,6 +895,8 @@ fn pi_report(path: &Path, model_hint: Option<&str>) -> AttemptReport {
         models: vec![usage],
         cost_micro_usd,
         duration_ms: None,
+        // Parsed from this attempt's own stdout only.
+        cumulative: false,
     }
 }
 
@@ -1218,7 +1243,7 @@ pub fn wait_bounded(
         // thing that reaches it (see `crate::interrupt`). Checked before the
         // deadline so an unbounded attempt is still interruptible; this loop is
         // also why `deadline_ms: None` no longer blocks in `child.wait()`.
-        if crate::interrupt::requested() {
+        if crate::interrupt::should_stop() {
             kill_group(child)?;
             return Ok(None);
         }
@@ -1618,7 +1643,7 @@ mod tests {
     #[test]
     fn codex_argv_shape() {
         let w = CodexWorker::new(Some("gpt-5".to_owned()), None);
-        let argv = w.command(None, None).join(" ");
+        let argv = w.command(None, None, false).join(" ");
         assert!(argv.contains("--output-last-message {result}"), "{argv}");
         // `--json` is load-bearing, not cosmetic: it is the only place codex
         // exposes its session id and token counts, so usage accounting and
@@ -1634,7 +1659,7 @@ mod tests {
         assert!(!argv.contains("--add-dir"));
         // Under isolation the control dir outside the workspace is added writable.
         let iso = w
-            .command(Some(std::path::Path::new("/tmp/run")), None)
+            .command(Some(std::path::Path::new("/tmp/run")), None, false)
             .join(" ");
         assert!(iso.contains("--add-dir /tmp/run"), "{iso}");
     }
@@ -1644,7 +1669,7 @@ mod tests {
     #[test]
     fn codex_resume_argv_uses_the_subcommand_and_config_overrides() {
         let w = CodexWorker::new(None, None);
-        let argv = w.command(None, Some("019fb9a2")).join(" ");
+        let argv = w.command(None, Some("019fb9a2"), false).join(" ");
         assert!(argv.starts_with("codex exec resume 019fb9a2 "), "{argv}");
         assert!(argv.contains("--json"), "{argv}");
         assert!(argv.contains("--output-last-message {result}"), "{argv}");
@@ -1658,7 +1683,7 @@ mod tests {
         // root travels as config or the run dir's result file is unwritable
         // under isolation.
         let iso = w
-            .command(Some(std::path::Path::new("/tmp/run")), Some("abc"))
+            .command(Some(std::path::Path::new("/tmp/run")), Some("abc"), false)
             .join(" ");
         assert!(!iso.contains("--add-dir"), "{iso}");
         assert!(
@@ -1668,9 +1693,21 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_uses_the_fork_subcommand_or_flag() {
+        let codex = CodexWorker::new(None, None)
+            .command(None, Some("t1"), true)
+            .join(" ");
+        assert!(codex.starts_with("codex exec fork t1 "), "{codex}");
+        let claude = ClaudeWorker::new(None, None)
+            .command(Some("s1"), true)
+            .join(" ");
+        assert!(claude.contains("--resume s1 --fork-session"), "{claude}");
+    }
+
+    #[test]
     fn claude_resume_argv_uses_a_plain_flag() {
         let argv = ClaudeWorker::new(None, None)
-            .command(Some("sess-1"))
+            .command(Some("sess-1"), false)
             .join(" ");
         assert!(argv.contains("--resume sess-1"), "{argv}");
         // Unchanged otherwise, unlike codex.
@@ -1696,7 +1733,7 @@ mod tests {
 
     #[test]
     fn claude_and_opencode_argv_shapes() {
-        let c = ClaudeWorker::new(None, None).command(None).join(" ");
+        let c = ClaudeWorker::new(None, None).command(None, false).join(" ");
         assert!(
             c.contains("claude -p {prompt} --output-format stream-json --verbose"),
             "streamed so a live attempt is watchable: {c}"
@@ -1710,7 +1747,7 @@ mod tests {
 
     #[test]
     fn claude_uses_an_allow_deny_classifier_not_a_blanket_bypass() {
-        let c = ClaudeWorker::new(None, None).command(None).join(" ");
+        let c = ClaudeWorker::new(None, None).command(None, false).join(" ");
         // A real classifier — never the blanket bypass the operator rejected.
         assert!(!c.contains("--dangerously-skip-permissions"), "{c}");
         assert!(c.contains("--permission-mode acceptEdits"), "{c}");

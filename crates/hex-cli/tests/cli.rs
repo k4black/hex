@@ -719,7 +719,11 @@ fn status_json_carries_the_live_fields() {
 
     let out = hex(dir.path(), &["status", &run_id, "--json"]);
     let v: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("json");
-    assert!(v["in_flight"].is_null(), "nothing runs on a finished run");
+    assert_eq!(
+        v["in_flight"],
+        serde_json::json!([]),
+        "nothing runs on a finished run"
+    );
     assert_eq!(v["queued"].as_array().expect("queued").len(), 0);
     assert_eq!(v["pending_steer"].as_array().expect("steer").len(), 0);
     assert!(v["waiting_for_human"].is_null());

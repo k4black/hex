@@ -290,7 +290,7 @@ fn steer_text_reaches_the_next_attempts_prompt() {
     let events = runtime.events(&report.run_id).expect("events");
     assert!(events.iter().any(|e| matches!(
         &e.body,
-        EventBody::Steered { text } if text == "USE-THE-V2-API"
+        EventBody::Steered { text, .. } if text == "USE-THE-V2-API"
     )));
 }
 
@@ -366,6 +366,7 @@ fn a_respond_and_a_steer_queued_together_both_apply() {
         vec![
             Command::Steer {
                 text: "USE-THE-V2-API".to_owned(),
+                node: None,
             },
             Command::Respond {
                 text: "SHIP-IT".to_owned(),
@@ -383,7 +384,7 @@ fn a_respond_and_a_steer_queued_together_both_apply() {
     assert!(
         events.iter().any(|e| matches!(
             &e.body,
-            EventBody::Steered { text } if text == "USE-THE-V2-API"
+            EventBody::Steered { text, .. } if text == "USE-THE-V2-API"
         )),
         "the steer queued alongside the answer must not be swallowed: {events:#?}"
     );

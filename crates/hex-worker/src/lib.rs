@@ -59,6 +59,10 @@ pub struct WorkRequest {
     /// node's first visit. Only a worker declaring
     /// [`hex_proto::Capability::SessionResume`] ever receives one.
     pub resume_session: Option<String>,
+    /// Start a *new* session from `resume_session` instead of continuing it
+    /// (`context: { fork: <node> }`). Only a worker declaring
+    /// [`hex_proto::Capability::SessionFork`] ever receives `true`.
+    pub fork_session: bool,
     /// The graph (workflow) name this run executes, injected as `HEX_GRAPH` so an
     /// agent's `hex feedback` can record which workflow it was running under.
     pub graph: String,
@@ -95,6 +99,9 @@ pub struct AttemptReport {
     pub cost_micro_usd: Option<u64>,
     /// Wall time the agent reported.
     pub duration_ms: Option<u64>,
+    /// `models` and `cost_micro_usd` are session totals, not this attempt's
+    /// share (claude and codex, when they resume or fork a session).
+    pub cumulative: bool,
 }
 
 impl AttemptReport {
@@ -197,8 +204,9 @@ impl WorkOutcome {
     }
 }
 
-/// The common contract every worker adapter implements.
-pub trait Worker {
+/// The common contract every worker adapter implements. `Sync` because a
+/// fan-out node runs one adapter on several threads at once.
+pub trait Worker: Sync {
     /// The capabilities this worker advertises to the graph validator. A fresh
     /// session per attempt is the baseline and needs none.
     fn capabilities(&self) -> &'static [Capability] {
@@ -271,6 +279,7 @@ fn test_request(dir: &std::path::Path, node: &str) -> WorkRequest {
         read_only: false,
         extra_writable_dir: None,
         resume_session: None,
+        fork_session: false,
         graph: "t".to_owned(),
         project_root: dir.to_path_buf(),
         worktree_branch: None,

@@ -350,17 +350,15 @@ fn progress_sink_finishes_even_when_the_worker_panics() {
     let runtime = Runtime::with_workers(root.clone(), Config::builtin(), workers)
         .with_progress(Arc::new(rec.clone()));
 
-    // The worker panics inside adapter.run; the driver's RAII finish guard must
-    // still fire attempt_finished while the run unwinds. (The panic prints a
-    // backtrace to the test log; we deliberately don't touch the process-global
-    // panic hook, which would race with other tests running in parallel.)
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.start("test-critique", Some("x"), None, &Isolation::Shared)
-    }));
-    assert!(
-        outcome.is_err(),
-        "the worker panic propagates out of start()"
-    );
+    // The worker panics inside adapter.run on its attempt thread. The driver
+    // turns the panic into a failed attempt, so the run ends `failed` and the
+    // sink still brackets the attempt. (The panic prints a backtrace to the test
+    // log; we deliberately don't touch the process-global panic hook, which
+    // would race with other tests running in parallel.)
+    let report = runtime
+        .start("test-critique", Some("x"), None, &Isolation::Shared)
+        .expect("a worker panic is a failed attempt, not a crashed run");
+    assert_eq!(report.disposition, Some(Disposition::Failed));
 
     let log = rec.log.lock().unwrap();
     let brackets: Vec<&Entry> = log
@@ -476,6 +474,7 @@ fn write_run(root: &Path, run_id: &str, inputs: BTreeMap<String, String>, extra:
         inputs,
         defaults: Default::default(),
         checks: Default::default(),
+        sessions: Default::default(),
     };
     for (node, attempt, body) in std::iter::once((None, None, created)).chain(extra) {
         j.append(run_id, node, attempt, Actor::runtime(), body)

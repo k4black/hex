@@ -253,14 +253,11 @@ fn policy(
                 Some(program) if program != worker => format!("{worker} {} {program}", g.binds),
                 _ => worker.clone(),
             });
-            parts.push(
-                if *context == hex_runtime::Context::Continue {
-                    "session continues"
-                } else {
-                    "fresh"
-                }
-                .to_owned(),
-            );
+            parts.push(match context {
+                hex_runtime::Context::Continue => "session continues".to_owned(),
+                hex_runtime::Context::Fork(from) => format!("forks {from}"),
+                hex_runtime::Context::Fresh => "fresh".to_owned(),
+            });
             if *read_only {
                 parts.push("read-only".to_owned());
             }
@@ -285,6 +282,9 @@ fn policy(
             parts.push("terminal".to_owned());
             parts.push(disposition.as_str().to_owned());
         }
+    }
+    if node.join {
+        parts.push("join: waits for all".to_owned());
     }
     parts.join(&format!(" {} ", g.sep))
 }

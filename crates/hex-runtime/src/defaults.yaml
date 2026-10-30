@@ -30,8 +30,9 @@ workers:
 # Cross-model by default: the reviewer runs a different agent from the
 # implementer, so the model that judges the change is not the one that wrote it.
 #
-# No role sets a `model` or `effort`: a fresh install runs each CLI's own
-# default model. Pin models in `~/.config/hex/config.yaml`.
+# Only `scout` pins a model: it exists to be the cheap, fast lookup. Every other
+# role runs its CLI's own default model. Pin models in
+# `~/.config/hex/config.yaml`.
 roles:
   implementer:
     worker: claude
@@ -63,6 +64,15 @@ roles:
       You are researching. Gather evidence before concluding, prefer primary
       sources, and cite them. Separate what you verified from what you inferred,
       and say plainly when something could not be established.
+
+  scout:
+    worker: claude
+    model: claude-sonnet-5-5
+    read_only: true
+    prompt: |
+      You are a scout: a fast, narrow lookup. Answer only the question asked,
+      with file:line references or source links. Do not edit files. Do not
+      explore beyond what the question needs.
 
 # Fallback compile defaults a graph inherits when it declares none.
 defaults:

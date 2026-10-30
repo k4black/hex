@@ -4,7 +4,7 @@
 //!
 //! Config holds three things: the **worker registry** (how to invoke each agent
 //! CLI — internal plumbing), the **roles** a graph actually names
-//! (implementer/reviewer/planner/researcher, each binding a worker to a model,
+//! (implementer/reviewer/planner/researcher/scout, each binding a worker to a model,
 //! effort, read-only policy and prompt preamble), and the project's **checks**.
 //!
 //! The built-in layer is [`DEFAULTS`] — a real YAML file embedded in the binary
@@ -225,6 +225,15 @@ pub(crate) fn user_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one built-in role that pins a model: the cheap, read-only lookup.
+    #[test]
+    fn the_builtin_scout_is_a_pinned_read_only_claude() {
+        let scout = &Config::builtin().roles["scout"];
+        assert_eq!(scout.worker.as_deref(), Some("claude"));
+        assert_eq!(scout.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(scout.read_only, Some(true));
+    }
 
     #[test]
     fn merge_lets_project_override() {

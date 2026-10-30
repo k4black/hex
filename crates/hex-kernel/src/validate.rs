@@ -5,11 +5,11 @@
 //! spends a token: dangling references, unreachable nodes, a zero budget that is
 //! spent before the first visit, and agent proposals that cannot route.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hex_proto::{Disposition, Event, EventBody, PROTOCOL_VERSION};
 
-use crate::graph::{Graph, NodeKind, NodeSpec};
+use crate::graph::{Context, Graph, NodeKind, NodeSpec};
 use crate::lifecycle;
 
 /// A single validation failure, located by node/edge where possible.
@@ -93,6 +93,8 @@ pub fn validate(graph: &Graph) -> Result<(), Vec<Issue>> {
         }
     }
 
+    check_forks(graph, &mut issues);
+    check_joins(graph, &mut issues);
     check_reachability(graph, &mut issues);
     check_routing(graph, &mut issues);
     check_signal_names(graph, &mut issues);
@@ -103,6 +105,110 @@ pub fn validate(graph: &Graph) -> Result<(), Vec<Issue>> {
         Ok(())
     } else {
         Err(issues)
+    }
+}
+
+/// Where the branches of a list edge meet, the meeting node must be a join:
+/// entering a node that is already active is a no-op, so without `join: all`
+/// the second branch's arrival would be lost. A walk from each target stops at a
+/// `human` node, a terminal, or a join that *every* target reaches (it merges
+/// them all). A join only some targets reach starts with the others still
+/// waiting, so the walk goes on past it.
+///
+/// shortcut: "reaches" means "can reach". With conditional routes, branches can
+/// still pick different joins that later meet at a non-join. Add a dominance
+/// check if a real graph needs it.
+fn check_joins(graph: &Graph, issues: &mut Vec<Issue>) {
+    for node in graph.nodes.values() {
+        if node.join && !matches!(node.spec, NodeSpec::Agent { .. } | NodeSpec::Command { .. }) {
+            issues.push(Issue::new(
+                "E-join-kind",
+                format!(
+                    "`{}` has `join: all`, but only an agent or command node can join",
+                    node.id
+                ),
+            ));
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for edge in &graph.edges {
+        let targets = graph.routes(&edge.from, &edge.on);
+        if targets.len() < 2 || !seen.insert((&edge.from, &edge.on)) {
+            continue;
+        }
+        // Grow the set of merging joins until it is stable.
+        let mut merged: BTreeSet<&str> = BTreeSet::new();
+        let reach = loop {
+            let mut reach: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+            for &target in &targets {
+                let mut stack = vec![target];
+                while let Some(id) = stack.pop() {
+                    let stops = graph.node(id).is_none_or(|n| {
+                        merged.contains(id)
+                            || matches!(n.spec, NodeSpec::Human { .. } | NodeSpec::Terminal { .. })
+                    });
+                    if stops || !reach.entry(id).or_default().insert(target) {
+                        continue;
+                    }
+                    stack.extend(
+                        graph
+                            .edges
+                            .iter()
+                            .filter(|e| e.from == id)
+                            .map(|e| e.to.as_str()),
+                    );
+                }
+            }
+            let grown = reach
+                .iter()
+                .filter(|(id, by)| {
+                    by.len() == targets.len() && graph.node(id).is_some_and(|n| n.join)
+                })
+                .fold(false, |grown, (id, _)| merged.insert(id) || grown);
+            if !grown {
+                break reach;
+            }
+        };
+        for (id, by) in reach {
+            if by.len() > 1 && !graph.node(id).is_some_and(|n| n.join) {
+                issues.push(Issue::new(
+                    "E-join-missing",
+                    format!(
+                        "`{id}` is reached from several branches of `{}.{}` ({}) — declare \
+                         `join: all` on it, or a later arrival is lost",
+                        edge.from,
+                        edge.on,
+                        by.into_iter().collect::<Vec<_>>().join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// A fork target must be another agent node: only an agent has a session.
+fn check_forks(graph: &Graph, issues: &mut Vec<Issue>) {
+    for node in graph.nodes.values() {
+        let NodeSpec::Agent {
+            context: Context::Fork(target),
+            ..
+        } = &node.spec
+        else {
+            continue;
+        };
+        let is_agent = matches!(
+            graph.node(target).map(|n| &n.spec),
+            Some(NodeSpec::Agent { .. })
+        );
+        if target == &node.id || !is_agent {
+            issues.push(Issue::new(
+                "E-fork-target",
+                format!(
+                    "agent `{}` forks `{target}`, which is not another agent node",
+                    node.id
+                ),
+            ));
+        }
     }
 }
 
@@ -374,13 +480,14 @@ fn check_acceptance(graph: &Graph, issues: &mut Vec<Issue>) {
             // `done` when it has a `done` edge (implicit completion).
             NodeSpec::Agent { may_propose, .. } => {
                 may_propose.iter().any(|s| s == &req.signal)
-                    || (req.signal == DONE_SIGNAL && graph.route(&req.node, DONE_SIGNAL).is_some())
+                    || (req.signal == DONE_SIGNAL
+                        && !graph.routes(&req.node, DONE_SIGNAL).is_empty())
             }
             NodeSpec::Command { .. } => req.signal == "passed" || req.signal == "failed",
             // An answered human node produces the signal of its single outgoing
             // edge, so requiring it (an approval as acceptance evidence) is
             // satisfiable exactly when that edge exists.
-            NodeSpec::Human { .. } => graph.route(&req.node, &req.signal).is_some(),
+            NodeSpec::Human { .. } => !graph.routes(&req.node, &req.signal).is_empty(),
             NodeSpec::Terminal { .. } => false,
         };
         if !producible {
@@ -541,11 +648,10 @@ fn bad_at(index: usize, state: &crate::RunState, why: impl Into<String>) -> Issu
     bad(
         index,
         format!(
-            "{} [status={}, current={}, in_flight={}, asked={}]",
+            "{} [status={}, active={:?}, asked={}]",
             why.into(),
             state.status,
-            state.current.as_deref().unwrap_or("none"),
-            state.current_attempt.as_deref().unwrap_or("none"),
+            state.active,
             state.asked.as_deref().unwrap_or("none"),
         ),
     )
@@ -758,6 +864,7 @@ mod tests {
                     inputs: Default::default(),
                     defaults: Default::default(),
                     checks: Default::default(),
+                    sessions: Default::default(),
                 },
             ),
             ev(1, None, None, EventBody::RunStarted),
@@ -974,6 +1081,7 @@ mod tests {
             None,
             EventBody::Steered {
                 text: "while you're stopped: use the v2 API".to_owned(),
+                node: None,
             },
         ));
         events.push(ev(4, None, None, EventBody::RunResumed));
@@ -1071,6 +1179,7 @@ mod tests {
                     inputs: Default::default(),
                     defaults: Default::default(),
                     checks: Default::default(),
+                    sessions: Default::default(),
                 },
             ),
             ev(1, None, None, EventBody::RunStarted),
@@ -1131,6 +1240,7 @@ mod tests {
                     inputs: Default::default(),
                     defaults: Default::default(),
                     checks: Default::default(),
+                    sessions: Default::default(),
                 },
             ),
             ev(1, None, None, EventBody::RunStarted),
@@ -1163,6 +1273,7 @@ mod tests {
                     inputs: Default::default(),
                     defaults: Default::default(),
                     checks: Default::default(),
+                    sessions: Default::default(),
                 },
             ),
             ev(1, None, None, EventBody::RunStarted),
@@ -1247,6 +1358,7 @@ mod tests {
                     inputs: Default::default(),
                     defaults: Default::default(),
                     checks: Default::default(),
+                    sessions: Default::default(),
                 },
             ),
             ev(1, None, None, EventBody::RunStarted),
@@ -1279,6 +1391,7 @@ mod tests {
                     inputs: Default::default(),
                     defaults: Default::default(),
                     checks: Default::default(),
+                    sessions: Default::default(),
                 },
             ),
             ev(1, None, None, EventBody::RunStarted),
@@ -1335,6 +1448,7 @@ mod tests {
             None,
             EventBody::Steered {
                 text: "forged guidance".to_owned(),
+                node: None,
             },
         )];
         events.extend(started_journal().into_iter().enumerate().map(|(i, mut e)| {
@@ -1344,10 +1458,96 @@ mod tests {
         assert!(check_journal(&g, &events).is_err());
     }
 
-    /// And not mid-attempt either: the loop is inside an opaque worker then, so
-    /// nothing drains the inbox and no `Steered` can be recorded.
+    /// Branches of a list edge that meet must meet at a join.
     #[test]
-    fn check_journal_rejects_steering_mid_attempt() {
+    fn branches_that_meet_need_a_join() {
+        let graph = |join: bool| {
+            let b = Graph::builder("t", "r")
+                .agent("r", "w", "p", &[])
+                .agent("a", "w", "p", &[])
+                .agent("b", "w", "p", &[])
+                .agent("m", "w", "p", &[])
+                .terminal("done", Disposition::Succeeded)
+                .edge("r", "done", "a")
+                .edge("r", "done", "b")
+                .edge("a", "done", "m")
+                .edge("b", "done", "m")
+                .edge("m", "done", "done");
+            if join { b.join("m").build() } else { b.build() }
+        };
+        let issues = validate(&graph(false)).unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.code == "E-join-missing"),
+            "{issues:?}"
+        );
+        assert!(validate(&graph(true)).is_ok());
+    }
+
+    /// Two joins that each take only some branches do not merge them: what
+    /// follows both still needs a join.
+    #[test]
+    fn partial_joins_do_not_merge_the_branches() {
+        let g = Graph::builder("t", "r")
+            .agent("r", "w", "p", &[])
+            .agent("ja", "w", "p", &[])
+            .agent("jb", "w", "p", &[])
+            .agent("m", "w", "p", &[])
+            .terminal("done", Disposition::Succeeded)
+            .edge("r", "done", "ja")
+            .edge("r", "done", "jb")
+            .edge("ja", "done", "m")
+            .edge("jb", "done", "m")
+            .edge("m", "done", "done")
+            .join("ja")
+            .join("jb")
+            .build();
+        let issues = validate(&g).unwrap_err();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.code == "E-join-missing" && i.message.contains("`m`")),
+            "{issues:?}"
+        );
+    }
+
+    /// `join` belongs on a node that runs: a human or terminal already waits.
+    #[test]
+    fn a_join_on_a_terminal_is_refused() {
+        let g = Graph::builder("t", "a")
+            .agent("a", "w", "p", &[])
+            .terminal("done", Disposition::Succeeded)
+            .edge("a", "done", "done")
+            .join("done")
+            .build();
+        let issues = validate(&g).unwrap_err();
+        assert!(issues.iter().any(|i| i.code == "E-join-kind"), "{issues:?}");
+    }
+
+    /// A fork names another agent node: not itself, not a terminal.
+    #[test]
+    fn a_fork_must_name_another_agent() {
+        for target in ["a", "done"] {
+            let mut g = Graph::builder("t", "a")
+                .agent("a", "w", "p", &[])
+                .terminal("done", Disposition::Succeeded)
+                .edge("a", "done", "done")
+                .build();
+            if let Some(NodeSpec::Agent { context, .. }) = g.nodes.get_mut("a").map(|n| &mut n.spec)
+            {
+                *context = Context::Fork(target.to_owned());
+            }
+            let issues = validate(&g).unwrap_err();
+            assert!(
+                issues.iter().any(|i| i.code == "E-fork-target"),
+                "{target}: {issues:?}"
+            );
+        }
+    }
+
+    /// Mid-attempt is fine: other attempts may still run, and the steer waits
+    /// for the next agent attempt.
+    #[test]
+    fn check_journal_accepts_steering_mid_attempt() {
         let g = cyclic();
         let mut events = started_journal();
         events.push(ev(
@@ -1356,8 +1556,9 @@ mod tests {
             None,
             EventBody::Steered {
                 text: "forged guidance".to_owned(),
+                node: None,
             },
         ));
-        assert!(check_journal(&g, &events).is_err());
+        assert!(check_journal(&g, &events).is_ok());
     }
 }

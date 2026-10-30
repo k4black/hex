@@ -43,7 +43,7 @@ impl NodeKind {
 }
 
 /// Per-node context policy: whether each attempt gets a fresh worker session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Context {
     /// A new worker session per attempt (the default).
     #[default]
@@ -52,6 +52,11 @@ pub enum Context {
     /// keep what the earlier ones established instead of re-deriving it. Requires
     /// the bound worker to declare [`hex_proto::Capability::SessionResume`].
     Continue,
+    /// `{ fork: <node> }`: the first visit starts a new session from `<node>`'s
+    /// session, so it begins with everything that node learned. Later visits
+    /// continue this node's own forked session. Requires
+    /// [`hex_proto::Capability::SessionFork`] and the same program as `<node>`.
+    Fork(String),
 }
 
 /// Kind-specific configuration of a node. The variant *is* the kind.
@@ -170,6 +175,9 @@ pub struct Node {
     /// cheap lint cycle and an expensive review cycle can cap the review at 3
     /// without also capping the lint.
     pub max_visits: Option<u32>,
+    /// `join: all`: the node waits while any other node is active, so it runs
+    /// once, after every parallel branch that leads to it has finished.
+    pub join: bool,
 }
 
 impl Node {
@@ -180,6 +188,7 @@ impl Node {
             id: id.into(),
             spec,
             max_visits: None,
+            join: false,
         }
     }
 }
@@ -290,13 +299,15 @@ impl Graph {
         self.nodes.get(id)
     }
 
-    /// The target of the edge leaving `from` on `signal`, if any (first match).
+    /// Every target of the edges leaving `from` on `signal`, in declared order.
+    /// More than one target is a fan-out: the run enters all of them.
     #[must_use]
-    pub fn route(&self, from: &str, signal: &str) -> Option<&str> {
+    pub fn routes(&self, from: &str, signal: &str) -> Vec<&str> {
         self.edges
             .iter()
-            .find(|e| e.from == from && e.on == signal)
+            .filter(|e| e.from == from && e.on == signal)
             .map(|e| e.to.as_str())
+            .collect()
     }
 
     /// Routing event names leaving `from`.
@@ -418,6 +429,15 @@ impl Builder {
                 mode: CommandMode::Ordered,
             },
         );
+        self
+    }
+
+    /// Make an already-added node a join (`join: all`).
+    #[must_use]
+    pub fn join(mut self, id: &str) -> Self {
+        if let Some(node) = self.graph.nodes.get_mut(id) {
+            node.join = true;
+        }
         self
     }
 
