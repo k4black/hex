@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/k4black/hex/compare/v0.1.2...v0.2.0) - 2026-10-30
+
+### Added
+
+- run hex as the operator's sub-agents ([#17](https://github.com/k4black/hex/pull/17))
+
+### Other
+
+- rework README and the hex skill ([#14](https://github.com/k4black/hex/pull/14))
+- *(deps)* bump sha2 from 0.10.9 to 0.11.0 ([#4](https://github.com/k4black/hex/pull/4))
+
 ## [0.1.2](https://github.com/k4black/hex/compare/v0.1.1...v0.1.2)
 
 ### Fixed
