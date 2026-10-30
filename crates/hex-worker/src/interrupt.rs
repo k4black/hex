@@ -38,3 +38,26 @@ pub fn requested() -> bool {
 pub fn reset() {
     REQUESTED.store(false, Ordering::SeqCst);
 }
+
+// shortcut: process-wide, so it stops every run in this process; `hex` drives one
+// run per process. Pass a per-run token in `WorkRequest` for a multi-run host.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// Stop every attempt in flight without pausing the run: the runtime calls it
+/// when one parallel attempt ends the run, then journals the others as
+/// interrupted. Unlike [`request`], it does not mean "the operator asked".
+pub fn stop_attempts() {
+    STOPPING.store(true, Ordering::SeqCst);
+}
+
+/// Clear [`stop_attempts`], once the attempts it stopped are closed.
+pub fn clear_stop() {
+    STOPPING.store(false, Ordering::SeqCst);
+}
+
+/// Whether an attempt in flight must stop now: an operator interrupt or
+/// [`stop_attempts`].
+#[must_use]
+pub fn should_stop() -> bool {
+    requested() || STOPPING.load(Ordering::SeqCst)
+}

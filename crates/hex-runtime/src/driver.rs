@@ -1,13 +1,15 @@
 //! The drive loop — the imperative shell around the pure kernel.
 //!
-//! Per iteration: ask [`hex_kernel::schedule`] for the next effect, journal the
-//! intent *before* performing it (idempotency key), execute it via a worker or
-//! a gate process, journal the result, fold it through [`hex_kernel::reduce`],
-//! and repeat until the kernel schedules nothing (terminal or blocked).
+//! Per iteration: ask [`hex_kernel::schedule`] for the next effects, journal
+//! each intent *before* performing it (idempotency key), start each attempt on
+//! its own thread, journal each outcome as it arrives, fold it through
+//! [`hex_kernel::reduce`], and repeat until the kernel schedules nothing
+//! (terminal or blocked). The main thread is the only journal writer.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Instant;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 
 use std::collections::BTreeMap;
 
@@ -15,7 +17,7 @@ use hex_kernel::graph::{CommandMode, CommandStep, Context, NodeKind, NodeSpec};
 use hex_kernel::validate::{DONE_SIGNAL, UNKNOWN_SIGNAL};
 use hex_kernel::{Effect, Graph, RunState, SessionHandle, Status, reduce, schedule};
 use hex_proto::{Actor, Command, Disposition, EventBody};
-use hex_worker::{VERDICT_PREFIX, WorkOutcome, WorkRequest};
+use hex_worker::{VERDICT_PREFIX, WorkOutcome, WorkRequest, Worker};
 
 use crate::control::{Heartbeat, Inbox};
 use crate::error::{HexError, Result};
@@ -92,20 +94,6 @@ pub trait ProgressSink {
     fn attempt_finished(&self) {}
 }
 
-/// Fires [`ProgressSink::attempt_finished`] on scope exit — including a panic
-/// unwind from the opaque worker — so every `attempt_started` is paired even if
-/// `Worker::run` panics. The sink ref is a shared borrow of the runtime's sink,
-/// independent of the `&mut self` record calls it lives across.
-struct FinishGuard<'s>(Option<&'s dyn ProgressSink>);
-
-impl Drop for FinishGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(sink) = self.0 {
-            sink.attempt_finished();
-        }
-    }
-}
-
 /// The active worktree for an isolated run: what the agent commit banner names
 /// and the signal that the control channel lives outside the workspace.
 #[derive(Clone)]
@@ -139,6 +127,69 @@ pub struct Session<'a> {
     /// only if a resumed run is ever seen wedging on the same gate again.
     gate_sigs: BTreeMap<String, String>,
     sink: Option<&'a dyn ProgressSink>,
+    /// Attempts on worker threads send their outcome here.
+    done_tx: Sender<Finished>,
+    done_rx: Receiver<Finished>,
+    /// Attempts started and not yet received back.
+    running: usize,
+    /// A `pause` that arrived while attempts ran: recorded once they are back.
+    pausing: Option<Actor>,
+    /// The attempt the sink previews. ponytail: one live preview; parallel
+    /// attempts show as plain event lines.
+    preview: Option<String>,
+}
+
+/// One attempt's work, owned so that it can run on its own thread.
+enum Job<'w> {
+    Agent(&'w dyn Worker, Box<WorkRequest>),
+    Command {
+        steps: Vec<CommandStep>,
+        mode: CommandMode,
+        workdir: PathBuf,
+        attempt_dir: PathBuf,
+        deadline_ms: Option<u64>,
+    },
+}
+
+/// What an attempt's thread hands back to the journal writer.
+enum Outcome {
+    Agent(WorkOutcome),
+    Command(std::result::Result<Vec<String>, ProcFail>),
+}
+
+/// A finished attempt, as the main thread receives it.
+struct Finished {
+    node_id: String,
+    attempt_id: String,
+    outcome: Outcome,
+}
+
+impl Job<'_> {
+    /// Run the work. A panic in the opaque worker becomes a failed outcome, so
+    /// the journal writer always hears back from every attempt it started.
+    fn run(self) -> Outcome {
+        let agent = matches!(self, Job::Agent(..));
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match self {
+            Job::Agent(adapter, request) => Outcome::Agent(adapter.run(&request)),
+            Job::Command {
+                steps,
+                mode,
+                workdir,
+                attempt_dir,
+                deadline_ms,
+            } => Outcome::Command(match mode {
+                CommandMode::Ordered => run_ordered(&steps, &workdir, &attempt_dir, deadline_ms),
+                CommandMode::Parallel => run_parallel(&steps, &workdir, &attempt_dir, deadline_ms),
+            }),
+        }));
+        ran.unwrap_or_else(|_| {
+            if agent {
+                Outcome::Agent(WorkOutcome::error("the worker panicked"))
+            } else {
+                Outcome::Command(Err(ProcFail::infra("the command runner panicked")))
+            }
+        })
+    }
 }
 
 impl<'a> Session<'a> {
@@ -158,6 +209,7 @@ impl<'a> Session<'a> {
         worktree: Option<WorktreeCtx>,
         sink: Option<&'a dyn ProgressSink>,
     ) -> Self {
+        let (done_tx, done_rx) = mpsc::channel();
         Self {
             graph,
             workers,
@@ -170,6 +222,11 @@ impl<'a> Session<'a> {
             worktree,
             gate_sigs: BTreeMap::new(),
             sink,
+            done_tx,
+            done_rx,
+            running: 0,
+            pausing: None,
+            preview: None,
         }
     }
 
@@ -211,10 +268,51 @@ impl<'a> Session<'a> {
         actor: Actor,
         disposition: Disposition,
     ) -> Result<()> {
+        self.stop_in_flight()?;
         if let Some(text) = note {
             self.record(None, None, actor.clone(), EventBody::Note { text })?;
         }
         self.record(None, None, actor, EventBody::RunFinished { disposition })
+    }
+
+    /// Stop every attempt still running and journal each one as interrupted,
+    /// with what it spent and produced, so that nothing is left open under the
+    /// terminal event that follows.
+    fn stop_in_flight(&mut self) -> Result<()> {
+        if self.running == 0 {
+            return Ok(());
+        }
+        hex_worker::interrupt::stop_attempts();
+        while self.running > 0 {
+            let finished = self
+                .done_rx
+                .recv()
+                .map_err(|_| HexError::new("an attempt thread vanished"))?;
+            self.running -= 1;
+            self.complete(finished, true)?;
+        }
+        hex_worker::interrupt::clear_stop();
+        Ok(())
+    }
+
+    /// Journal one attempt's outcome. `stopping` closes it as interrupted
+    /// whatever it reported, because the run is ending.
+    fn complete(&mut self, finished: Finished, stopping: bool) -> Result<()> {
+        let Finished {
+            node_id,
+            attempt_id,
+            outcome,
+        } = finished;
+        if self.preview.as_deref() == Some(attempt_id.as_str()) {
+            self.preview = None;
+            if let Some(sink) = self.sink {
+                sink.attempt_finished();
+            }
+        }
+        match outcome {
+            Outcome::Agent(o) => self.finish_agent(&node_id, &attempt_id, o, stopping),
+            Outcome::Command(o) => self.finish_command(&node_id, &attempt_id, o, stopping),
+        }
     }
 
     /// Drive the loop until the run reaches a terminal disposition — or an
@@ -226,39 +324,95 @@ impl<'a> Session<'a> {
         // A liveness beacon for the life of the loop, so a reader can tell a
         // long attempt from a wedged process (the lock alone cannot).
         let _heartbeat = Heartbeat::start(&self.run_dir);
-        // A generous ceiling so a pathological graph can never spin forever
-        // even if a budget was mis-declared; budgets normally stop it first.
-        for _ in 0..100_000 {
-            // Attempt boundaries are the only safe place to apply control: the
-            // loop is otherwise blocked inside an opaque worker, and pausing or
-            // cancelling mid-attempt would orphan it.
+        std::thread::scope(|scope| {
+            let result = self.drive_loop(scope);
+            if result.is_err() {
+                // Best effort: journal what the running attempts did before the
+                // error surfaces, so `resume` does not redo finished work.
+                let _ = self.stop_in_flight();
+            }
+            result
+        })
+    }
+
+    fn drive_loop<'s>(
+        &mut self,
+        scope: &'s std::thread::Scope<'s, '_>,
+    ) -> Result<Option<Disposition>>
+    where
+        'a: 's,
+    {
+        // A generous ceiling on scheduling passes so a pathological graph can
+        // never spin forever even if a budget was mis-declared; budgets
+        // normally stop it first.
+        let mut passes = 0u32;
+        while passes < 100_000 {
+            // Control applies whenever the loop wakes: between attempts, and
+            // each time a parallel attempt ends or the poll times out.
             self.ingest_control()?;
             if self.state.is_finished() {
                 break;
             }
-            // Interrupted between attempts: there is no attempt to close, so
-            // just pause here. Checked at the boundary for the same reason
-            // control is — anywhere else would orphan the in-flight attempt.
-            // (A human wait runs its own copy of this check inside
-            // `request_human`, since it blocks without reaching a boundary.)
-            if hex_worker::interrupt::requested() && self.state.status != Status::Paused {
-                self.runtime_event(EventBody::RunPaused)?;
-                return Ok(None);
+            // Interrupted or pausing: start nothing new, and pause once every
+            // attempt in flight is back and journaled. (A human wait runs its
+            // own copy of the interrupt check inside `request_human`, since it
+            // blocks without reaching this loop.)
+            let halting = hex_worker::interrupt::requested()
+                || self.pausing.is_some()
+                || self.state.status == Status::Paused;
+            let mut progressed = false;
+            if halting {
+                if self.running == 0 {
+                    if self.state.status != Status::Paused {
+                        let actor = self.pausing.take().unwrap_or_else(Actor::runtime);
+                        self.record(None, None, actor, EventBody::RunPaused)?;
+                    }
+                    self.pausing = None;
+                    return Ok(None);
+                }
+            } else {
+                for effect in schedule(self.graph, &self.state, now_ms()) {
+                    progressed = true;
+                    if let Some((node_id, attempt_id, job)) = self.execute(effect)? {
+                        let tx = self.done_tx.clone();
+                        scope.spawn(move || {
+                            let outcome = job.run();
+                            // The receiver lives as long as the session.
+                            let _ = tx.send(Finished {
+                                node_id,
+                                attempt_id,
+                                outcome,
+                            });
+                        });
+                        self.running += 1;
+                    }
+                    if self.state.is_finished() || self.state.status == Status::Paused {
+                        break;
+                    }
+                }
+                if self.state.is_finished() {
+                    break;
+                }
             }
-            if self.state.status == Status::Paused {
-                return Ok(None);
+            if progressed {
+                passes += 1;
             }
-            let effects = schedule(self.graph, &self.state, now_ms());
-            let Some(effect) = effects.into_iter().next() else {
+            if self.running > 0 {
+                match self
+                    .done_rx
+                    .recv_timeout(Duration::from_millis(RESPOND_POLL_MS))
+                {
+                    Ok(finished) => {
+                        self.running -= 1;
+                        self.complete(finished, false)?;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(HexError::new("the attempt channel closed"));
+                    }
+                }
+            } else if !progressed && self.state.status != Status::Paused {
                 break;
-            };
-            self.execute(effect)?;
-            if self.state.is_finished() {
-                break;
-            }
-            // A human wait can also absorb a pause while it blocks.
-            if self.state.status == Status::Paused {
-                return Ok(None);
             }
         }
         if !self.state.is_finished() {
@@ -323,6 +477,9 @@ impl<'a> Session<'a> {
                     Disposition::Cancelled,
                 )?;
             }
+            // A pause lands at an attempt boundary: with attempts in flight, the
+            // loop records it once they are all back.
+            Command::Pause if self.running > 0 => self.pausing = Some(actor.clone()),
             Command::Pause => self.record(None, None, actor.clone(), EventBody::RunPaused)?,
             // Only meaningful to lift a pause; a running run is already resumed.
             Command::Resume => {
@@ -330,11 +487,14 @@ impl<'a> Session<'a> {
                     self.record(None, None, actor.clone(), EventBody::RunResumed)?;
                 }
             }
-            Command::Steer { text } => self.record(
+            Command::Steer { text, node } => self.record(
                 None,
                 None,
                 actor.clone(),
-                EventBody::Steered { text: text.clone() },
+                EventBody::Steered {
+                    text: text.clone(),
+                    node: node.clone(),
+                },
             )?,
             Command::Respond { text } => {
                 let Some(node_id) = awaiting_human else {
@@ -382,27 +542,59 @@ impl<'a> Session<'a> {
         }
     }
 
-    fn execute(&mut self, effect: Effect) -> Result<()> {
-        match effect {
+    /// Perform one effect. An attempt comes back as a job for its own thread.
+    fn execute(&mut self, effect: Effect) -> Result<Option<(String, String, Job<'a>)>> {
+        let job = match &effect {
             Effect::StartAttempt {
                 node_id,
                 attempt_id,
                 idempotency_key,
-            } => self.start_attempt(&node_id, &attempt_id, &idempotency_key),
+            } => self.start_attempt(node_id, attempt_id, idempotency_key)?,
             Effect::RunCommand {
                 node_id,
                 attempt_id,
                 idempotency_key,
-            } => self.run_command(&node_id, &attempt_id, &idempotency_key),
+            } => self.run_command(node_id, attempt_id, idempotency_key)?,
             Effect::RerouteUnmet { to, missing } => {
-                self.runtime_event(EventBody::AcceptanceUnmet { missing, to })
+                self.runtime_event(EventBody::AcceptanceUnmet {
+                    missing: missing.clone(),
+                    to: to.clone(),
+                })?;
+                None
             }
             // Journal *why* before the outcome, so `budget_exhausted` and a
             // downgraded `failed` are self-explanatory instead of bare.
             Effect::RecordTerminal { disposition, why } => {
-                self.finish(why, Actor::runtime(), disposition)
+                self.finish(why.clone(), Actor::runtime(), *disposition)?;
+                None
             }
-            Effect::RequestHuman { node_id } => self.request_human(&node_id),
+            Effect::RequestHuman { node_id } => {
+                self.request_human(node_id)?;
+                None
+            }
+        };
+        Ok(job.map(|job| match effect {
+            Effect::StartAttempt {
+                node_id,
+                attempt_id,
+                ..
+            }
+            | Effect::RunCommand {
+                node_id,
+                attempt_id,
+                ..
+            } => (node_id, attempt_id, job),
+            _ => unreachable!("only attempts produce a job"),
+        }))
+    }
+
+    /// Show the attempt in the sink's live preview, if no other attempt holds it.
+    fn show(&mut self, view: impl FnOnce(&Self) -> AttemptView, attempt_id: &str) {
+        if let Some(sink) = self.sink
+            && self.preview.is_none()
+        {
+            sink.attempt_started(&view(self));
+            self.preview = Some(attempt_id.to_owned());
         }
     }
 
@@ -502,9 +694,16 @@ impl<'a> Session<'a> {
         self.finish(None, Actor::runtime(), disposition)
     }
 
-    fn start_attempt(&mut self, node_id: &str, attempt_id: &str, idk: &str) -> Result<()> {
+    /// Journal an agent attempt's start and build its job.
+    fn start_attempt(
+        &mut self,
+        node_id: &str,
+        attempt_id: &str,
+        idk: &str,
+    ) -> Result<Option<Job<'a>>> {
         let Some(node) = self.graph.node(node_id) else {
-            return self.fail_attempt(node_id, attempt_id, "unknown node", Disposition::Failed);
+            self.fail_attempt(node_id, attempt_id, "unknown node", Disposition::Failed)?;
+            return Ok(None);
         };
         let NodeSpec::Agent {
             worker,
@@ -514,12 +713,13 @@ impl<'a> Session<'a> {
             context,
         } = &node.spec
         else {
-            return self.fail_attempt(
+            self.fail_attempt(
                 node_id,
                 attempt_id,
                 "not an agent node",
                 Disposition::Failed,
-            );
+            )?;
+            return Ok(None);
         };
         let worker_name = worker.clone();
         let read_only = *read_only;
@@ -532,9 +732,14 @@ impl<'a> Session<'a> {
         // land on a different adapter than the one that opened the session. Only
         // resume a handle its own worker recorded — otherwise run fresh, rather
         // than handing a codex thread id to `claude --resume`.
-        let resume_handle = match context {
-            Context::Continue => self.state.sessions.get(node_id).cloned(),
-            Context::Fresh => None,
+        // `{ fork: <node> }` starts from that node's session on the first visit,
+        // then continues its own fork.
+        let own = self.state.sessions.get(node_id).cloned();
+        let (resume_handle, fork_from) = match context {
+            Context::Continue => (own, None),
+            Context::Fresh => (None, None),
+            Context::Fork(_) if own.is_some() => (own, None),
+            Context::Fork(from) => (self.state.sessions.get(from).cloned(), Some(from.clone())),
         };
         // Capture before `record` (its `&mut self`) ends the `node` borrow.
         let kind = node.spec.kind();
@@ -553,7 +758,14 @@ impl<'a> Session<'a> {
         // untrusted-data fencing `interpolate` puts around agent output. The
         // AttemptStarted event below clears the queue, so guidance lands on
         // exactly one attempt.
-        resolved_prompt.push_str(&steer_banner(&self.state.pending_steer));
+        let steers: Vec<String> = self
+            .state
+            .pending_steer
+            .iter()
+            .chain(self.state.node_steer.get(node_id).into_iter().flatten())
+            .cloned()
+            .collect();
+        resolved_prompt.push_str(&steer_banner(&steers));
         // One role banner per node. A read-only node whose prompt already runs
         // `git diff` gets the review scope (the diff base is a runtime fact,
         // never authored) — the prompt test keeps it off read-only nodes that
@@ -580,34 +792,47 @@ impl<'a> Session<'a> {
             },
         )?;
 
-        let Some(adapter) = self.workers.get(&worker_name) else {
-            return self.fail_attempt(
+        let workers = self.workers;
+        let Some(adapter) = workers.get(&worker_name) else {
+            self.fail_attempt(
                 node_id,
                 attempt_id,
                 &format!("unknown worker `{worker_name}`"),
                 Disposition::Failed,
-            );
+            )?;
+            return Ok(None);
         };
 
         let resume_session = resumable_id(resume_handle.as_ref(), adapter.program());
+        if let Some(from) = &fork_from
+            && resume_session.is_none()
+        {
+            self.fail_attempt(
+                node_id,
+                attempt_id,
+                &format!(
+                    "`{from}` has no session to fork: it has not run yet, or its agent reported \
+                     none"
+                ),
+                Disposition::Failed,
+            )?;
+            return Ok(None);
+        }
 
         let attempt_dir = self.attempt_dir(attempt_id)?;
         let deadline_ms = self.attempt_deadline();
-        // The sink is a shared ref (Copy), so we can hold it across the `&mut
-        // self` record calls below without borrowing `self`.
-        let sink = self.sink;
-        if let Some(s) = sink {
-            let view = self.attempt_view(
-                node_id,
-                kind,
-                attempt_id,
-                Some(worker_name.clone()),
-                deadline_ms,
-            );
-            s.attempt_started(&view);
-        }
-        // Pairs attempt_finished on scope exit, even if adapter.run panics.
-        let _finish = FinishGuard(sink);
+        self.show(
+            |s| {
+                s.attempt_view(
+                    node_id,
+                    kind,
+                    attempt_id,
+                    Some(worker_name.clone()),
+                    deadline_ms,
+                )
+            },
+            attempt_id,
+        );
         let request = WorkRequest {
             run_id: self.run_id.clone(),
             node_id: node_id.to_owned(),
@@ -621,6 +846,7 @@ impl<'a> Session<'a> {
             // worktree workspace — a path-sandboxed worker must keep it writable.
             extra_writable_dir: self.worktree.as_ref().map(|_| self.run_dir.clone()),
             resume_session,
+            fork_session: fork_from.is_some(),
             graph: self.graph.name.clone(),
             // run_dir is `<root>/.hex/runs/<id>` (the journal stays in the main
             // `.hex` even under worktree isolation), so the project
@@ -633,22 +859,48 @@ impl<'a> Session<'a> {
                 .to_path_buf(),
             worktree_branch: self.worktree.as_ref().map(|w| w.branch.clone()),
         };
+        Ok(Some(Job::Agent(adapter, Box::new(request))))
+    }
+
+    /// Journal what an agent attempt spent and produced, then route it.
+    fn finish_agent(
+        &mut self,
+        node_id: &str,
+        attempt_id: &str,
+        outcome: WorkOutcome,
+        stopping: bool,
+    ) -> Result<()> {
+        let Some(NodeSpec::Agent {
+            worker: worker_name,
+            may_propose,
+            ..
+        }) = self.graph.node(node_id).map(|n| &n.spec)
+        else {
+            return self.fail_attempt(
+                node_id,
+                attempt_id,
+                "not an agent node",
+                Disposition::Failed,
+            );
+        };
+        let worker_name = worker_name.clone();
+        let claims_cost = self.workers.get(&worker_name).is_some_and(|w| {
+            w.capabilities()
+                .contains(&hex_proto::Capability::CostReporting)
+        });
         let WorkOutcome {
             result,
             error,
             timed_out,
             interrupted,
             report,
-        } = adapter.run(&request);
+        } = outcome;
 
         // Facts this attempt's *silence* must be judged against, captured before
         // `report` and `result` are consumed below.
         let reported_usage = report
             .as_ref()
             .is_some_and(|r| !r.models.is_empty() || r.cost_micro_usd.is_some());
-        let claims_cost = adapter
-            .capabilities()
-            .contains(&hex_proto::Capability::CostReporting);
         let had_text = result.as_deref().is_some_and(|t| !t.trim().is_empty());
 
         // What the agent spent goes down first, because everything after this can
@@ -667,6 +919,7 @@ impl<'a> Session<'a> {
                     models: report.models,
                     cost_micro_usd: report.cost_micro_usd,
                     duration_ms: report.duration_ms,
+                    cumulative: report.cumulative,
                 },
             )?;
         }
@@ -691,11 +944,11 @@ impl<'a> Session<'a> {
             )?;
         }
 
-        // The operator interrupted the run. The agent is already dead (its
-        // process group was killed) and everything it spent and produced is
-        // journaled above, so the attempt is closed and the run pauses — it is
-        // resumable, and nothing is left running unrecorded.
-        if interrupted {
+        // The operator interrupted the run, or a sibling ended it. The agent is
+        // already dead (its process group was killed) and everything it spent
+        // and produced is journaled above, so the attempt is closed. The drive
+        // loop pauses the run once every attempt is back.
+        if interrupted || stopping {
             return self.interrupt_attempt(node_id, attempt_id);
         }
 
@@ -732,8 +985,18 @@ impl<'a> Session<'a> {
         self.fail_attempt(node_id, attempt_id, &error, disposition)
     }
 
-    /// Journal a routing signal for an attempt.
+    /// Journal a routing signal for an attempt. A signal with no edge would end
+    /// the run inside `reduce` with no `RunFinished` and with siblings still
+    /// running, so it fails the attempt here instead.
     fn signal(&mut self, node_id: &str, attempt_id: &str, actor: Actor, name: &str) -> Result<()> {
+        if self.graph.routes(node_id, name).is_empty() {
+            return self.fail_attempt(
+                node_id,
+                attempt_id,
+                &format!("`{name}` has no edge out of `{node_id}`"),
+                Disposition::Failed,
+            );
+        }
         self.record(
             Some(node_id),
             Some(attempt_id),
@@ -756,7 +1019,7 @@ impl<'a> Session<'a> {
         // A node with no declared outcomes completes implicitly; whatever the
         // message says is a result, never a verdict.
         if may_propose.is_empty() {
-            return if self.graph.route(node_id, DONE_SIGNAL).is_some() {
+            return if !self.graph.routes(node_id, DONE_SIGNAL).is_empty() {
                 self.signal(node_id, attempt_id, Actor::agent(worker_name), DONE_SIGNAL)
             } else {
                 self.fail_attempt(
@@ -776,7 +1039,7 @@ impl<'a> Session<'a> {
             // reserved `unknown`: route its declared edge, else fail closed
             // naming the outcomes the node was asked for.
             other => {
-                if self.graph.route(node_id, UNKNOWN_SIGNAL).is_some() {
+                if !self.graph.routes(node_id, UNKNOWN_SIGNAL).is_empty() {
                     return self.signal(
                         node_id,
                         attempt_id,
@@ -797,19 +1060,27 @@ impl<'a> Session<'a> {
         }
     }
 
-    fn run_command(&mut self, node_id: &str, attempt_id: &str, idk: &str) -> Result<()> {
+    /// Journal a command attempt's start and build its job.
+    fn run_command(
+        &mut self,
+        node_id: &str,
+        attempt_id: &str,
+        idk: &str,
+    ) -> Result<Option<Job<'a>>> {
         let Some(node) = self.graph.node(node_id) else {
-            return self.fail_attempt(node_id, attempt_id, "unknown node", Disposition::Failed);
+            self.fail_attempt(node_id, attempt_id, "unknown node", Disposition::Failed)?;
+            return Ok(None);
         };
         let (steps, mode) = match &node.spec {
             NodeSpec::Command { steps, mode } => (steps.clone(), *mode),
             _ => {
-                return self.fail_attempt(
+                self.fail_attempt(
                     node_id,
                     attempt_id,
                     "not a command node",
                     Disposition::Failed,
-                );
+                )?;
+                return Ok(None);
             }
         };
         // Capture before `record` (its `&mut self`) ends the `node` borrow.
@@ -827,20 +1098,46 @@ impl<'a> Session<'a> {
 
         let attempt_dir = self.attempt_dir(attempt_id)?;
         let deadline_ms = self.attempt_deadline();
-        let sink = self.sink;
-        if let Some(s) = sink {
-            // A command has no worker; its steps' output still streams.
-            let view = self.attempt_view(node_id, kind, attempt_id, None, deadline_ms);
-            s.attempt_started(&view);
+        // A command has no worker; its steps' output still streams.
+        self.show(
+            |s| s.attempt_view(node_id, kind, attempt_id, None, deadline_ms),
+            attempt_id,
+        );
+        Ok(Some(Job::Command {
+            steps,
+            mode,
+            workdir: self.workdir.clone(),
+            attempt_dir,
+            deadline_ms,
+        }))
+    }
+
+    /// Journal a command attempt's verdict.
+    ///
+    /// An infrastructure failure (spawn/log/timeout) is NOT a `failed` verdict —
+    /// routing it as `failed` would feed a token-spending loop on false evidence.
+    /// Only a real exit status yields passed/failed.
+    fn finish_command(
+        &mut self,
+        node_id: &str,
+        attempt_id: &str,
+        outcome: std::result::Result<Vec<String>, ProcFail>,
+        stopping: bool,
+    ) -> Result<()> {
+        if stopping {
+            return self.interrupt_attempt(node_id, attempt_id);
         }
-        let _finish = FinishGuard(sink);
-        // An infrastructure failure (spawn/log/timeout) is NOT a `failed`
-        // verdict — routing it as `failed` would feed a token-spending loop on
-        // false evidence. Only a real exit status yields passed/failed.
-        let outcome = match mode {
-            CommandMode::Ordered => run_ordered(&steps, &self.workdir, &attempt_dir, deadline_ms),
-            CommandMode::Parallel => run_parallel(&steps, &self.workdir, &attempt_dir, deadline_ms),
+        let Some(NodeSpec::Command { steps, mode }) = self.graph.node(node_id).map(|n| &n.spec)
+        else {
+            return self.fail_attempt(
+                node_id,
+                attempt_id,
+                "not a command node",
+                Disposition::Failed,
+            );
         };
+        let (count, mode) = (steps.len(), *mode);
+        let attempt_dir = self.run_dir.join("attempts").join(attempt_id);
         match outcome {
             Ok(failed) => {
                 if failed.is_empty() {
@@ -858,7 +1155,7 @@ impl<'a> Session<'a> {
                         text: format!(
                             "{} of {} {} step(s) failed: {}",
                             failed.len(),
-                            steps.len(),
+                            count,
                             mode.as_str(),
                             failed.join(", ")
                         ),
@@ -895,23 +1192,23 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Close an attempt the operator interrupted, and pause the run.
+    /// Close an attempt the operator interrupted, or that a sibling's end
+    /// stopped.
     ///
     /// Not a failure: nothing was exceeded and nothing went wrong, so recording
     /// `AttemptFailed` would both misreport the run and make it unresumable
     /// (a failed attempt ends the run — redo is a new run). `AttemptInterrupted`
     /// is the same event `resume` writes for an attempt orphaned by a crash,
-    /// which is exactly what this is, only deliberate. `RunPaused` then leaves
-    /// the run in a state that already has a producer, an exit code (6) and a
-    /// continuation verb (`hex resume`).
+    /// which is exactly what this is, only deliberate. After an interrupt, the
+    /// drive loop records `RunPaused` once every attempt is back: a state with a
+    /// producer, an exit code (6) and a continuation verb (`hex resume`).
     fn interrupt_attempt(&mut self, node_id: &str, attempt_id: &str) -> Result<()> {
         self.record(
             Some(node_id),
             Some(attempt_id),
             Actor::runtime(),
             EventBody::AttemptInterrupted,
-        )?;
-        self.runtime_event(EventBody::RunPaused)
+        )
     }
 
     /// Record a failed attempt as a single *terminal* event carrying its
@@ -925,6 +1222,11 @@ impl<'a> Session<'a> {
         reason: &str,
         disposition: Disposition,
     ) -> Result<()> {
+        // The siblings close first: nothing may follow the terminal record.
+        self.stop_in_flight()?;
+        if self.state.is_finished() {
+            return Ok(());
+        }
         self.record(
             Some(node_id),
             Some(attempt_id),
@@ -1197,7 +1499,7 @@ fn run_process(
             Ok(status.success())
         }
         // Same kill, two causes; the flag is what tells them apart.
-        Ok(None) if hex_worker::interrupt::requested() => Err(ProcFail::interrupted()),
+        Ok(None) if hex_worker::interrupt::should_stop() => Err(ProcFail::interrupted()),
         Ok(None) => Err(ProcFail::timeout(
             "command exceeded its time budget (killed)",
         )),
@@ -1427,6 +1729,31 @@ pub fn check_workers(graph: &Graph, workers: &Workers) -> Result<()> {
                     node.id
                 )));
             };
+            if let Context::Fork(from) = context {
+                let caps = adapter.capabilities();
+                let from_program = match graph.node(from).map(|n| &n.spec) {
+                    Some(NodeSpec::Agent { worker, .. }) => {
+                        workers.get(worker).and_then(|w| w.program())
+                    }
+                    _ => None,
+                };
+                if !caps.contains(&hex_proto::Capability::SessionFork) {
+                    return Err(HexError::new(format!(
+                        "node `{}` forks `{from}`, but worker `{worker}` cannot fork a session — \
+                         bind the node to a role backed by claude or codex",
+                        node.id
+                    )));
+                }
+                if from_program.is_none() || from_program != adapter.program() {
+                    return Err(HexError::new(format!(
+                        "E-fork-agent: node `{}` forks `{from}`, but they run different programs \
+                         ({} and {}) — a session belongs to the program that opened it",
+                        node.id,
+                        adapter.program().unwrap_or("?"),
+                        from_program.unwrap_or("?"),
+                    )));
+                }
+            }
             if *context == Context::Continue
                 && !adapter
                     .capabilities()
@@ -1531,6 +1858,7 @@ mod resume_tests {
         SessionHandle {
             agent: agent.to_owned(),
             id: "019fb9a2".to_owned(),
+            ..Default::default()
         }
     }
 
@@ -1616,12 +1944,48 @@ mod check_workers_tests {
         assert!(err.to_string().contains("cannot resume a session"), "{err}");
     }
 
+    /// A session belongs to the program that opened it, so a fork across
+    /// programs, or on a worker that cannot fork, never starts.
+    #[test]
+    fn a_fork_needs_a_forking_worker_on_the_same_program() {
+        let g = Graph::builder("t", "src")
+            .agent("src", "src_w", "p", &[])
+            .agent("a", "w", "p", &[])
+            .terminal("fin", Disposition::Succeeded)
+            .edge("src", "done", "a")
+            .edge("a", "done", "fin")
+            .build();
+        let mut g = g;
+        if let Some(NodeSpec::Agent { context, .. }) = g.nodes.get_mut("a").map(|n| &mut n.spec) {
+            *context = Context::Fork("src".to_owned());
+        }
+        let with = |src: Box<dyn hex_worker::Worker>, w: Box<dyn hex_worker::Worker>| {
+            let mut reg = Workers::default();
+            reg.insert("src_w".to_owned(), src);
+            reg.insert("w".to_owned(), w);
+            check_workers(&g, &reg)
+        };
+        let cross = with(
+            Box::<CodexWorker>::default(),
+            Box::<hex_worker::ClaudeWorker>::default(),
+        )
+        .expect_err("codex session, claude fork");
+        assert!(cross.to_string().contains("E-fork-agent"), "{cross}");
+        let unable = with(
+            Box::<CodexWorker>::default(),
+            Box::new(CommandWorker::new("w", vec!["true".to_owned()])),
+        )
+        .expect_err("a command worker cannot fork");
+        assert!(unable.to_string().contains("cannot fork"), "{unable}");
+        assert!(with(Box::<CodexWorker>::default(), Box::<CodexWorker>::default()).is_ok());
+    }
+
     #[test]
     fn continue_on_a_resumable_worker_is_accepted() {
         assert!(
             check_workers(
                 &graph(Context::Continue),
-                &registry(Box::new(CodexWorker::default()))
+                &registry(Box::<CodexWorker>::default())
             )
             .is_ok()
         );

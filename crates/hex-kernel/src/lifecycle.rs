@@ -43,11 +43,10 @@ use hex_proto::{Disposition, Event, EventBody};
 use crate::graph::{Graph, NodeKind, NodeSpec};
 use crate::{RunState, Status};
 
-/// Idle-running: scheduling is live and no attempt is in flight. This is the
-/// only position at which the driver reaches an attempt boundary, so it is the
-/// only one that can produce a control-driven or routing record.
+/// Idle-running: scheduling is live and no attempt is in flight. A pause, a
+/// human question and an acceptance reroute happen only here.
 pub(crate) fn idle_running(state: &RunState) -> bool {
-    state.status == Status::Running && state.current_attempt.is_none()
+    state.status == Status::Running && !state.awaiting()
 }
 
 /// Whether scheduling may start here: exactly once, out of `Created`.
@@ -59,22 +58,26 @@ pub(crate) fn run_start_ok(state: &RunState) -> bool {
     state.status == Status::Created
 }
 
-/// The kind of the node the run is parked on, if any.
-fn current_kind(graph: &Graph, state: &RunState) -> Option<NodeKind> {
-    graph.node(state.current.as_deref()?).map(|n| n.spec.kind())
+/// The kind of the event's node, if it is an active node.
+fn event_kind(graph: &Graph, state: &RunState, event: &Event) -> Option<NodeKind> {
+    let node = event.node_id.as_deref()?;
+    state.active.contains_key(node).then_some(())?;
+    graph.node(node).map(|n| n.spec.kind())
 }
 
-/// Whether `event` refers to the currently in-flight node + attempt. Requires an
-/// attempt to actually be in flight — a `Signal`/`AttemptFailed`/`NodeResult`
-/// arriving while nothing is awaiting is spurious and must not be applied.
+/// Whether `event` refers to an in-flight node + attempt. Requires that attempt
+/// to actually be in flight — a `Signal`/`AttemptFailed`/`NodeResult` for a node
+/// that is not running is spurious and must not be applied.
 pub(crate) fn correlated(state: &RunState, event: &Event) -> bool {
-    state.current_attempt.is_some()
-        && event.node_id == state.current
-        && event.attempt_id == state.current_attempt
+    event.attempt_id.is_some()
+        && event
+            .node_id
+            .as_deref()
+            .is_some_and(|n| state.attempt_of(n) == event.attempt_id.as_deref())
 }
 
-/// Whether an `AttemptStarted` may begin here: an idle running run, on its own
-/// current node, with an attempt id to correlate later outcomes to.
+/// Whether an `AttemptStarted` may begin here: a running run, on an active node
+/// with no attempt in flight, with an attempt id to correlate later outcomes to.
 ///
 /// The kind check is a guard, not bookkeeping. Only `agent` and `command` nodes
 /// run an attempt: a `human` node is answered (`HumanRequested`/
@@ -83,12 +86,14 @@ pub(crate) fn correlated(state: &RunState, event: &Event) -> bool {
 /// outstanding question — `human_requested → attempt_started → signal` — because
 /// the signal then correlates to an attempt that should never have existed.
 pub(crate) fn attempt_start_ok(graph: &Graph, state: &RunState, event: &Event) -> bool {
-    idle_running(state)
+    state.status == Status::Running
         && event.attempt_id.is_some()
-        && state.current.is_some()
-        && event.node_id == state.current
+        && event
+            .node_id
+            .as_deref()
+            .is_some_and(|n| state.active.get(n) == Some(&None))
         && matches!(
-            current_kind(graph, state),
+            event_kind(graph, state, event),
             Some(NodeKind::Agent | NodeKind::Command)
         )
 }
@@ -105,9 +110,9 @@ pub(crate) fn attempt_start_ok(graph: &Graph, state: &RunState, event: &Event) -
 /// `node_result` could replace what the agent actually reported downstream.
 pub(crate) fn node_result_ok(graph: &Graph, state: &RunState, event: &Event) -> bool {
     correlated(state, event)
-        && current_kind(graph, state) == Some(NodeKind::Agent)
-        && state
-            .current
+        && event_kind(graph, state, event) == Some(NodeKind::Agent)
+        && event
+            .node_id
             .as_deref()
             .is_some_and(|cur| !state.results.contains_key(cur))
 }
@@ -121,8 +126,11 @@ pub(crate) fn node_result_ok(graph: &Graph, state: &RunState, event: &Event) -> 
 /// twice, and a cost you cannot trust is worse than no cost at all.
 pub(crate) fn attempt_report_ok(graph: &Graph, state: &RunState, event: &Event) -> bool {
     correlated(state, event)
-        && current_kind(graph, state) == Some(NodeKind::Agent)
-        && state.reported_attempt != state.current_attempt
+        && event_kind(graph, state, event) == Some(NodeKind::Agent)
+        && event
+            .attempt_id
+            .as_ref()
+            .is_some_and(|a| !state.reported.contains(a))
 }
 
 /// Whether a `HumanRequested` may be recorded here: an idle running run parked
@@ -130,10 +138,7 @@ pub(crate) fn attempt_report_ok(graph: &Graph, state: &RunState, event: &Event) 
 /// legitimate, so this stays true for an already-outstanding question (it
 /// re-arms it).
 pub(crate) fn human_request_ok(graph: &Graph, state: &RunState, event: &Event) -> bool {
-    idle_running(state)
-        && state.current.is_some()
-        && event.node_id == state.current
-        && current_kind(graph, state) == Some(NodeKind::Human)
+    idle_running(state) && event_kind(graph, state, event) == Some(NodeKind::Human)
 }
 
 /// Whether a `HumanResponded` may be applied here: it must answer an
@@ -147,8 +152,7 @@ pub(crate) fn human_response_ok(graph: &Graph, state: &RunState, event: &Event) 
     idle_running(state)
         && state.asked.is_some()
         && event.node_id == state.asked
-        && state.asked == state.current
-        && current_kind(graph, state) == Some(NodeKind::Human)
+        && event_kind(graph, state, event) == Some(NodeKind::Human)
 }
 
 /// Whether an `AcceptanceUnmet` reroute is one [`schedule`](crate::schedule)
@@ -170,16 +174,14 @@ pub(crate) fn unmet_reroute_ok(
     idle_running(state)
         && graph.accept.on_unmet.as_deref() == Some(to)
         && graph.nodes.contains_key(to)
-        && matches!(
-            state
-                .current
-                .as_deref()
-                .and_then(|c| graph.node(c))
-                .map(|n| &n.spec),
-            Some(NodeSpec::Terminal {
-                disposition: Disposition::Succeeded
-            })
-        )
+        && state.active.keys().any(|c| {
+            matches!(
+                graph.node(c).map(|n| &n.spec),
+                Some(NodeSpec::Terminal {
+                    disposition: Disposition::Succeeded
+                })
+            )
+        })
         && missing_evidence(graph, state) == missing
 }
 
@@ -210,16 +212,14 @@ pub(crate) fn resume_ok(state: &RunState) -> bool {
     state.status == Status::Paused
 }
 
-/// Whether operator guidance may be queued here.
+/// Whether operator guidance may be queued here: on a started, unfinished run.
 ///
-/// Steering is inert until an agent attempt reads it, but it must still be
-/// *journalable*: the driver drains the control inbox only at an attempt
-/// boundary or while blocked on a human node, so idle-running and paused are the
-/// only positions that can produce a `Steered`. Without this, a hand-edited
-/// journal could place guidance before `run_created` and have it reach the first
-/// prompt as if an operator had sent it.
+/// Steering is inert until the next agent attempt reads it, so it may land
+/// while other attempts run. Without this, a hand-edited journal could place
+/// guidance before `run_started` and have it reach the first prompt as if an
+/// operator had sent it.
 pub(crate) fn steer_ok(state: &RunState) -> bool {
-    idle_running(state) || state.status == Status::Paused
+    matches!(state.status, Status::Running | Status::Paused)
 }
 
 /// Whether `event` may apply at `state`: every per-event guard, with the reason
@@ -247,7 +247,7 @@ pub(crate) fn admissible(graph: &Graph, state: &RunState, event: &Event) -> Resu
         }
         EventBody::AttemptStarted { .. } => (
             attempt_start_ok(graph, state, event),
-            "attempt_started must target an idle running run's current agent or command node",
+            "attempt_started must target an active agent or command node with no attempt in flight",
         ),
         // A routing signal is only meaningful from the attempt that produced it.
         // (`reduce` then routes; a signal with no legal edge is a defensive run
@@ -268,11 +268,11 @@ pub(crate) fn admissible(graph: &Graph, state: &RunState, event: &Event) -> Resu
         EventBody::RunResumed => (resume_ok(state), "run_resumed without a pause"),
         EventBody::Steered { .. } => (
             steer_ok(state),
-            "steered outside an attempt boundary or a pause",
+            "steered before the run started or after it finished",
         ),
         EventBody::HumanRequested { .. } => (
             human_request_ok(graph, state, event),
-            "human_requested must target an idle running run's current human node",
+            "human_requested must target an active human node of an idle running run",
         ),
         EventBody::HumanResponded { .. } => (
             human_response_ok(graph, state, event),

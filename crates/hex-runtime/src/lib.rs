@@ -22,6 +22,12 @@ pub mod local_log;
 pub mod preset;
 pub mod skill;
 pub mod stats;
+
+/// The active nodes as one label (`implement` or `impl_a, impl_b`).
+fn current_of(state: &hex_kernel::RunState) -> Option<String> {
+    (!state.active.is_empty()).then(|| state.active_nodes().join(", "))
+}
+
 #[cfg(test)]
 mod test_support;
 pub mod workers;
@@ -61,6 +67,8 @@ const WT_BASE_REF: &str = "worktree.base_ref";
 /// The resolved graph origin (`built-in:<name>` or a path), recorded so a
 /// resumed or cancelled run's stats line keeps the original classification.
 const ORIGIN: &str = "origin";
+/// `RunCreated.inputs` key: the run whose sessions this run continued.
+const CONTINUED_FROM: &str = "continued_from";
 
 /// The outcome of starting or resuming a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +106,7 @@ pub struct RunSummary {
     /// alive; only a fresh heartbeat proves it is progressing. Meaningless for
     /// any state other than [`Liveness::Live`].
     pub hung: bool,
-    /// The active node, if any.
+    /// The active nodes, comma-joined (`impl_a, impl_b`), if any.
     pub current: Option<String>,
     /// Attempts started so far.
     pub attempts: u32,
@@ -125,7 +133,7 @@ pub struct StatusReport {
     pub run_id: String,
     /// Lifecycle status.
     pub status: Status,
-    /// The active node, if any.
+    /// The active nodes, comma-joined (`impl_a, impl_b`), if any.
     pub current: Option<String>,
     /// Attempts started so far.
     pub attempts: u32,
@@ -139,7 +147,7 @@ pub struct StatusReport {
     pub usage: Usage,
     /// The attempt executing right now, if any — what an operator watching a live
     /// loop is actually asking about.
-    pub in_flight: Option<InFlight>,
+    pub in_flight: Vec<InFlight>,
     /// Control commands sitting in the inbox that no driver has claimed yet.
     /// Distinct from [`Self::pending_steer`], which has already been journaled:
     /// between `hex steer` and the driver's next attempt boundary a command is
@@ -159,6 +167,9 @@ pub struct StatusReport {
     /// before `RunFinished` (a budget bound, an unmet acceptance) or the
     /// terminal `AttemptFailed`'s reason. `None` while the run is unfinished.
     pub why: Option<String>,
+    /// The last agent session of each node, for `hex run --continue <run>` or
+    /// to open that conversation directly in its own CLI.
+    pub sessions: BTreeMap<String, hex_kernel::SessionHandle>,
 }
 
 /// How far a follower has read each of an attempt's streams.
@@ -555,6 +566,85 @@ impl Runtime {
         Ok((graph, state))
     }
 
+    /// The run that continued `run_id`'s sessions (`hex run --continue`), if any.
+    ///
+    /// shortcut: a scan with no lock, so two `--continue` commands at the same
+    /// instant can both pass. Add a lock if operators script that.
+    fn continued_by(&self, run_id: &str) -> Option<String> {
+        std::fs::read_dir(self.runs_dir())
+            .ok()?
+            .flatten()
+            .find_map(|dir| {
+                let file = std::fs::File::open(dir.path().join("events.jsonl")).ok()?;
+                let line = std::io::BufRead::lines(std::io::BufReader::new(file))
+                    .next()?
+                    .ok()?;
+                match serde_json::from_str::<Event>(&line).ok()?.body {
+                    EventBody::RunCreated { inputs, .. }
+                        if inputs.get(CONTINUED_FROM).map(String::as_str) == Some(run_id) =>
+                    {
+                        Some(dir.file_name().to_string_lossy().into_owned())
+                    }
+                    _ => None,
+                }
+            })
+    }
+
+    /// The sessions a new run of `graph` takes over from the run `from`.
+    ///
+    /// A live source is refused: two runs writing one agent session corrupt it.
+    /// A session whose program differs from the node's worker is refused too:
+    /// the operator asked for that context, and running fresh would lose it.
+    fn import_sessions(
+        &self,
+        from: &str,
+        graph: &Graph,
+    ) -> Result<BTreeMap<String, hex_kernel::SessionHandle>> {
+        let run_dir = self.run_dir(from)?;
+        let events = journal::read_all(&run_dir.join("events.jsonl"))
+            .map_err(|_| HexError::new(format!("run `{from}` not found")))?;
+        let (_, state) = self.verify_and_fold(from, &events)?;
+        if matches!(liveness_of(&run_dir, &state.status).0, Liveness::Live) {
+            return Err(HexError::new(format!(
+                "run `{from}` is still live: `hex wait {from}` or `hex pause {from}` first"
+            )));
+        }
+        let mut sessions = BTreeMap::new();
+        for node in graph.nodes.values() {
+            let NodeSpec::Agent {
+                worker, context, ..
+            } = &node.spec
+            else {
+                continue;
+            };
+            let Some(handle) = state.sessions.get(&node.id) else {
+                continue;
+            };
+            if *context == Context::Fresh {
+                continue;
+            }
+            let program = self.workers.get(worker).and_then(|w| w.program());
+            if program != Some(handle.agent.as_str()) {
+                return Err(HexError::new(format!(
+                    "E-import-agent: node `{}` continues a {} session from `{from}`, but its \
+                     role now runs {}",
+                    node.id,
+                    handle.agent,
+                    program.unwrap_or("no resumable agent")
+                )));
+            }
+            sessions.insert(node.id.clone(), handle.clone());
+        }
+        // A session continues along one chain of runs: a second run taking it over
+        // would write it at the same time, or bill against stale totals.
+        if let Some(other) = self.continued_by(from) {
+            return Err(HexError::new(format!(
+                "run `{other}` already continued `{from}` — continue `{other}` instead"
+            )));
+        }
+        Ok(sessions)
+    }
+
     /// Start a new run of `reference` with an optional operator prompt. Blocks
     /// until the run reaches a terminal disposition (or an operator pauses it).
     ///
@@ -567,10 +657,32 @@ impl Runtime {
         name: Option<&str>,
         isolation: &Isolation,
     ) -> Result<RunReport> {
+        self.start_from(reference, prompt, name, isolation, None)
+    }
+
+    /// [`Runtime::start`], continuing the agent sessions of the earlier run
+    /// `from` (`hex run --continue <run>`): each node with `context: continue`
+    /// or `{ fork: … }` starts from the session of the same-named node there.
+    ///
+    /// # Errors
+    /// As [`Runtime::start`], and when `from` is live, unreadable, or holds a
+    /// session that the node's current worker cannot resume.
+    pub fn start_from(
+        &self,
+        reference: &str,
+        prompt: Option<&str>,
+        name: Option<&str>,
+        isolation: &Isolation,
+        from: Option<&str>,
+    ) -> Result<RunReport> {
         // Resolve the source exactly once, then compile that same text — no
         // second resolution that could observe a changed file (TOCTOU).
         let resolved = preset::resolve(reference, &self.root)?;
         let graph = self.prepare(&resolved.source, prompt)?;
+        let sessions = match from {
+            Some(from) => self.import_sessions(from, &graph)?,
+            None => BTreeMap::new(),
+        };
 
         let (run_id, run_dir) = self.new_run(&graph.name, name)?;
         std::fs::create_dir_all(run_dir.join("attempts"))?;
@@ -582,6 +694,9 @@ impl Runtime {
             .map(|p| BTreeMap::from([("prompt".to_owned(), p.to_owned())]))
             .unwrap_or_default();
         inputs.insert(ORIGIN.to_owned(), resolved.origin.clone());
+        if let Some(from) = from {
+            inputs.insert(CONTINUED_FROM.to_owned(), from.to_owned());
+        }
         let mut workdir = self.root.clone();
         let mut worktree_ctx = None;
         let mut slot = None;
@@ -628,6 +743,7 @@ impl Runtime {
             inputs,
             defaults: defaults_to_map(&self.config.defaults),
             checks: resolved_checks(&graph),
+            sessions,
         })?;
         // A reclaimed slot discarded a prior run's uncommitted work — record
         // exactly what, in this run's authoritative journal.
@@ -733,6 +849,13 @@ impl Runtime {
         // driving. A crashed run's advisory lock is released by the OS, so this
         // succeeds after a real crash.
         let _lock = RunLock::acquire(&run_dir)?;
+        // Its agent sessions now belong to the run that continued it.
+        if let Some(other) = self.continued_by(run_id) {
+            return Err(HexError::new(format!(
+                "run `{other}` continued `{run_id}`'s sessions — resume or continue `{other}` \
+                 instead"
+            )));
+        }
 
         // One scan: the writer hands back the events it read (torn tail already
         // repaired), which we verify + fold rather than reading the journal again.
@@ -806,14 +929,17 @@ impl Runtime {
             session.runtime_event(EventBody::RunResumed)?;
         }
 
-        // Orphaned attempt (started, no terminal): mark it interrupted — with
+        // Orphaned attempts (started, no terminal): mark each interrupted — with
         // its exact node + attempt id — then re-attempt, never silently rerun.
-        if session.state().awaiting() {
-            let node = session.state().current.clone();
-            let attempt = session.state().current_attempt.clone();
+        let orphans: Vec<(String, String)> = session
+            .state()
+            .in_flight()
+            .map(|(n, a)| (n.to_owned(), a.to_owned()))
+            .collect();
+        for (node, attempt) in orphans {
             session.record(
-                node.as_deref(),
-                attempt.as_deref(),
+                Some(&node),
+                Some(&attempt),
                 Actor::runtime(),
                 EventBody::AttemptInterrupted,
             )?;
@@ -847,21 +973,24 @@ impl Runtime {
         // loop is asking. The projection knows an attempt is in flight; only the
         // journal knows when it started, so the elapsed clock comes from the
         // `AttemptStarted` event rather than being tracked anywhere.
-        let in_flight = state.current_attempt.as_ref().and_then(|attempt| {
-            let started = events.iter().rev().find(|e| {
-                e.attempt_id.as_ref() == Some(attempt)
-                    && matches!(e.body, EventBody::AttemptStarted { .. })
-            })?;
-            Some(InFlight {
-                attempt_id: attempt.clone(),
-                node_id: started.node_id.clone().unwrap_or_default(),
-                worker: match &started.body {
-                    EventBody::AttemptStarted { worker, .. } => worker.clone(),
-                    _ => None,
-                },
-                started_at_ms: started.at_ms,
+        let in_flight = state
+            .in_flight()
+            .filter_map(|(_, attempt)| {
+                let started = events.iter().rev().find(|e| {
+                    e.attempt_id.as_deref() == Some(attempt)
+                        && matches!(e.body, EventBody::AttemptStarted { .. })
+                })?;
+                Some(InFlight {
+                    attempt_id: attempt.to_owned(),
+                    node_id: started.node_id.clone().unwrap_or_default(),
+                    worker: match &started.body {
+                        EventBody::AttemptStarted { worker, .. } => worker.clone(),
+                        _ => None,
+                    },
+                    started_at_ms: started.at_ms,
+                })
             })
-        });
+            .collect();
         // A run parked on a `human` node is *waiting on you*; surface the
         // question here rather than reporting a bare `running`.
         let question = state.asked.as_ref().and_then(|node| {
@@ -875,7 +1004,7 @@ impl Runtime {
         Ok(StatusReport {
             run_id: run_id.to_owned(),
             status: state.status.clone(),
-            current: state.current.clone(),
+            current: current_of(&state),
             attempts: state.attempts_total,
             disposition: state.disposition(),
             visits: state.visits.clone(),
@@ -892,10 +1021,21 @@ impl Runtime {
                 .into_iter()
                 .map(|e| e.command)
                 .collect(),
-            pending_steer: state.pending_steer.clone(),
+            pending_steer: state
+                .pending_steer
+                .iter()
+                .cloned()
+                .chain(
+                    state
+                        .node_steer
+                        .iter()
+                        .flat_map(|(n, texts)| texts.iter().map(move |t| format!("[{n}] {t}"))),
+                )
+                .collect(),
             asked: state.asked.clone(),
             question,
             why: state.is_finished().then(|| terminal_why(&events)).flatten(),
+            sessions: state.sessions.clone(),
         })
     }
 
@@ -1077,11 +1217,11 @@ impl Runtime {
         // `lifecycle` — which left the journal permanently unreadable, on the
         // very path an operator takes to clean up after Ctrl-C. Close the
         // orphan first, exactly as `resume` does.
-        if state.awaiting() {
+        for (node, attempt) in state.in_flight() {
             journal.append(
                 run_id,
-                state.current.as_deref(),
-                state.current_attempt.as_deref(),
+                Some(node),
+                Some(attempt),
                 actor.clone(),
                 EventBody::AttemptInterrupted,
             )?;
@@ -1130,6 +1270,19 @@ impl Runtime {
             return Err(HexError::new(format!(
                 "run `{run_id}` already finished ({d}) — start a new run instead"
             )));
+        }
+        // A steer for a node the graph has no agent of would never be read.
+        if let Command::Steer {
+            node: Some(node), ..
+        } = command
+        {
+            let events = journal::read_all(&run_dir.join("events.jsonl"))?;
+            let (graph, _) = self.verify_and_fold(run_id, &events)?;
+            if graph.node(node).map(|n| n.spec.kind()) != Some(NodeKind::Agent) {
+                return Err(HexError::new(format!(
+                    "run `{run_id}` has no agent node `{node}` to steer"
+                )));
+            }
         }
         Inbox::new(&run_dir).send(actor, command)
     }
@@ -1249,7 +1402,7 @@ impl Runtime {
                     run_id: run_id.to_owned(),
                     state,
                     hung,
-                    current: kernel.current.clone(),
+                    current: current_of(&kernel),
                     attempts: kernel.attempts_total,
                     created_at_ms,
                     updated_at_ms,
@@ -1346,6 +1499,7 @@ fn run_created(events: &[Event]) -> Option<RunCreation> {
             inputs,
             defaults,
             checks,
+            ..
         } => Some((
             graph_hash.clone(),
             inputs.clone(),

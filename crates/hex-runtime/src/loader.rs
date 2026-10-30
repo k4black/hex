@@ -118,11 +118,22 @@ struct RawNode {
     /// Authored order matters: a node's first-written edge is usually its happy
     /// path, and rendering it alphabetically ("failed" before "passed") misreads
     /// the author. An insertion-ordered map keeps YAML map semantics *and* order.
-    on: IndexMap<String, String>,
+    on: IndexMap<String, Targets>,
+    /// `join: all` waits for every parallel branch before the node runs.
+    #[serde(default)]
+    join: Option<String>,
     /// Per-node bounds. Only `visits` today: how many times this node may be
     /// entered, so one loop can be capped without capping every loop.
     #[serde(default)]
     budget: Option<RawNodeBudget>,
+}
+
+/// An edge's target: one node, or a list that the run enters all at once.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Targets {
+    One(String),
+    Many(Vec<String>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,7 +152,7 @@ struct RawAgent {
     #[serde(default)]
     may_propose: Vec<String>,
     #[serde(default)]
-    context: Option<String>,
+    context: Option<RawContext>,
     /// Read-only policy: the worker must not modify the workspace (a reviewer).
     #[serde(default)]
     read_only: bool,
@@ -242,13 +253,28 @@ pub fn load_with(
             roles,
             checks,
         )?;
-        for (on, to) in &node.on {
-            edges.push(Edge {
-                from: id.clone(),
-                on: on.clone(),
-                to: to.clone(),
-            });
+        for (on, targets) in &node.on {
+            let targets = match targets {
+                Targets::One(to) => std::slice::from_ref(to),
+                Targets::Many(list) => list.as_slice(),
+            };
+            for to in targets {
+                edges.push(Edge {
+                    from: id.clone(),
+                    on: on.clone(),
+                    to: to.clone(),
+                });
+            }
         }
+        let join = match node.join.as_deref() {
+            None => false,
+            Some("all") => true,
+            Some(other) => {
+                return Err(HexError::new(format!(
+                    "node `{id}`: unknown join `{other}` (expected all)"
+                )));
+            }
+        };
         let declared_visits = node.budget.as_ref().and_then(|b| b.visits);
         // Every non-terminal node gets a visit bound, whether or not the graph
         // declares one, so no loop can churn unbounded. A terminal keeps `None`:
@@ -264,6 +290,7 @@ pub fn load_with(
             id.clone(),
             Node {
                 max_visits,
+                join,
                 ..Node::new(id.clone(), spec)
             },
         );
@@ -308,6 +335,14 @@ pub(super) fn uses_prompt(graph: &Graph) -> bool {
         };
         tokens(prompt).any(|t| t == Token::Prompt)
     })
+}
+
+/// `context: fresh | continue`, or `context: { fork: <node> }`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawContext {
+    Name(String),
+    Fork { fork: String },
 }
 
 fn compile_node(
@@ -356,7 +391,11 @@ fn compile_node(
             // interpolated at attempt-start.
             prompt,
             may_propose: agent.may_propose.clone(),
-            context: parse_context(agent.context.as_deref().or(default_context))?,
+            context: match &agent.context {
+                Some(RawContext::Fork { fork }) => Context::Fork(fork.clone()),
+                Some(RawContext::Name(name)) => parse_context(Some(name))?,
+                None => parse_context(default_context)?,
+            },
             // A node may force read-only; otherwise the role's policy applies.
             read_only: agent.read_only || role.and_then(|r| r.read_only).unwrap_or(false),
         });
@@ -483,7 +522,7 @@ fn parse_context(raw: Option<&str>) -> Result<Context> {
         None | Some("fresh") => Ok(Context::Fresh),
         Some("continue") => Ok(Context::Continue),
         Some(other) => Err(HexError::new(format!(
-            "unknown context `{other}` (expected fresh or continue)"
+            "unknown context `{other}` (expected fresh, continue or {{ fork: <node> }})"
         ))),
     }
 }

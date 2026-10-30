@@ -37,6 +37,24 @@ research in `docs/design/gpt-research-{1,2}.md`.
 
 ## Open
 
+Operator sessions (design: `docs/design/2026-10-30-operator-sessions.md`):
+- [x] Graph on stdin (`hex run -`).
+- [x] List edges, `join: all`, concurrent attempts, sibling stop.
+- [x] `context: { fork: <node> }` (claude, codex).
+- [x] `hex run --continue <run>`, `sessions` in `hex status --json`.
+- [ ] Per-node worktrees for parallel writers.
+- [x] `hex status` and `hex logs --follow` show every parallel attempt.
+- [ ] The live preview shows one parallel attempt; the others are event lines.
+- [ ] A join waits until every other active node is an idle waiter (a global
+      barrier): one fan-out's join waits for an unrelated fan-out's branches.
+      Add reachability when a graph needs it.
+- [x] Branches that meet without `join: all` are refused (`E-join-missing`).
+- [x] `hex steer --node <n>` steers one parallel node.
+- [x] Built-in `scout` role (claude, `claude-sonnet-5-5`, read-only).
+- [x] A resumed or forked claude/codex session bills only what it added (both
+      report session totals). Verified live 2026-10-30: a fork reporting
+      $0.00764 was billed $0.00132. pi reports per attempt; not subtracted.
+
 Review cost and quality:
 - [ ] Feed the reviewer the diff, not the repo. A cross-model `checklist` run
       cost ≈ $40, mostly the reviewer re-reading the repo each round, and the
@@ -114,8 +132,8 @@ Journal and surface:
 
 Build only when a real need shows up.
 
-- Phase 6 concurrency: `tokio`, `map`/`parallel`/`join`, subgraphs and
-  watchdogs as graph constructs, per-node worktrees + an integration queue.
+- Phase 6 concurrency: `map` over a computed list, `join: any`, subgraphs and
+  watchdogs as graph constructs, an integration queue for worktree branches.
 - Typed node inputs/outputs (`{{node.output}}`).
 - `hex graph new` (an agent drafts a graph).
 - `hex add` / `hex connect` builder commands.

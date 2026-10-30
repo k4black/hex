@@ -397,6 +397,7 @@ mod tests {
                     &Actor::human("kc"),
                     &Command::Steer {
                         text: text.to_owned(),
+                        node: None,
                     },
                 )
                 .expect("send");
@@ -406,7 +407,7 @@ mod tests {
             .expect("queued")
             .into_iter()
             .map(|e| match e.command {
-                Command::Steer { text } => text,
+                Command::Steer { text, .. } => text,
                 other => panic!("unexpected {other:?}"),
             })
             .collect();
@@ -440,6 +441,7 @@ mod tests {
                 &Actor::human("kc"),
                 &Command::Steer {
                     text: "USE-THE-V2-API".to_owned(),
+                    node: None,
                 },
             )
             .expect("send steer");
@@ -464,7 +466,8 @@ mod tests {
         assert_eq!(
             second.command,
             Command::Steer {
-                text: "USE-THE-V2-API".to_owned()
+                text: "USE-THE-V2-API".to_owned(),
+                node: None,
             }
         );
         // Consumed exactly once, and the files survive in `done/` as evidence.

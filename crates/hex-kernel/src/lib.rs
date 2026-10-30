@@ -14,8 +14,9 @@
 //! The graph *surface syntax* (standard YAML) is parsed elsewhere (the
 //! runtime); this crate models the compiled IR only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+pub use hex_proto::SessionHandle;
 use hex_proto::{Disposition, Event, EventBody};
 
 pub mod graph;
@@ -69,12 +70,11 @@ impl std::fmt::Display for Status {
 pub struct RunState {
     /// Where the run is in its lifecycle.
     pub status: Status,
-    /// The node currently active (about to run, or in-flight).
-    pub current: Option<String>,
-    /// The id of the in-flight attempt, if any. `Some` exactly when an attempt
-    /// is running — so it doubles as the "awaiting" flag (see
-    /// [`RunState::awaiting`]) and drives correlation + resume.
-    pub current_attempt: Option<String>,
+    /// Every active node, with its in-flight attempt id. A node is active from
+    /// the moment an edge enters it until its signal routes the run onward.
+    /// `None` means it waits to start (or, for a join, waits for its siblings).
+    /// One entry is the sequential case; a list edge adds several.
+    pub active: BTreeMap<String, Option<String>>,
     /// Total attempts started across the whole run.
     pub attempts_total: u32,
     /// Times each node has been entered, checked against its `max_visits` bound.
@@ -90,11 +90,13 @@ pub struct RunState {
     /// (which consumes it). Part of the projection rather than driver memory, so
     /// a replay of the journal reproduces the same prompt.
     pub pending_steer: Vec<String>,
-    /// The attempt that has already recorded an `AttemptReported`, so a second
-    /// one cannot inflate the usage totals (see
-    /// `lifecycle::attempt_report_ok`). Cleared when the next attempt starts;
-    /// one field suffices because only one attempt is ever in flight.
-    pub reported_attempt: Option<String>,
+    /// Operator guidance for one agent node (`hex steer --node`), consumed by
+    /// that node's next attempt.
+    pub node_steer: BTreeMap<String, Vec<String>>,
+    /// The attempts that have already recorded an `AttemptReported`, so a
+    /// second one cannot inflate the usage totals (see
+    /// `lifecycle::attempt_report_ok`). Attempt ids are unique within a run.
+    pub reported: BTreeSet<String>,
     /// Token and cost accounting, summed from `AttemptReported` and split by
     /// node and by model. A projection like every other field here — nothing
     /// stores a running total, so it cannot disagree with the journal.
@@ -113,24 +115,6 @@ pub struct RunState {
     pub asked: Option<String>,
     /// When scheduling started (Unix epoch ms), for elapsed budgets.
     pub started_at_ms: u64,
-}
-
-/// A resumable agent session, and the program that owns it.
-///
-/// Recorded because a role's binding is resolved from *live* config every time
-/// the graph is compiled, so a `hex resume` after an edit to
-/// `roles.reviewer.worker` can select a different adapter than the one that
-/// opened the session — and hex would hand a codex thread id to
-/// `claude --resume`. The identity has to be the **program**, not the registry
-/// name: roles register under their own alias, so the alias is unchanged by
-/// exactly the rebind this guards against.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionHandle {
-    /// The external program that owns the session (`codex`, `claude`) — not the
-    /// worker registry name, which is a role alias and survives a rebind.
-    pub agent: String,
-    /// The agent's own session/thread id.
-    pub id: String,
 }
 
 /// What a run spent, split the two ways an operator asks about it: *which node
@@ -282,11 +266,29 @@ impl RunState {
         self.status.is_finished()
     }
 
-    /// Whether an attempt is in flight for [`RunState::current`] — i.e. an
-    /// attempt has started and has not yet produced a terminal event.
+    /// Whether any attempt is in flight: started, with no terminal event yet.
     #[must_use]
     pub fn awaiting(&self) -> bool {
-        self.current_attempt.is_some()
+        self.active.values().any(Option::is_some)
+    }
+
+    /// The in-flight attempt of `node`, if any.
+    #[must_use]
+    pub fn attempt_of(&self, node: &str) -> Option<&str> {
+        self.active.get(node)?.as_deref()
+    }
+
+    /// Every in-flight `(node, attempt)`, in node order.
+    pub fn in_flight(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.active
+            .iter()
+            .filter_map(|(n, a)| Some((n.as_str(), a.as_deref()?)))
+    }
+
+    /// The active node ids, in node order.
+    #[must_use]
+    pub fn active_nodes(&self) -> Vec<String> {
+        self.active.keys().cloned().collect()
     }
 }
 
@@ -359,9 +361,13 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
     if lifecycle::admissible(graph, &state, event).is_err() {
         return state;
     }
+    // Every node-scoped event names its node; the guards checked it is active.
+    let node = event.node_id.clone();
     match &event.body {
-        EventBody::RunCreated { .. } => {
+        // A run continuing an earlier one starts with that run's sessions.
+        EventBody::RunCreated { sessions, .. } => {
             state.status = Status::Created;
+            state.sessions = sessions.clone();
         }
         EventBody::RunStarted => {
             state.status = Status::Running;
@@ -373,23 +379,27 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
         // two journal consumers drifted: it advanced `current` while the read
         // path's audit did not, so one legitimate reroute made
         // `status`/`logs`/`resume` reject the journal forever.
-        EventBody::AcceptanceUnmet { to, .. } => enter(&mut state, to),
+        // The settled success terminal leaves; the reroute target enters.
+        EventBody::AcceptanceUnmet { to, .. } => {
+            state
+                .active
+                .retain(|n, _| graph.node(n).map(|n| n.spec.kind()) != Some(NodeKind::Terminal));
+            enter(&mut state, to);
+        }
         EventBody::AttemptStarted { .. } => {
             state.attempts_total += 1;
-            state.current_attempt = event.attempt_id.clone();
-            // A fresh attempt has not reported usage yet. Clearing here is what
-            // lets one field stand in for "this attempt already reported".
-            state.reported_attempt = None;
-            // A fresh attempt starts with no result: clear any prior one for this
-            // node so a re-visit that captures nothing can't hand downstream the
-            // previous attempt's stale text.
-            if let Some(cur) = &state.current {
-                state.results.remove(cur);
+            if let Some(cur) = node {
+                state.active.insert(cur.clone(), event.attempt_id.clone());
+                // A fresh attempt starts with no result: clear any prior one for
+                // this node so a re-visit that captures nothing can't hand
+                // downstream the previous attempt's stale text.
+                state.results.remove(&cur);
                 // Queued steering is consumed by the agent attempt that reads it
                 // into its prompt. A command node has no prompt to steer, so it
                 // must not swallow the guidance on its way past.
-                if graph.node(cur).map(|n| n.spec.kind()) == Some(NodeKind::Agent) {
+                if graph.node(&cur).map(|n| n.spec.kind()) == Some(NodeKind::Agent) {
                     state.pending_steer.clear();
+                    state.node_steer.remove(&cur);
                 }
             }
         }
@@ -398,19 +408,21 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             // re-scheduled fresh, and drop any result it captured before
             // crashing, so a re-attempt that produces none can't hand downstream
             // stale text.
-            state.current_attempt = None;
-            if let Some(cur) = &state.current {
-                state.results.remove(cur);
+            if let Some(cur) = node {
+                state.active.insert(cur.clone(), None);
+                state.results.remove(&cur);
             }
         }
         EventBody::Signal { name } => {
-            state.current_attempt = None;
-            if let Some(cur) = state.current.clone() {
+            if let Some(cur) = node {
+                state.active.remove(&cur);
                 route_or_fail(graph, &mut state, cur, name);
             }
         }
         EventBody::AttemptFailed { disposition, .. } => {
-            state.current_attempt = None;
+            if let Some(cur) = &node {
+                state.active.remove(cur);
+            }
             // Terminal in one atomic event: the failure and its disposition are
             // recorded together, so a crash can never leave a failed attempt
             // looking re-runnable. Fail closed: only a genuine failure
@@ -427,38 +439,67 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
             cost_micro_usd,
             session_id,
             agent,
+            cumulative,
             ..
         } => {
             // Summed, not overwritten — so unlike a result, a duplicate would
             // silently inflate the bill; the guard admits one report per attempt.
-            state.reported_attempt = state.current_attempt.clone();
-            state
-                .usage
-                .add(state.current.as_deref(), models, *cost_micro_usd);
+            if let Some(a) = &event.attempt_id {
+                state.reported.insert(a.clone());
+            }
+            // shortcut: a fork subtracts its source's totals at report time; if the
+            // source reran meanwhile, the fork is under-billed. Journal the base at
+            // attempt start if that shape shows up.
+            let base = cumulative
+                .then(|| resumed_from(graph, &state, node.as_deref(), session_id.as_deref()))
+                .flatten();
+            match base {
+                Some(base) => {
+                    let (models, cost) = since(models, *cost_micro_usd, base);
+                    state.usage.add(node.as_deref(), &models, cost);
+                }
+                None => state.usage.add(node.as_deref(), models, *cost_micro_usd),
+            }
             // Recorded against the program that opened it, so a resume cannot hand
             // it to a different one. A report naming no agent is not resumable —
             // better to run fresh than to guess the owner.
-            if let (Some(node), Some(id), Some(agent)) =
-                (state.current.clone(), session_id.clone(), agent.clone())
-            {
-                state.sessions.insert(node, SessionHandle { agent, id });
+            if let (Some(node), Some(id), Some(agent)) = (node, session_id.clone(), agent.clone()) {
+                let totals = |v: &Vec<_>| if *cumulative { v.clone() } else { Vec::new() };
+                state.sessions.insert(
+                    node,
+                    SessionHandle {
+                        agent,
+                        id,
+                        models: totals(models),
+                        cost_micro_usd: cost_micro_usd.filter(|_| *cumulative),
+                    },
+                );
             }
         }
         EventBody::NodeResult { text } => {
-            if let Some(cur) = state.current.clone() {
+            if let Some(cur) = node {
                 state.results.insert(cur, text.clone());
             }
         }
         EventBody::RunPaused => state.status = Status::Paused,
         EventBody::RunResumed => state.status = Status::Running,
-        EventBody::Steered { text } => state.pending_steer.push(text.clone()),
+        EventBody::Steered { text, node: None } => state.pending_steer.push(text.clone()),
+        EventBody::Steered {
+            text,
+            node: Some(n),
+        } => state
+            .node_steer
+            .entry(n.clone())
+            .or_default()
+            .push(text.clone()),
         // The request is an intent record: the run's position does not move, so a
         // crash while waiting simply re-asks on resume. It does arm `asked`, which
         // is what makes the eventual answer correlatable.
         EventBody::HumanRequested { .. } => state.asked = event.node_id.clone(),
         EventBody::HumanResponded { text, signal } => {
-            if let Some(cur) = state.current.clone() {
+            if let Some(cur) = node {
                 state.asked = None;
+                state.active.remove(&cur);
                 state.results.insert(cur.clone(), text.clone());
                 route_or_fail(graph, &mut state, cur, signal);
             }
@@ -477,90 +518,239 @@ pub fn reduce(graph: &Graph, mut state: RunState, event: &Event) -> RunState {
     state
 }
 
-/// Move the run onto `to`, spending one visit against its bound.
+/// The session an attempt of `node` resumed or forked, whose last totals its
+/// session-total report must not bill again: the node's own session when the
+/// report names the same id (continue), else the fork source when the node had
+/// no session yet (a fork always starts from it, or fails).
+fn resumed_from<'s>(
+    graph: &Graph,
+    state: &'s RunState,
+    node: Option<&str>,
+    session_id: Option<&str>,
+) -> Option<&'s SessionHandle> {
+    let node = node?;
+    match state.sessions.get(node) {
+        Some(own) => (Some(own.id.as_str()) == session_id).then_some(own),
+        None => match &graph.node(node)?.spec {
+            NodeSpec::Agent {
+                context: graph::Context::Fork(from),
+                ..
+            } => state.sessions.get(from),
+            _ => None,
+        },
+    }
+}
+
+/// This attempt's share of session totals: `models` and `cost` minus the
+/// session's last totals in `base`, per model, saturating at zero.
+fn since(
+    models: &[hex_proto::ModelUsage],
+    cost: Option<u64>,
+    base: &SessionHandle,
+) -> (Vec<hex_proto::ModelUsage>, Option<u64>) {
+    let models = models
+        .iter()
+        .map(|m| {
+            // One model on each side is one session counter (codex labels it with
+            // the configured model, which a fork may change).
+            let single = (models.len() == 1 && base.models.len() == 1).then(|| &base.models[0]);
+            let Some(b) = base.models.iter().find(|b| b.model == m.model).or(single) else {
+                return m.clone();
+            };
+            hex_proto::ModelUsage {
+                model: m.model.clone(),
+                input_tokens: m.input_tokens.saturating_sub(b.input_tokens),
+                output_tokens: m.output_tokens.saturating_sub(b.output_tokens),
+                cache_read_tokens: m.cache_read_tokens.saturating_sub(b.cache_read_tokens),
+                cache_write_tokens: m.cache_write_tokens.saturating_sub(b.cache_write_tokens),
+                reasoning_tokens: m.reasoning_tokens.saturating_sub(b.reasoning_tokens),
+                cost_micro_usd: m
+                    .cost_micro_usd
+                    .map(|c| c.saturating_sub(b.cost_micro_usd.unwrap_or(0))),
+            }
+        })
+        .collect();
+    let cost = cost.map(|c| c.saturating_sub(base.cost_micro_usd.unwrap_or(0)));
+    (models, cost)
+}
+
+/// Activate `to`, spending one visit against its bound. Entering a node that is
+/// already active is a no-op: two branches that meet at a join enter it once.
 fn enter(state: &mut RunState, to: &str) {
-    state.current = Some(to.to_owned());
+    if state.active.contains_key(to) {
+        return;
+    }
+    state.active.insert(to.to_owned(), None);
     *state.visits.entry(to.to_owned()).or_insert(0) += 1;
 }
 
-/// Record `signal` as `from`'s last verdict and follow its edge. No legal edge
+/// Record `signal` as `from`'s last verdict and follow its edges. No legal edge
 /// fails the run — a defensive failure, since validation guarantees every
 /// proposable signal routes and a human node has exactly one edge.
 fn route_or_fail(graph: &Graph, state: &mut RunState, from: String, signal: &str) {
-    match graph.route(&from, signal) {
-        Some(to) => enter(state, to),
-        None => state.status = Status::Finished(Disposition::Failed),
+    let targets = graph.routes(&from, signal);
+    if targets.is_empty() {
+        state.status = Status::Finished(Disposition::Failed);
+    }
+    for to in targets {
+        enter(state, to);
     }
     state.signals.insert(from, signal.to_owned());
 }
 
 /// Derive the next [`Effect`] intents from `(graph, state)` at time `now_ms`.
-/// Deterministic. Returns at most one effect in the slim sequential MVP.
+/// Deterministic. Returns one effect per active node that can start now, in
+/// node order, or a single terminal effect.
+///
+/// A join, a `human` node and a success terminal wait until the run is quiet:
+/// nothing in flight and every active node waiting. Then one `human` node is
+/// asked first, since a join may depend on its answer; else every join starts;
+/// else one success terminal settles (acceptance needs every branch's evidence). A failure terminal or a spent budget ends the
+/// run at once; the runtime stops the attempts in flight.
 ///
 /// `now_ms` is injected so the kernel stays clock-free and testable.
 #[must_use]
 pub fn schedule(graph: &Graph, state: &RunState, now_ms: u64) -> Vec<Effect> {
-    if state.status != Status::Running || state.awaiting() {
+    if state.status != Status::Running {
         return Vec::new();
     }
-    let Some(cur) = state.current.clone() else {
-        return Vec::new();
+    // shortcut: a waiter waits for *every* other active node, a global barrier,
+    // so two unrelated fan-outs wait for each other. Add reachability if a graph
+    // needs it.
+    let waiter = |id: &str| {
+        graph.node(id).is_some_and(|n| {
+            n.join
+                || matches!(
+                    n.spec,
+                    NodeSpec::Human { .. }
+                        | NodeSpec::Terminal {
+                            disposition: Disposition::Succeeded
+                        }
+                )
+        })
     };
-    let Some(node) = graph.node(&cur) else {
-        return vec![terminal(Disposition::Failed)];
+    let is_join = |id: &str| graph.node(id).is_some_and(|n| n.join);
+    // Quiet: nothing runs and every active node waits. Then one human is asked
+    // first (a join may depend on its answer), else every join starts, else one
+    // success terminal settles.
+    let quiet = !state.awaiting() && state.active.keys().all(|n| waiter(n));
+    let is_human = |id: &str| {
+        matches!(
+            graph.node(id).map(|n| &n.spec),
+            Some(NodeSpec::Human { .. })
+        )
     };
-
-    // Terminal nodes settle the run *before* budget checks: reaching an outcome
-    // does not spend an attempt, so a success that coincides with the last
-    // attempt must not be flipped to `budget_exhausted`.
-    if let NodeSpec::Terminal { disposition } = &node.spec {
-        // A success terminal only succeeds if the acceptance contract holds.
-        if *disposition == Disposition::Succeeded
-            && let missing = lifecycle::missing_evidence(graph, state)
-            && !missing.is_empty()
-        {
-            // Prefer going and producing the missing evidence over dead-ending.
-            // The transition comes from `Graph::implicit_reroute_from`, the one
-            // definition of the implicit success-terminal edge (core rule 5).
-            if let Some(to) = graph.implicit_reroute_from(&cur) {
-                return vec![Effect::RerouteUnmet {
-                    to: to.to_owned(),
-                    missing,
-                }];
-            }
-            return vec![terminal_because(
-                Disposition::Failed,
-                format!(
-                    "reached `{cur}` but acceptance is unmet: missing {}. \
-                     Declare `accept.on_unmet: <node>` to route back and fix it, \
-                     or add an edge so the evidence is produced before `{cur}`",
-                    missing.join(", ")
-                ),
-            )];
+    let human = state.active.keys().find(|n| is_human(n));
+    let any_join = state.active.keys().any(|n| is_join(n));
+    let next = human.or_else(|| {
+        (!any_join)
+            .then(|| state.active.keys().find(|n| waiter(n)))
+            .flatten()
+    });
+    let mut effects = Vec::new();
+    let mut started = state.attempts_total;
+    for (cur, attempt) in &state.active {
+        if attempt.is_some() {
+            continue;
         }
-        return vec![terminal(*disposition)];
-    }
+        let Some(node) = graph.node(cur) else {
+            return vec![terminal(Disposition::Failed)];
+        };
+        if waiter(cur) && !(quiet && (next == Some(cur) || (node.join && human.is_none()))) {
+            continue;
+        }
 
-    // Budgets are checked before spending an attempt, and fail closed.
-    let visits = state.visits.get(&cur).copied().unwrap_or(0);
-    if let Some(maxv) = node.max_visits
+        // Terminal nodes settle the run *before* budget checks: reaching an
+        // outcome does not spend an attempt, so a success that coincides with the
+        // last attempt must not be flipped to `budget_exhausted`.
+        if let NodeSpec::Terminal { disposition } = &node.spec {
+            return vec![settle(graph, state, cur, *disposition)];
+        }
+
+        // Budgets are checked before spending an attempt, and fail closed.
+        if let Some(effect) = over_budget(graph, state, cur, node.max_visits, now_ms) {
+            return vec![effect];
+        }
+
+        started += 1;
+        let attempt_id = format!("att_{started}");
+        let idempotency_key = format!("{cur}#{started}");
+        let node_id = cur.clone();
+        effects.push(match &node.spec {
+            NodeSpec::Terminal { .. } => unreachable!("terminal handled above"),
+            NodeSpec::Agent { .. } => Effect::StartAttempt {
+                node_id,
+                attempt_id,
+                idempotency_key,
+            },
+            NodeSpec::Command { .. } => Effect::RunCommand {
+                node_id,
+                attempt_id,
+                idempotency_key,
+            },
+            NodeSpec::Human { .. } => Effect::RequestHuman { node_id },
+        });
+    }
+    effects
+}
+
+/// The effect a terminal node settles to. A success terminal only succeeds if
+/// the acceptance contract holds.
+fn settle(graph: &Graph, state: &RunState, cur: &str, disposition: Disposition) -> Effect {
+    if disposition == Disposition::Succeeded
+        && let missing = lifecycle::missing_evidence(graph, state)
+        && !missing.is_empty()
+    {
+        // Prefer going and producing the missing evidence over dead-ending.
+        // The transition comes from `Graph::implicit_reroute_from`, the one
+        // definition of the implicit success-terminal edge (core rule 5).
+        if let Some(to) = graph.implicit_reroute_from(cur) {
+            return Effect::RerouteUnmet {
+                to: to.to_owned(),
+                missing,
+            };
+        }
+        return terminal_because(
+            Disposition::Failed,
+            format!(
+                "reached `{cur}` but acceptance is unmet: missing {}. \
+                 Declare `accept.on_unmet: <node>` to route back and fix it, \
+                 or add an edge so the evidence is produced before `{cur}`",
+                missing.join(", ")
+            ),
+        );
+    }
+    terminal(disposition)
+}
+
+/// The terminal effect when starting `cur` would break a budget: its own visit
+/// bound, or the run-wide generation or time budget.
+fn over_budget(
+    graph: &Graph,
+    state: &RunState,
+    cur: &str,
+    max_visits: Option<u32>,
+    now_ms: u64,
+) -> Option<Effect> {
+    let visits = state.visits.get(cur).copied().unwrap_or(0);
+    if let Some(maxv) = max_visits
         && visits > maxv
     {
-        return vec![terminal_because(
+        return Some(terminal_because(
             Disposition::BudgetExhausted,
             format!("node `{cur}` exceeded its visit bound ({maxv} visits)"),
-        )];
+        ));
     }
     if let Some(maxt) = graph.budget.output_tokens
         && state.usage.total.output_tokens >= maxt
     {
-        return vec![terminal_because(
+        return Some(terminal_because(
             Disposition::BudgetExhausted,
             format!(
                 "generation budget spent ({} of {maxt} output tokens)",
                 state.usage.total.output_tokens
             ),
-        )];
+        ));
     }
     if let Some(maxe) = graph.budget.elapsed_ms {
         // Fail closed on the time budget, and treat a backward clock (now before
@@ -568,29 +758,13 @@ pub fn schedule(graph: &Graph, state: &RunState, now_ms: u64) -> Vec<Effect> {
         // fresh budget.
         let over = now_ms < state.started_at_ms || now_ms - state.started_at_ms >= maxe;
         if over {
-            return vec![terminal_because(
+            return Some(terminal_because(
                 Disposition::TimedOut,
                 format!("run exceeded its time budget ({maxe} ms)"),
-            )];
+            ));
         }
     }
-
-    let attempt_id = format!("att_{}", state.attempts_total + 1);
-    let idempotency_key = format!("{cur}#{}", state.attempts_total + 1);
-    match &node.spec {
-        NodeSpec::Terminal { .. } => unreachable!("terminal handled above"),
-        NodeSpec::Agent { .. } => vec![Effect::StartAttempt {
-            node_id: cur,
-            attempt_id,
-            idempotency_key,
-        }],
-        NodeSpec::Command { .. } => vec![Effect::RunCommand {
-            node_id: cur,
-            attempt_id,
-            idempotency_key,
-        }],
-        NodeSpec::Human { .. } => vec![Effect::RequestHuman { node_id: cur }],
-    }
+    None
 }
 
 fn terminal(disposition: Disposition) -> Effect {
@@ -612,6 +786,16 @@ fn terminal_because(disposition: Disposition, why: impl Into<String>) -> Effect 
 mod tests {
     use super::*;
     use hex_proto::{Actor, PROTOCOL_VERSION};
+
+    /// The one active node of a sequential run.
+    fn current(s: &RunState) -> Option<String> {
+        s.active.keys().next().cloned()
+    }
+
+    /// Park a sequential run on `node`, with no attempt in flight.
+    fn park(s: &mut RunState, node: &str) {
+        s.active = BTreeMap::from([(node.to_owned(), None)]);
+    }
 
     fn ev(seq: u64, body: EventBody) -> Event {
         Event {
@@ -651,14 +835,14 @@ mod tests {
             match body {
                 EventBody::AttemptStarted { .. } => {
                     attempt_n += 1;
-                    e.node_id = state.current.clone();
+                    e.node_id = current(&state);
                     e.attempt_id = Some(format!("att_{attempt_n}"));
                 }
                 EventBody::Signal { .. }
                 | EventBody::AttemptFailed { .. }
                 | EventBody::AttemptReported { .. } => {
-                    e.node_id = state.current.clone();
-                    e.attempt_id = state.current_attempt.clone();
+                    e.node_id = current(&state);
+                    e.attempt_id = state.active.values().next().cloned().flatten();
                 }
                 _ => {}
             }
@@ -671,7 +855,7 @@ mod tests {
     fn run_started_activates_entry() {
         let g = loop_graph();
         let s = drive_to(&g, &[EventBody::RunStarted]);
-        assert_eq!(s.current.as_deref(), Some("implement"));
+        assert_eq!(current(&s).as_deref(), Some("implement"));
         assert_eq!(s.status, Status::Running);
     }
 
@@ -694,6 +878,7 @@ mod tests {
             models,
             cost_micro_usd: cost,
             duration_ms: None,
+            cumulative: false,
         }
     }
 
@@ -820,6 +1005,7 @@ mod tests {
                     models: vec![],
                     cost_micro_usd: None,
                     duration_ms: None,
+                    cumulative: false,
                 },
             ],
         );
@@ -853,6 +1039,7 @@ mod tests {
                     models: vec![],
                     cost_micro_usd: None,
                     duration_ms: None,
+                    cumulative: false,
                 },
             ],
         );
@@ -1024,7 +1211,7 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(s.current.as_deref(), Some("test"));
+        assert_eq!(current(&s).as_deref(), Some("test"));
         assert!(!s.awaiting());
     }
 
@@ -1082,7 +1269,7 @@ mod tests {
         let g = loop_graph();
         // Reach `done` without ever seeing test.passed.
         let mut s = drive_to(&g, &[EventBody::RunStarted]);
-        s.current = Some("done".to_owned());
+        park(&mut s, "done");
         assert_eq!(
             schedule(&g, &s, 0),
             vec![Effect::RecordTerminal {
@@ -1121,7 +1308,7 @@ mod tests {
             .on_unmet("implement")
             .build();
         let mut s = drive_to(&g, &[EventBody::RunStarted]);
-        s.current = Some("done".to_owned());
+        park(&mut s, "done");
         assert_eq!(
             schedule(&g, &s, 0),
             vec![Effect::RerouteUnmet {
@@ -1141,7 +1328,7 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(s.current.as_deref(), Some("implement"));
+        assert_eq!(current(&s).as_deref(), Some("implement"));
         assert_eq!(s.visits.get("implement").copied(), Some(2));
     }
 
@@ -1153,7 +1340,7 @@ mod tests {
         let mut g = loop_graph();
         g.nodes.get_mut("done").expect("done").max_visits = Some(8);
         let mut s = drive_to(&g, &[EventBody::RunStarted]);
-        s.current = Some("done".to_owned());
+        park(&mut s, "done");
         s.visits.insert("done".to_owned(), 8); // at the bound
         s.signals.insert("test".to_owned(), "passed".to_owned());
         assert_eq!(
@@ -1170,7 +1357,7 @@ mod tests {
         let g = loop_graph();
         // Start an attempt on `implement` (att_1), then feed a Signal tagged
         // with a *different* attempt id — it must be ignored.
-        let mut s = drive_to(
+        let s = drive_to(
             &g,
             &[
                 EventBody::RunStarted,
@@ -1180,9 +1367,6 @@ mod tests {
                 },
             ],
         );
-        // AttemptStarted in drive_to has no attempt_id in the envelope; set the
-        // projection's expected attempt explicitly to model a real run.
-        s.current_attempt = Some("att_1".to_owned());
         let mut forged = ev(
             50,
             EventBody::Signal {
@@ -1193,7 +1377,7 @@ mod tests {
         forged.attempt_id = Some("att_999".to_owned()); // wrong attempt
         let after = reduce(&g, s, &forged);
         assert_eq!(
-            after.current.as_deref(),
+            current(&after).as_deref(),
             Some("implement"),
             "must not route"
         );
@@ -1207,7 +1391,7 @@ mod tests {
     fn attempt_failed_with_success_disposition_fails_closed() {
         let g = loop_graph();
         // Reach an in-flight attempt on `implement`.
-        let mut s = drive_to(
+        let s = drive_to(
             &g,
             &[
                 EventBody::RunStarted,
@@ -1217,7 +1401,6 @@ mod tests {
                 },
             ],
         );
-        s.current_attempt = Some("att_1".to_owned());
         // A forged failure claiming success must collapse to Failed.
         let mut failed = ev(
             50,
@@ -1251,8 +1434,353 @@ mod tests {
 
         let resumed = reduce(&g, paused, &ev(10, EventBody::RunResumed));
         assert_eq!(resumed.status, Status::Running);
-        assert_eq!(resumed.current.as_deref(), Some("implement"));
+        assert_eq!(current(&resumed).as_deref(), Some("implement"));
         assert_eq!(schedule(&g, &resumed, 0).len(), 1, "and work resumes");
+    }
+
+    /// research --done--> [a, b]; a, b --done--> review (join) --done--> done.
+    fn fan_graph() -> Graph {
+        Graph::builder("t", "research")
+            .agent("research", "w", "p", &[])
+            .agent("a", "w", "p", &[])
+            .agent("b", "w", "p", &[])
+            .agent("review", "w", "p", &[])
+            .terminal("done", Disposition::Succeeded)
+            .terminal("bad", Disposition::Failed)
+            .edge("research", "done", "a")
+            .edge("research", "done", "b")
+            .edge("a", "done", "review")
+            .edge("b", "done", "review")
+            .edge("review", "done", "done")
+            .join("review")
+            .build()
+    }
+
+    /// Fold one event for `node`, stamped with that node's in-flight attempt
+    /// (or `att` for a start).
+    fn on(g: &Graph, s: RunState, node: &str, att: &str, body: EventBody) -> RunState {
+        let mut e = ev(0, body);
+        e.node_id = Some(node.to_owned());
+        e.attempt_id = Some(att.to_owned());
+        reduce(g, s, &e)
+    }
+
+    fn start() -> EventBody {
+        EventBody::AttemptStarted {
+            idempotency_key: "k".to_owned(),
+            worker: None,
+        }
+    }
+
+    fn done() -> EventBody {
+        EventBody::Signal {
+            name: "done".to_owned(),
+        }
+    }
+
+    fn starts(effects: &[Effect]) -> Vec<(&str, &str)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::StartAttempt {
+                    node_id,
+                    attempt_id,
+                    ..
+                } => Some((node_id.as_str(), attempt_id.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A list edge enters every target, and both start at once with distinct ids.
+    /// The join waits for both and is entered once.
+    #[test]
+    fn a_list_edge_fans_out_and_a_join_waits_for_every_branch() {
+        let g = fan_graph();
+        let s = reduce(&g, RunState::default(), &ev(0, EventBody::RunStarted));
+        let s = on(&g, s, "research", "att_1", start());
+        let s = on(&g, s, "research", "att_1", done());
+        assert_eq!(s.active_nodes(), ["a", "b"]);
+        assert_eq!(
+            starts(&schedule(&g, &s, 0)),
+            [("a", "att_2"), ("b", "att_3")]
+        );
+
+        let s = on(&g, s, "a", "att_2", start());
+        let s = on(&g, s, "b", "att_3", start());
+        assert!(schedule(&g, &s, 0).is_empty(), "both in flight");
+
+        let s = on(&g, s, "a", "att_2", done());
+        assert_eq!(s.active_nodes(), ["b", "review"]);
+        assert!(schedule(&g, &s, 0).is_empty(), "the join waits for b");
+
+        let s = on(&g, s, "b", "att_3", done());
+        assert_eq!(s.active_nodes(), ["review"]);
+        assert_eq!(s.visits["review"], 1, "entered once");
+        assert_eq!(starts(&schedule(&g, &s, 0)), [("review", "att_4")]);
+    }
+
+    /// A success terminal waits for the branches still running; a failure terminal
+    /// ends the run at once.
+    #[test]
+    fn a_success_terminal_waits_and_a_failure_terminal_does_not() {
+        let g = Graph::builder("t", "r")
+            .agent("r", "w", "p", &[])
+            .agent("a", "w", "p", &["ok", "no"])
+            .agent("b", "w", "p", &[])
+            .terminal("done", Disposition::Succeeded)
+            .terminal("bad", Disposition::Failed)
+            .edge("r", "done", "a")
+            .edge("r", "done", "b")
+            .edge("a", "ok", "done")
+            .edge("a", "no", "bad")
+            .edge("b", "done", "done")
+            .build();
+        let s = reduce(&g, RunState::default(), &ev(0, EventBody::RunStarted));
+        let s = on(&g, s, "r", "att_1", start());
+        let s = on(&g, s, "r", "att_1", done());
+        let s = on(&g, s, "a", "att_2", start());
+        let s = on(&g, s, "b", "att_3", start());
+
+        let ok = EventBody::Signal {
+            name: "ok".to_owned(),
+        };
+        let waiting = on(&g, s.clone(), "a", "att_2", ok);
+        assert!(schedule(&g, &waiting, 0).is_empty(), "b still runs");
+        let settled = on(&g, waiting, "b", "att_3", done());
+        assert_eq!(
+            schedule(&g, &settled, 0),
+            [terminal(Disposition::Succeeded)]
+        );
+
+        let no = EventBody::Signal {
+            name: "no".to_owned(),
+        };
+        let failed = on(&g, s, "a", "att_2", no);
+        assert_eq!(schedule(&g, &failed, 0), [terminal(Disposition::Failed)]);
+    }
+
+    /// Two joins, or a join beside a waiting success terminal, never block each
+    /// other: with nothing in flight, the joins start.
+    #[test]
+    fn idle_waiters_never_deadlock() {
+        let g = Graph::builder("t", "r")
+            .agent("r", "w", "p", &[])
+            .agent("a", "w", "p", &[])
+            .agent("b", "w", "p", &[])
+            .agent("j1", "w", "p", &[])
+            .agent("j2", "w", "p", &[])
+            .terminal("done", Disposition::Succeeded)
+            .edge("r", "done", "a")
+            .edge("r", "done", "b")
+            .edge("a", "done", "j1")
+            .edge("b", "done", "j2")
+            .edge("j1", "done", "done")
+            .edge("j2", "done", "done")
+            .join("j1")
+            .join("j2")
+            .build();
+        let s = reduce(&g, RunState::default(), &ev(0, EventBody::RunStarted));
+        let s = on(&g, s, "r", "att_1", start());
+        let s = on(&g, s, "r", "att_1", done());
+        let s = on(&g, s, "a", "att_2", start());
+        let s = on(&g, s, "b", "att_3", start());
+        let s = on(&g, s, "a", "att_2", done());
+        let s = on(&g, s, "b", "att_3", done());
+        assert_eq!(s.active_nodes(), ["j1", "j2"]);
+        assert_eq!(
+            starts(&schedule(&g, &s, 0)),
+            [("j1", "att_4"), ("j2", "att_5")]
+        );
+
+        // j1 done first: the success terminal waits beside the join j2 ...
+        let s = on(&g, s, "j1", "att_4", start());
+        let s = on(&g, s, "j2", "att_5", start());
+        let s = on(&g, s, "j1", "att_4", done());
+        assert!(schedule(&g, &s, 0).is_empty(), "j2 still in flight");
+        // ... and settles once it is alone.
+        let s = on(&g, s, "j2", "att_5", done());
+        assert_eq!(schedule(&g, &s, 0), [terminal(Disposition::Succeeded)]);
+    }
+
+    /// Idle waiters go one kind at a time: a human before a join or a terminal.
+    #[test]
+    fn a_human_goes_before_a_terminal_and_two_terminals_settle() {
+        let g = Graph::builder("t", "r")
+            .agent("r", "w", "p", &[])
+            .human("ask", "ok?")
+            .terminal("done", Disposition::Succeeded)
+            .terminal("fin", Disposition::Succeeded)
+            .edge("ask", "done", "done")
+            .build();
+        let quiet = |nodes: &[&str]| RunState {
+            status: Status::Running,
+            active: nodes.iter().map(|n| ((*n).to_owned(), None)).collect(),
+            ..RunState::default()
+        };
+        assert_eq!(
+            schedule(&g, &quiet(&["ask", "done"]), 0),
+            [Effect::RequestHuman {
+                node_id: "ask".to_owned()
+            }]
+        );
+        assert_eq!(
+            schedule(&g, &quiet(&["done", "fin"]), 0),
+            [terminal(Disposition::Succeeded)]
+        );
+        let mut g = g;
+        if let Some(n) = g.nodes.get_mut("r") {
+            n.join = true;
+        }
+        assert_eq!(
+            schedule(&g, &quiet(&["ask", "r"]), 0),
+            [Effect::RequestHuman {
+                node_id: "ask".to_owned()
+            }],
+            "the join waits for the answer"
+        );
+    }
+
+    /// A join beside an idle success terminal starts; the terminal waits for it.
+    #[test]
+    fn a_join_starts_beside_a_waiting_terminal() {
+        let mut s = RunState {
+            status: Status::Running,
+            ..RunState::default()
+        };
+        let g = fan_graph();
+        s.active = BTreeMap::from([("done".to_owned(), None), ("review".to_owned(), None)]);
+        assert_eq!(starts(&schedule(&g, &s, 0)), [("review", "att_1")]);
+    }
+
+    /// Session totals bill only what each attempt added: a continued session
+    /// subtracts its own last totals, a fork subtracts its source's. A report
+    /// that is not a session total bills in full.
+    #[test]
+    fn session_totals_bill_only_the_difference() {
+        let mut g = Graph::builder("t", "r")
+            .agent("r", "w", "p", &["again"])
+            .agent("f", "w", "p", &[])
+            .terminal("done", Disposition::Succeeded)
+            .edge("r", "again", "r")
+            .edge("r", "done", "f")
+            .edge("f", "done", "done")
+            .build();
+        if let Some(NodeSpec::Agent { context, .. }) = g.nodes.get_mut("f").map(|n| &mut n.spec) {
+            *context = graph::Context::Fork("r".to_owned());
+        }
+        let report = |id: &str, out: u64, cost: u64, cumulative: bool| EventBody::AttemptReported {
+            session_id: Some(id.to_owned()),
+            agent: Some("claude".to_owned()),
+            models: vec![model("m", 0, out, Some(cost))],
+            cost_micro_usd: Some(cost),
+            duration_ms: None,
+            cumulative,
+        };
+        let again = EventBody::Signal {
+            name: "again".to_owned(),
+        };
+        let s = reduce(&g, RunState::default(), &ev(0, EventBody::RunStarted));
+        let s = on(&g, s, "r", "att_1", start());
+        let s = on(&g, s, "r", "att_1", report("s1", 10, 100, true));
+        let s = on(&g, s, "r", "att_1", again);
+        // Continued: the session now totals 25 tokens and 250, so this adds 15/150.
+        let s = on(&g, s, "r", "att_2", start());
+        let s = on(&g, s, "r", "att_2", report("s1", 25, 250, true));
+        let s = on(&g, s, "r", "att_2", done());
+        // Forked from s1 (25/250) into s2, which totals 30/260: adds 5/10.
+        let s = on(&g, s, "f", "att_3", start());
+        // A one-model fork under another model label (codex) still subtracts.
+        let relabelled = EventBody::AttemptReported {
+            session_id: Some("s2".to_owned()),
+            agent: Some("claude".to_owned()),
+            models: vec![model("other", 0, 30, None)],
+            cost_micro_usd: None,
+            duration_ms: None,
+            cumulative: true,
+        };
+        let codex = on(&g, s.clone(), "f", "att_3", relabelled);
+        assert_eq!(codex.usage.by_node["f"].output_tokens, 5);
+        let s = on(&g, s, "f", "att_3", report("s2", 30, 260, true));
+        assert_eq!(s.usage.total.output_tokens, 30);
+        assert_eq!(s.usage.total.cost_micro_usd, 260);
+        assert_eq!(s.usage.by_node["r"].output_tokens, 25);
+        assert_eq!(s.usage.by_node["f"].cost_micro_usd, 10);
+
+        // Per-attempt reports (pi) are never subtracted, even with the same id.
+        let s = reduce(&g, RunState::default(), &ev(0, EventBody::RunStarted));
+        let s = on(&g, s, "r", "att_1", start());
+        let s = on(&g, s, "r", "att_1", report("p", 10, 100, false));
+        let s = on(
+            &g,
+            s,
+            "r",
+            "att_1",
+            EventBody::Signal {
+                name: "again".to_owned(),
+            },
+        );
+        let s = on(&g, s, "r", "att_2", start());
+        let s = on(&g, s, "r", "att_2", report("p", 10, 100, false));
+        assert_eq!(s.usage.total.output_tokens, 20);
+    }
+
+    /// A steer for one node waits for that node's next attempt; another node's
+    /// attempt does not consume it.
+    #[test]
+    fn a_node_steer_waits_for_its_node() {
+        let g = fan_graph();
+        let s = reduce(&g, RunState::default(), &ev(0, EventBody::RunStarted));
+        let s = on(&g, s, "research", "att_1", start());
+        let s = on(&g, s, "research", "att_1", done());
+        let steer = ev(
+            0,
+            EventBody::Steered {
+                text: "use helper X".to_owned(),
+                node: Some("b".to_owned()),
+            },
+        );
+        let s = reduce(&g, s, &steer);
+        let s = on(&g, s, "a", "att_2", start());
+        assert_eq!(s.node_steer["b"], ["use helper X"], "a does not take it");
+        let s = on(&g, s, "b", "att_3", start());
+        assert!(s.node_steer.is_empty(), "b's attempt consumed it");
+    }
+
+    /// The audit folds through `reduce`, so a fan-out journal reads back.
+    #[test]
+    fn check_journal_accepts_a_fan_out() {
+        let g = fan_graph();
+        let mut events = vec![
+            ev(
+                0,
+                EventBody::RunCreated {
+                    graph_hash: "h".to_owned(),
+                    inputs: BTreeMap::new(),
+                    defaults: BTreeMap::new(),
+                    checks: BTreeMap::new(),
+                    sessions: Default::default(),
+                },
+            ),
+            ev(1, EventBody::RunStarted),
+        ];
+        for (node, att, body) in [
+            ("research", "att_1", start()),
+            ("research", "att_1", done()),
+            ("a", "att_2", start()),
+            ("b", "att_3", start()),
+            ("b", "att_3", done()),
+            ("a", "att_2", done()),
+            ("review", "att_4", start()),
+            ("review", "att_4", done()),
+        ] {
+            let mut e = ev(events.len() as u64, body);
+            e.node_id = Some(node.to_owned());
+            e.attempt_id = Some(att.to_owned());
+            events.push(e);
+        }
+        let s = check_journal(&g, &events).expect("valid");
+        assert_eq!(s.active_nodes(), ["done"]);
     }
 
     /// A pause is only legal between attempts, so a forged one mid-attempt must
@@ -1260,7 +1788,7 @@ mod tests {
     #[test]
     fn pause_is_ignored_while_an_attempt_is_in_flight() {
         let g = loop_graph();
-        let mut s = drive_to(
+        let s = drive_to(
             &g,
             &[
                 EventBody::RunStarted,
@@ -1270,7 +1798,6 @@ mod tests {
                 },
             ],
         );
-        s.current_attempt = Some("att_1".to_owned());
         let after = reduce(&g, s, &ev(9, EventBody::RunPaused));
         assert_eq!(after.status, Status::Running);
     }
@@ -1286,6 +1813,7 @@ mod tests {
                 9,
                 EventBody::Steered {
                     text: "prefer the smaller diff".to_owned(),
+                    node: None,
                 },
             ),
         );
@@ -1311,7 +1839,7 @@ mod tests {
     fn a_command_attempt_does_not_consume_queued_steering() {
         let g = loop_graph();
         let mut s = drive_to(&g, &[EventBody::RunStarted]);
-        s.current = Some("test".to_owned()); // the gate
+        park(&mut s, "test"); // the gate
         s = reduce(
             &g,
             s,
@@ -1319,6 +1847,7 @@ mod tests {
                 9,
                 EventBody::Steered {
                     text: "guidance".to_owned(),
+                    node: None,
                 },
             ),
         );
@@ -1350,7 +1879,7 @@ mod tests {
     fn a_human_node_asks_for_a_decision_rather_than_starting_an_attempt() {
         let g = human_graph();
         let mut s = drive_to(&g, &[EventBody::RunStarted]);
-        s.current = Some("approve".to_owned());
+        park(&mut s, "approve");
         assert_eq!(
             schedule(&g, &s, 0),
             vec![Effect::RequestHuman {
@@ -1363,7 +1892,7 @@ mod tests {
     /// position an answer may be applied from.
     fn asked_on_approve(g: &Graph) -> RunState {
         let mut s = drive_to(g, &[EventBody::RunStarted]);
-        s.current = Some("approve".to_owned());
+        park(&mut s, "approve");
         let mut asked = ev(
             8,
             EventBody::HumanRequested {
@@ -1395,7 +1924,7 @@ mod tests {
             "downstream `{{approve.result}}` reads an operator answer like an agent's"
         );
         assert_eq!(s.signals.get("approve").map(String::as_str), Some("done"));
-        assert_eq!(s.current.as_deref(), Some("fin"), "routed along its edge");
+        assert_eq!(current(&s).as_deref(), Some("fin"), "routed along its edge");
         assert!(
             s.asked.is_none(),
             "the question is answered, not still open"
@@ -1417,7 +1946,7 @@ mod tests {
         );
         forged.node_id = Some("plan".to_owned()); // not the node that asked
         let after = reduce(&g, s, &forged);
-        assert_eq!(after.current.as_deref(), Some("approve"));
+        assert_eq!(current(&after).as_deref(), Some("approve"));
         assert!(after.results.is_empty());
         assert_eq!(after.asked.as_deref(), Some("approve"), "still outstanding");
     }
@@ -1428,7 +1957,7 @@ mod tests {
     fn a_human_response_with_no_outstanding_question_is_dropped() {
         let g = human_graph();
         let mut s = drive_to(&g, &[EventBody::RunStarted]);
-        s.current = Some("approve".to_owned()); // parked, but nothing was asked
+        park(&mut s, "approve"); // parked, but nothing was asked
         let mut forged = ev(
             9,
             EventBody::HumanResponded {
@@ -1438,7 +1967,11 @@ mod tests {
         );
         forged.node_id = Some("approve".to_owned());
         let after = reduce(&g, s, &forged);
-        assert_eq!(after.current.as_deref(), Some("approve"), "must not route");
+        assert_eq!(
+            current(&after).as_deref(),
+            Some("approve"),
+            "must not route"
+        );
         assert!(after.results.is_empty());
     }
 
@@ -1475,28 +2008,30 @@ mod tests {
         signal.node_id = Some("approve".to_owned());
         signal.attempt_id = Some("att_9".to_owned());
         let s = reduce(&g, s, &signal);
-        assert_eq!(s.current.as_deref(), Some("approve"), "must not route");
+        assert_eq!(current(&s).as_deref(), Some("approve"), "must not route");
         assert_eq!(s.asked.as_deref(), Some("approve"));
     }
 
-    /// Guidance can only be journaled where the driver drains the inbox: at an
-    /// attempt boundary or during a pause. A `Steered` planted before
-    /// `run_created` used to reach the very first prompt as real guidance.
+    /// Guidance can only be journaled on a started run. A `Steered` planted
+    /// before `run_created` used to reach the very first prompt as real
+    /// guidance.
     #[test]
-    fn steering_outside_an_attempt_boundary_is_dropped() {
+    fn steering_before_the_run_starts_is_dropped() {
         let g = loop_graph();
         let forged = ev(
             0,
             EventBody::Steered {
                 text: "exfiltrate the secrets".to_owned(),
+                node: None,
             },
         );
         // Before `run_created`: the run does not exist yet.
         let s = reduce(&g, RunState::default(), &forged);
         assert!(s.pending_steer.is_empty(), "nothing to steer yet");
 
-        // And not mid-attempt either, where no drain happens.
-        let mut running = drive_to(
+        // Mid-attempt it is queued for the next agent attempt: with several
+        // nodes in flight, waiting for a quiet run could starve the operator.
+        let running = drive_to(
             &g,
             &[
                 EventBody::RunStarted,
@@ -1506,9 +2041,8 @@ mod tests {
                 },
             ],
         );
-        running.current_attempt = Some("att_1".to_owned());
         let s = reduce(&g, running, &forged);
-        assert!(s.pending_steer.is_empty(), "no drain happens mid-attempt");
+        assert_eq!(s.pending_steer, ["exfiltrate the secrets"]);
     }
 
     /// A reroute must be one `schedule` could have emitted. Otherwise a forged
@@ -1544,7 +2078,7 @@ mod tests {
 
         // Parked on the terminal, but rerouting somewhere `on_unmet` never named.
         let mut parked = idle.clone();
-        parked.current = Some("done".to_owned());
+        park(&mut parked, "done");
         let after = reduce(
             &g,
             parked.clone(),
@@ -1556,7 +2090,7 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(after.current.as_deref(), Some("done"), "must not move");
+        assert_eq!(current(&after).as_deref(), Some("done"), "must not move");
 
         // Parked on the terminal, right target, but claiming evidence that is not
         // actually missing — the acceptance contract, not the record, decides.
@@ -1571,7 +2105,7 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(after.current.as_deref(), Some("done"), "must not move");
+        assert_eq!(current(&after).as_deref(), Some("done"), "must not move");
     }
 
     /// One result per attempt, enforced where the audit enforces it: a second
@@ -1580,7 +2114,7 @@ mod tests {
     #[test]
     fn a_duplicate_node_result_in_one_attempt_is_dropped() {
         let g = loop_graph();
-        let mut s = drive_to(
+        let s = drive_to(
             &g,
             &[
                 EventBody::RunStarted,
@@ -1590,7 +2124,6 @@ mod tests {
                 },
             ],
         );
-        s.current_attempt = Some("att_1".to_owned());
         let result = |text: &str| {
             let mut e = ev(
                 9,
@@ -1611,7 +2144,7 @@ mod tests {
 
         // A fresh attempt clears the node's result, so the next one records again.
         let mut s = s;
-        s.current_attempt = None; // attempt 1 ended; the run is parked on `implement`
+        park(&mut s, "implement"); // attempt 1 ended; the run is parked on `implement`
         let mut started = ev(
             11,
             EventBody::AttemptStarted {

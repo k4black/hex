@@ -90,13 +90,13 @@ enum Command {
     },
     /// Validate a graph: schema, references, a reachable success
     Validate {
-        /// Graph reference: a preset name or a path to a `.yaml` file
+        /// Graph reference: a preset name, a path to a `.yaml` file, or `-` for stdin
         #[arg(value_name = "GRAPH")]
         graph: String,
     },
     /// Render a graph: as text, or its YAML source
     Graph {
-        /// Graph reference: a preset name or a path to a `.yaml` file
+        /// Graph reference: a preset name, a path to a `.yaml` file, or `-` for stdin
         #[arg(value_name = "GRAPH")]
         graph: String,
         /// Output format (`source` prints the YAML, the copy-and-customise path)
@@ -105,7 +105,7 @@ enum Command {
     },
     /// Start a NEW run of a graph
     Run {
-        /// Graph reference; omit to list what's runnable
+        /// Graph reference (`-` reads stdin); omit to list what's runnable
         #[arg(value_name = "GRAPH")]
         graph: Option<String>,
         /// Operator prompt, inline (fills `{{prompt}}` in the graph)
@@ -123,6 +123,10 @@ enum Command {
         /// Warmup argv run once in a fresh/reclaimed worktree (no shell)
         #[arg(long, value_name = "CMD", requires = "worktree")]
         worktree_init: Option<String>,
+        /// Continue the agent sessions of an earlier run: each `continue` or
+        /// `fork` node starts from the session of the same-named node there
+        #[arg(long = "continue", value_name = "RUN")]
+        continue_from: Option<String>,
         /// Disable the live in-flight preview pane (plain line streaming instead)
         #[arg(long)]
         no_preview: bool,
@@ -180,6 +184,10 @@ enum Command {
         /// Guidance text, injected into the next attempt's prompt
         #[arg(value_name = "TEXT")]
         text: String,
+        /// Only this agent node's next attempt reads it (else the next agent
+        /// attempt of any node)
+        #[arg(long, value_name = "NODE")]
+        node: Option<String>,
     },
     /// Answer a `human` node that is blocking a run
     Respond {
@@ -305,11 +313,13 @@ fn dispatch(cli: Cli, verb: &str) -> Result<ExitCode, String> {
             name,
             worktree,
             worktree_init,
+            continue_from,
             no_preview,
         } => cmd_run(
             graph.as_deref(),
             resolve_prompt(prompt, file.as_deref())?,
             name.as_deref(),
+            continue_from.as_deref(),
             isolation_from(worktree.as_deref(), worktree_init.as_deref()),
             json,
             no_preview,
@@ -339,8 +349,8 @@ fn dispatch(cli: Cli, verb: &str) -> Result<ExitCode, String> {
         ),
         Command::Wait { run_id } => cmd_wait(&run_id, json),
         Command::Pause { run_id } => cmd_control(&run_id, &ControlCommand::Pause, json),
-        Command::Steer { run_id, text } => {
-            cmd_control(&run_id, &ControlCommand::Steer { text }, json)
+        Command::Steer { run_id, text, node } => {
+            cmd_control(&run_id, &ControlCommand::Steer { text, node }, json)
         }
         Command::Respond { run_id, text } => {
             cmd_control(&run_id, &ControlCommand::Respond { text }, json)
@@ -715,10 +725,12 @@ fn isolation_from(worktree: Option<&str>, init: Option<&str>) -> Isolation {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     reference: Option<&str>,
     prompt: Option<String>,
     name: Option<&str>,
+    continue_from: Option<&str>,
     isolation: Isolation,
     json: bool,
     no_preview: bool,
@@ -731,7 +743,13 @@ fn cmd_run(
         return Ok(ExitCode::SUCCESS);
     };
     let report = runtime
-        .start(reference, prompt.as_deref(), name, &isolation)
+        .start_from(
+            reference,
+            prompt.as_deref(),
+            name,
+            &isolation,
+            continue_from,
+        )
         .map_err(|e| e.to_string())?;
     print_outcome(&runtime, &report, json, "run", ui)
 }
@@ -1245,7 +1263,7 @@ fn cmd_control(run_id: &str, command: &ControlCommand, json: bool) -> Result<Exi
         // the unchanged output as the steer having been lost.
         if matches!(command, ControlCommand::Steer { .. })
             && let Ok(s) = runtime.status(run_id)
-            && let Some(f) = s.in_flight
+            && let Some(f) = s.in_flight.first()
         {
             eprintln!(
                 "note: {} is mid-attempt ({} on {}); the steer applies to the NEXT attempt",
@@ -1284,13 +1302,14 @@ fn cmd_status(run_id: &str, usage: bool, json: bool, ui: ui::Ui) -> Result<ExitC
             "current": s.current,
             "attempts": s.attempts,
             "disposition": disposition_json(s.disposition),
-            "in_flight": s.in_flight.as_ref().map(|f| serde_json::json!({
+            "sessions": s.sessions,
+            "in_flight": s.in_flight.iter().map(|f| serde_json::json!({
                 "attempt_id": f.attempt_id,
                 "node_id": f.node_id,
                 "worker": f.worker,
                 "started_at_ms": f.started_at_ms,
                 "elapsed_ms": elapsed_ms(f.started_at_ms),
-            })),
+            })).collect::<Vec<_>>(),
             "queued": s.queued.iter().map(ControlCommand::as_str).collect::<Vec<_>>(),
             "pending_steer": s.pending_steer,
             "waiting_for_human": s.asked,
@@ -1318,7 +1337,7 @@ fn cmd_status(run_id: &str, usage: bool, json: bool, ui: ui::Ui) -> Result<ExitC
         outln!("{}", line.join(" · "));
 
         // What is happening right now, when something is.
-        if let Some(f) = &s.in_flight {
+        for f in &s.in_flight {
             let via = f
                 .worker
                 .as_deref()
@@ -1343,7 +1362,7 @@ fn cmd_status(run_id: &str, usage: bool, json: bool, ui: ui::Ui) -> Result<ExitC
         }
         for command in &s.queued {
             match command {
-                ControlCommand::Steer { text } => outln!(
+                ControlCommand::Steer { text, .. } => outln!(
                     "{}{text}   {}",
                     ui.field(ui::style::HEADER, "Queued", 11),
                     ui.paint(ui::style::DIM, "(not yet picked up)")
@@ -1524,7 +1543,8 @@ fn follow_logs(
     ui: ui::Ui,
 ) -> Result<ExitCode, String> {
     wait_for_journal(runtime, run_id)?;
-    let mut open: Option<(String, hex_runtime::StreamCursor)> = None;
+    // Every attempt still running, so parallel nodes all stream.
+    let mut open: Vec<(String, String, hex_runtime::StreamCursor)> = Vec::new();
     let mut seen = 0usize;
     // The attempt already running when we attach is joined at its tail; anything
     // starting later streams from its first byte.
@@ -1541,7 +1561,6 @@ fn follow_logs(
             if node.is_some_and(|want| want != node_id) {
                 continue;
             }
-            drain(runtime, run_id, &mut open, ui)?;
             let via = worker
                 .as_deref()
                 .map_or(String::new(), |w| format!(" via {w}"));
@@ -1553,13 +1572,15 @@ fn follow_logs(
             } else {
                 hex_runtime::StreamCursor::default()
             };
-            open = Some((attempt_id.clone(), cursor));
+            open.push((attempt_id.clone(), node_id.clone(), cursor));
         }
         seen = events.len();
         attaching = false;
-        drain(runtime, run_id, &mut open, ui)?;
-
+        // Status before the drain: an attempt it no longer lists has exited, so
+        // this drain reads its last bytes and the attempt can then be dropped.
         let status = runtime.status(run_id).map_err(|e| e.to_string())?;
+        drain(runtime, run_id, &mut open, ui)?;
+        open.retain(|(a, ..)| status.in_flight.iter().any(|f| &f.attempt_id == a));
         if status.status.is_finished() {
             outln!(
                 "\u{2500}\u{2500} {} \u{2500}\u{2500}",
@@ -1571,26 +1592,32 @@ fn follow_logs(
     }
 }
 
-/// Print whatever the open attempt has written since the last look. Called on
-/// every poll *and* before switching attempts: an attempt's final bytes land
+/// Print whatever the open attempts have written since the last look. Called
+/// on every poll, and once more after an attempt exits: its final bytes land
 /// after the last poll that could still see it running, and those are the
-/// interesting ones — a check's failure, an agent's last word.
+/// interesting ones — a check's failure, an agent's last word. With several
+/// attempts open, each line starts with its node.
 fn drain(
     runtime: &Runtime,
     run_id: &str,
-    open: &mut Option<(String, hex_runtime::StreamCursor)>,
+    open: &mut [(String, String, hex_runtime::StreamCursor)],
     ui: ui::Ui,
 ) -> Result<(), String> {
-    let Some((attempt_id, cursor)) = open.as_mut() else {
-        return Ok(());
-    };
-    for chunk in runtime
-        .read_streams(run_id, attempt_id, cursor)
-        .map_err(|e| e.to_string())?
-    {
-        for line in chunk.text.lines() {
-            if let Some(shown) = agent_stream::humanize(line) {
-                outln!("{}", ui.paint(ui::style::DIM, &shown));
+    let many = open.len() > 1;
+    for (attempt_id, node_id, cursor) in open.iter_mut() {
+        for chunk in runtime
+            .read_streams(run_id, attempt_id, cursor)
+            .map_err(|e| e.to_string())?
+        {
+            for line in chunk.text.lines() {
+                if let Some(shown) = agent_stream::humanize(line) {
+                    let shown = if many {
+                        format!("[{node_id}] {shown}")
+                    } else {
+                        shown
+                    };
+                    outln!("{}", ui.paint(ui::style::DIM, &shown));
+                }
             }
         }
     }
@@ -1650,7 +1677,13 @@ fn cmd_logs(
     let in_flight = runtime
         .status(run_id)
         .ok()
-        .and_then(|s| s.in_flight.map(|f| f.attempt_id));
+        .map(|s| {
+            s.in_flight
+                .into_iter()
+                .map(|f| f.attempt_id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let logs = runtime.logs(run_id).map_err(|e| e.to_string())?;
     let logs: Vec<_> = logs
         .into_iter()
@@ -1713,7 +1746,7 @@ fn cmd_logs(
                 // An attempt still running has no final message *yet*, and saying
                 // "(no final message captured)" over ten lines of live output reads
                 // as "nothing happened". Show its tail instead, and say it is live.
-                None if in_flight.as_deref() == Some(l.attempt_id.as_str()) => {
+                None if in_flight.contains(&l.attempt_id) => {
                     let lines = stream_lines(&runtime, run_id, &l.attempt_id);
                     if lines.is_empty() {
                         outln!(
@@ -1880,7 +1913,7 @@ fn event_summary(body: &hex_runtime::EventBody) -> String {
         B::RunStarted => "run_started".to_owned(),
         B::RunPaused => "run_paused".to_owned(),
         B::RunResumed => "run_resumed".to_owned(),
-        B::Steered { text } => format!("steer: {text}"),
+        B::Steered { text, .. } => format!("steer: {text}"),
         B::HumanRequested { prompt } => format!("human_requested: {prompt}"),
         B::HumanResponded { text, signal } => format!("human_responded [{signal}]: {text}"),
         B::AcceptanceUnmet { missing, to } => format!(

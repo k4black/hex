@@ -136,7 +136,7 @@ graph naming an undeclared check is **refused before the run starts**.
 _Avoid_: gate (a check is what a gate node *runs*).
 
 **Role**: The user-facing unit a graph names (`role: reviewer`):
-implementer / reviewer / planner / researcher. A role binds a **worker** to a
+implementer / reviewer / planner / researcher / scout. A role binds a **worker** to a
 `model`, `effort`, `read_only` policy and `prompt` preamble; two roles can
 share one CLI and differ in everything else. Defined in layered config,
 deep-merged per key, so a project overriding `roles.reviewer.model` inherits
@@ -161,6 +161,20 @@ scoped authority. _Avoid_: user, supervisor, controller.
 (`.hex/graphs/`) > user (`~/.config/hex/graphs/`) > built-in; invoked as
 `hex run <preset> -p "<prompt>"`. _Avoid_: pipeline (banned Graph synonym),
 template (reserved for `templates:` node reuse inside a graph).
+
+**Fan-out**: An edge with a list of targets (`on: { done: [a, b] }`). The run
+enters every target, and they run at the same time, each as its own node with
+its own attempt, bound, verdict and session. A **join** (`join: all`) is a node
+that waits until no other node is active. _Avoid_: branch, parallel step.
+
+**Fork**: `context: { fork: <node> }`. The node's first attempt starts a new
+agent session from a copy of `<node>`'s session. Later visits continue its own
+session. _Avoid_: clone, copy.
+
+**Operator session**: The main Claude Code or Codex session that plans the
+work and calls hex. Never inside an attempt. `hex run --continue <run>` lets
+it call the same implementer or reviewer again in a new run. _Avoid_: calling
+it a run or an agent session.
 
 **Interactive session**: An `agent` attempt with `interactive: true` that
 stays open for live human↔agent conversation, journaled per turn, resumable.
@@ -376,6 +390,12 @@ not built. _Avoid_: sign-off, confirmation.
    `cached_input_tokens`, so the fresh share is the difference; claude reports
    cache tokens beside `inputTokens`. `reasoning_tokens` is a subset of output
    and is not added into `tokens()`.
+   - claude and codex report **session totals** on a resumed or forked session
+     (`AttemptReported.cumulative`). `reduce` bills the difference to the
+     session's last totals, kept on `SessionHandle.models`/`cost_micro_usd`
+     (`resumed_from`, `since`). The base is the node's own session when the id
+     matches, else the fork source. `--continue` carries the totals in
+     `RunCreated.sessions`. pi reports per attempt (`cumulative: false`).
 30. **`AttemptReported` is recorded before anything that can end the
    attempt**, at most once per attempt. `reduce` clears `current_attempt` when
    a signal routes, so a later report is dropped. A duplicate would inflate
@@ -390,7 +410,7 @@ not built. _Avoid_: sign-off, confirmation.
 32. **`budget.output_tokens` counts generation only**, run-wide under
    `defaults: { budget: … }`. Cached input dominates total tokens, so a bound
    over all tokens would track context size. `schedule` checks it at the
-   attempt boundary (overshoot ≤ one attempt); `0` is `E-budget-zero`. Covered
+   attempt boundary (overshoot ≤ the attempts in flight); `0` is `E-budget-zero`. Covered
    by kernel unit tests only (TODO.md).
 33. **Every run ends with `RunFinished`, and `AttemptFailed` still carries the
    disposition.** `AttemptFailed` stays one atomic terminal fact; the trailing
@@ -439,6 +459,10 @@ not built. _Avoid_: sign-off, confirmation.
    accepted`). `Inbox::queued()` must stay read-only: moving a file to `done/`
    would delete the steer the operator is checking. An in-flight attempt does
    not see a steer; `hex steer` says so on stderr.
+   - `hex steer --node <n>` goes to `RunState.node_steer[n]`, read only by that
+     node's next attempt. `Runtime::control` refuses a node that is not an
+     agent of the run's graph. Without `--node`, the next agent attempt of any
+     node reads it.
 40. **Following a run.** `Runtime::read_streams(run, attempt, &mut
    StreamCursor)` hands back chunks, so no client learns the on-disk layout.
    The live preview holds no run id, so it reads the same streams through the
@@ -474,9 +498,10 @@ not built. _Avoid_: sign-off, confirmation.
    - The CLI banner goes through `LivePreview::notice`. A raw stderr write
      desyncs ratatui's inline viewport. A ratatui cell renders ANSI escapes as
      visible bytes, so share styling through `ui::Mark`, not rendered strings.
-   - `hex cancel` does not stop an in-flight attempt (the inbox drains at
-     boundaries). On a crashed run it writes `AttemptInterrupted` first, since
-     `lifecycle` rejects `RunFinished` over an open attempt.
+   - `hex cancel` on a live run stops the attempts in flight: the driver reads
+     the inbox every 250 ms and closes each one as `AttemptInterrupted` before
+     `RunFinished`. On a crashed run `cancel` writes `AttemptInterrupted` itself,
+     since `lifecycle` rejects `RunFinished` over an open attempt.
 42. **`hex feedback` writes the *user-global* `~/.hex/feedback.jsonl`**, not a
    project `.hex/`. `hex-cli/src/feedback.rs` uses no `Runtime`: only `$HOME`,
    env and cwd. It captures `HEX_RUN_ID`, `HEX_NODE_ID`, `HEX_GRAPH`,
@@ -501,4 +526,42 @@ not built. _Avoid_: sign-off, confirmation.
      skipped unless `install --force`.
    - A new skill file needs its own `include_str!` entry in `skill::FILES`.
    - doctor's `skill` rows are informational: `Report::ok` ignores them.
-45. _add new gotchas here as they are discovered_
+45. **Several nodes can be active.** `RunState.active` maps each active node
+   to its in-flight attempt (`None` = waiting). There is no single `current`.
+   - `reduce` reads the node from `event.node_id`. A list edge
+     (`Graph::routes`) enters every target. Entering an active node is a no-op,
+     so two branches enter a join once.
+   - `schedule` returns one start effect per ready node.
+     A join, a `human` node and a success terminal wait until the run is quiet
+     (nothing in flight, every active node waiting). Then one human is asked
+     first, else every join starts, else one success terminal settles. A
+     failure terminal or a spent budget ends the run at once.
+   - Validation: `E-join-missing` (branches of one list edge meet at a non-join;
+     the walk passes joins that only some branches reach) and `E-join-kind`
+     (`join` only on agent/command nodes).
+   - `Session::signal` fails an attempt whose signal has no edge, so `reduce`
+     never ends a run with attempts still running.
+   - `hex run --continue <A>` records `inputs.continued_from = A`
+     (`Runtime::continued_by`). A second run continuing A is refused, and so is
+     `hex resume A`: the sessions moved on. Continue the newest run instead.
+   - The driver runs each attempt on a scoped thread; the main thread is the
+     only journal writer (`Session::drive`, `Job`, `Finished`). Control is read
+     each time the loop wakes, so a `steer` may land mid-attempt (`steer_ok`).
+     A `pause` waits until every attempt is back.
+   - A failed attempt or a terminal stops the siblings first
+     (`stop_in_flight`, `hex_worker::interrupt::stop_attempts`), and journals
+     each as `AttemptInterrupted` before the terminal. The stop flag is
+     process-wide, so a test that triggers it needs its own test binary
+     (`tests/parallel_stop.rs`).
+   - Writers share one workspace. Use `--worktree` runs for isolation.
+   - Graph reference `-` reads stdin (`preset::resolve`). Design doc:
+     `docs/design/2026-10-30-operator-sessions.md`.
+46. **Fork and continue sessions.** `Context::Fork(node)` resolves at attempt
+   start: own session if any, else the source node's session with
+   `WorkRequest.fork_session` (claude `--fork-session`, codex `exec fork`),
+   else the attempt fails. `check_workers` requires `Capability::SessionFork`
+   and the same program as the source (`E-fork-agent`).
+   `hex run --continue <run>` (`Runtime::start_from`) copies the source run's
+   handles for `continue`/`fork` nodes into `RunCreated.sessions`, refuses a
+   live source and a program mismatch (`E-import-agent`).
+47. _add new gotchas here as they are discovered_

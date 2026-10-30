@@ -1,7 +1,7 @@
 //! Resolve a graph reference to its YAML source.
 //!
-//! A reference is either a filesystem path (used directly) or a bare preset
-//! name resolved through three layers, most specific first:
+//! A reference is `-` (stdin), a filesystem path (used directly), or a bare
+//! preset name resolved through three layers, most specific first:
 //!
 //! 1. `<project>/.hex/graphs/<name>.yaml`
 //! 2. `~/.config/hex/graphs/<name>.yaml`
@@ -57,6 +57,23 @@ pub struct Entry {
 /// # Errors
 /// Fails if a path does not exist/read, or a name matches no layer.
 pub fn resolve(reference: &str, project_root: &Path) -> Result<Resolved> {
+    // `-` reads the graph from stdin, so an agent can author and launch a
+    // workflow in one command. The run dir keeps the snapshot, so resume needs
+    // no file.
+    if reference == "-" {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            return Err(HexError::new(
+                "graph `-` reads stdin, but stdin is a terminal — pipe the YAML in",
+            ));
+        }
+        let mut source = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut source)?;
+        return Ok(Resolved {
+            source,
+            origin: "stdin".to_owned(),
+        });
+    }
     // An explicit existing path wins and is used verbatim.
     let as_path = Path::new(reference);
     if as_path.is_file() {

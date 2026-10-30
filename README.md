@@ -73,6 +73,26 @@ accept:
   require: [test.passed]
 ```
 
+An agent can write a graph for one task and pipe it in: `hex run - -p "…" < graph.yaml`. An edge with a list of targets starts those nodes at the same time. A `join: all` node waits for all of them. A node with `context: { fork: <node> }` starts from a copy of that node's agent session:
+
+```yaml
+research:
+  agent: { role: researcher, prompt: "Map the auth module for: {{prompt}}" }
+  on: { done: [impl_a, impl_b] }
+impl_a:
+  agent: { role: implementer, context: { fork: research }, prompt: "Approach A." }
+  on: { done: review }
+impl_b:
+  agent: { role: implementer, context: { fork: research }, prompt: "Approach B." }
+  on: { done: review }
+review:
+  join: all
+  agent: { role: reviewer, prompt: "Compare {{impl_a.result}} and {{impl_b.result}}." }
+  on: { done: done }
+```
+
+`hex run <graph> --continue <run>` starts a new run whose `continue` and `fork` nodes take over the agent sessions of the same-named nodes in an earlier run. `hex status <run> --json` lists those `sessions`.
+
 ## Config
 
 hex reads config and graphs in layers. Project (`.hex/config.yaml`, `.hex/graphs/`) wins over user
@@ -92,7 +112,7 @@ roles:
 
 ### One agent CLI only
 
-The built-in roles use claude to implement and research, and codex to review and plan.
+The built-in roles use claude to implement and research, and codex to review and plan. `scout` is a fast read-only lookup on claude with `claude-sonnet-5-5`, the only built-in role that pins a model.
 With one CLI, rebind the roles in `~/.config/hex/config.yaml`.
 
 ```yaml
@@ -107,6 +127,7 @@ roles:
 roles:
   implementer: { worker: codex, model: gpt-6-sol }
   researcher:  { worker: codex, model: gpt-6-sol }
+  scout:       { worker: codex, model: gpt-6-sol }
 ```
 
 When you change a role's `worker`, also set its `model`. A model from another layer may not exist in the new CLI. `hex doctor` reports it.

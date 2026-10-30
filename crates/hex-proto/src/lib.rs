@@ -178,6 +178,10 @@ pub enum EventBody {
         /// never change what a resumed run executes as its gate.
         #[serde(default)]
         checks: BTreeMap<String, Vec<String>>,
+        /// Agent sessions taken over from an earlier run (`hex run --continue
+        /// <run>`), by node. Recorded here so this run never reads the other.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        sessions: BTreeMap<String, SessionHandle>,
     },
     /// A success terminal was reached but the acceptance contract was unmet, so
     /// the run rerouted to `to` (the graph's `accept.on_unmet`) instead of
@@ -207,6 +211,9 @@ pub enum EventBody {
         /// The operator's guidance text, fenced into the next prompt as
         /// operator input (trusted instructions, unlike agent output).
         text: String,
+        /// The agent node it is for. `None`: the next agent attempt to start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<String>,
     },
     /// A `human` node suspended the run and asked its question. The runtime then
     /// blocks on a `respond` command; a crash while blocked leaves this event
@@ -287,6 +294,11 @@ pub enum EventBody {
         /// Wall time the agent itself reported, where it does.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        /// The usage covers the whole session, not only this attempt: claude
+        /// and codex report session totals when they resume or fork. The kernel
+        /// then bills the difference to the session's last report.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cumulative: bool,
     },
     /// An attempt failed to execute (worker crashed, timed out, emitted nothing
     /// valid). This is a *terminal* event: it carries the run's resulting
@@ -382,6 +394,10 @@ pub enum Command {
     Steer {
         /// The guidance text.
         text: String,
+        /// The agent node it is for (`hex steer --node`). `None`: the next
+        /// agent attempt to start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<String>,
     },
     /// Answer a `human` node that is blocking the run.
     Respond {
@@ -404,6 +420,31 @@ impl Command {
     }
 }
 
+/// A resumable agent session, and the program that owns it.
+///
+/// Recorded because a role's binding is resolved from *live* config every time
+/// the graph is compiled, so a `hex resume` after an edit to
+/// `roles.reviewer.worker` can select a different adapter than the one that
+/// opened the session — and hex would hand a codex thread id to
+/// `claude --resume`. The identity has to be the **program**, not the registry
+/// name: roles register under their own alias, so the alias is unchanged by
+/// exactly the rebind this guards against.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHandle {
+    /// The external program that owns the session (`codex`, `claude`) — not the
+    /// worker registry name, which is a role alias and survives a rebind.
+    pub agent: String,
+    /// The agent's own session/thread id.
+    pub id: String,
+    /// The session's last session-total usage, when the agent reports totals
+    /// (`AttemptReported.cumulative`): what the next resume or fork subtracts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelUsage>,
+    /// The session-total cost that goes with `models`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micro_usd: Option<u64>,
+}
+
 /// A capability a worker adapter advertises in its manifest so the graph
 /// validator can reject definitions the adapter cannot satisfy (e.g. a
 /// `context: continue` node on a worker without session resume).
@@ -412,6 +453,8 @@ impl Command {
 pub enum Capability {
     /// Can resume a prior agent session.
     SessionResume,
+    /// Can fork a prior agent session into a new one (`context: { fork: … }`).
+    SessionFork,
     /// Reports token/cost usage per attempt.
     CostReporting,
 }
@@ -477,6 +520,7 @@ mod tests {
                     models: vec![],
                     cost_micro_usd: None,
                     duration_ms: None,
+                    cumulative: false,
                 }),
                 &[],
                 &["cost_micro_usd", "session_id", "models"],
@@ -511,6 +555,7 @@ mod tests {
             Command::Cancel,
             Command::Steer {
                 text: "prefer the smaller diff".to_owned(),
+                node: None,
             },
             Command::Respond {
                 text: "approved".to_owned(),
@@ -541,6 +586,7 @@ mod tests {
             }],
             cost_micro_usd: Some(177_800),
             duration_ms: Some(2611),
+            cumulative: true,
         });
         let json = serde_json::to_string(&ev).expect("serializes");
         assert!(json.contains("\"kind\":\"attempt_reported\""), "{json}");
